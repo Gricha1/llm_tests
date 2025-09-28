@@ -1,0 +1,43 @@
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+actor_rollout_ref:
+
+  actor:
+
+    # initial entropy coeff
+    entropy_coeff: 0
+
+    # whether to use clamped entropy
+    clamp_entropy: False
+
+    # the percentage of tokens that will be clamped when calculating entropy
+    clamp_p: 0.3
+
+    # adaptive entropy coeff update, will only enable if the following args are valid
+    adaptive_entropy:
+
+      # the algorithm will try to confine entropy within [lower, high] after warmup
+      entropy_low: -1 
+
+      entropy_high: -1 
+
+      # learning rate of entropy coeff update
+      entropy_coeff_lr: -1 
+
+      # the entropy coeff will begin to update after this step
+      entropy_coeff_warmup: 0 
+
+      # the entropy coeff will be confined within [clip_low, clip_high]
+      entropy_coeff_clip_high: 0.1 
+
+      entropy_coeff_clip_low: 0.00004
+
+      # optional, the l2 regularization constant used in coeff update
+      entropy_coeff_reg: 0 
+   
