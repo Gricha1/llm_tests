@@ -1,29 +1,19 @@
 ## Overview
 
-This is a verl-based implementation of [AEnt](https://www.arxiv.org/pdf/2509.03493), a
-clamped entropy regularization method for LLM-RL algorithms.
+This is an verl-based implementation of [AEnt](https://www.arxiv.org/pdf/2509.03493), a clamped entropy regularization method for LLM-RL algorithms.
 
-Entropy regularization has been a successful method for robotic and games RL, while it
-offers weak gains for LLM RL. It is argued in the
-[paper](https://www.arxiv.org/pdf/2509.03493) that entropy regularization suffers from
-LLM tasks' sparse optimality and the immense response set.
+Entropy regularization has been a successful method for robotic and games RL, while it offers weak gains for LLM RL. It is argued in the [paper](https://www.arxiv.org/pdf/2509.03493) that entropy regularization suffers from LLM tasks' sparse optimality and the immense response set.
 
-> One can observe this effect in a toy run on a synthetic MDP below, where as the number
-> of optimal actions decrease (thus sparsity increases), entropy regularization no
-> longer has an advantage over no regularization. The method to be proposed is more
-> robust to this issue.
+> One can observe this effect in a toy run on a synthetic MDP below, where as the number of optimal actions decrease (thus sparsity increases), entropy regularization no longer has an advantage over no regularization. The method to be proposed is more robust to this issue.
 >
 > <div align="left">
 
 <img src="https://github.com/hanshen95/hanshen95.github.io/blob/master/images/toy_demo.png?raw=true" alt="issue" style="width: 96%; height: auto;">
 </div>
 
-To address this issue, AEnt utilizes a clamped entropy regularization paired with
-adaptively adjusted coefficient. It is observed that AEnt achieves larger gains on
-multiple benchmarks when tested on different models and training datasets.
+To address this issue, AEnt utilizes a clamped entropy regularization paired with adaptively adjusted coefficient. It is observed that AEnt achieves larger gains on multiple benchmarks when tested on different models and training datasets.
 
-> An example run on DeepSeek-R1-distilled-Qwen-1.5b on 40k verifiable samples from
-> Openr1-math dataset
+> An example run on DeepSeek-R1-distilled-Qwen-1.5b on 40k verifiable samples from Openr1-math dataset
 >
 > <div align="left">
 
@@ -45,8 +35,7 @@ actor:
     clamp_p: 0.3
 ```
 
-`entropy_coeff` weighs the entropy regularization and `entropy_clamp` specifies value
-clamping percentage p in the paper.
+`entropy_coeff` weighs the entropy regularization and `entropy_clamp` specifies value clamping percentage p in the paper.
 
 Related code in `aent_torch_functional.py`:
 
@@ -91,11 +80,9 @@ actor:
         # optional, the l2 regularization constant used in coeff update
         entropy_coeff_reg: 0 
 ```
-A constant coeff will be used by default. Modify these args to enable adaptive coeff.
- `entropy_low/high`
-sets the lower/upper tolerance of the clamped entropy, `entropy_coeff_clip_high/low` sets the
-bounding interval of the coefficient. The coeffcient will start updating after
-`entropy_coeff_warmup` with a learning rate of `entropy_coeff_lr`. We find that the algorithm is mostly just sensitive to `entropy_high/low`.
+A constant coeff will be used by default. Modify these args to enable adaptive coeff. 
+`entropy_low/high` sets the lower/upper tolerance of the clamped entropy, `entropy_coeff_clip_high/low` sets the bounding interval of the coefficient. 
+The coeffcient will start updating after `entropy_coeff_warmup` with a learning rate of `entropy_coeff_lr`. We find that the algorithm is mostly just sensitive to `entropy_high/low`.
 
 
 Related code in `ray_aent_trainer.py`:
@@ -105,7 +92,7 @@ Related code in `ray_aent_trainer.py`:
 if self.adaptive_entropy_control and self.entropy_coeff_warmup<=self.global_steps:
     entropy = float(metrics['actor/entropy_loss'])
     self.entropy_coeff -= self.entropy_coeff_lr*(min(0,entropy-self.entropy_box[0])+max(0,entropy-self.entropy_box[1]) \
-                            +self.entropy_coeff_reg*(self.entropy_coeff-self.initial_entropy_coeff))
+                        +self.entropy_coeff_reg*(self.entropy_coeff-self.initial_entropy_coeff))
     self.entropy_coeff = min(max(self.entropy_coeff, self.entropy_coeff_box[0]), self.entropy_coeff_box[1])
     metrics.update({'actor/entropy_coeff': self.entropy_coeff})
 ```
