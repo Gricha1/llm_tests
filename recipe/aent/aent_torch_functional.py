@@ -13,7 +13,6 @@ def clamped_entropy_from_logits(logits: torch.Tensor, clamp_p: float):
         rm_mask = torch.zeros_like(logits_cpu,dtype=torch.bool)
         rm_mask[row_indices,rm_indices]=True
         del logits_cpu, row_indices, rm_indices
-    # clamped_logtis = torch.gather(logits,dim=-1,index=keep_indices.to(logits.device))
     clamped_logits = logits.masked_fill(rm_mask.to(logits.device), -torch.inf)
     del rm_mask
     torch.cuda.empty_cache()
