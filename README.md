@@ -84,9 +84,6 @@ A constant coeff will be used by default. Modify these args to enable adaptive c
 `entropy_low/high` sets the lower/upper tolerance of the clamped entropy, `entropy_coeff_clip_high/low` sets the bounding interval of the coefficient. 
 The coeffcient will start updating after `entropy_coeff_warmup` with a learning rate of `entropy_coeff_lr`. 
 
-Overall, the algorithm is mostly sensitive to `entropy_coeff`, `entropy_clamp` and `entropy_low/high`.
-
-
 Related code in `ray_aent_trainer.py`:
 
 ```python
@@ -98,6 +95,9 @@ if self.adaptive_entropy_control and self.entropy_coeff_warmup<=self.global_step
     self.entropy_coeff = min(max(self.entropy_coeff, self.entropy_coeff_box[0]), self.entropy_coeff_box[1])
     metrics.update({'actor/entropy_coeff': self.entropy_coeff})
 ```
+
+Overall, the algorithm is mostly sensitive to `entropy_coeff`, `entropy_clamp` and `entropy_low/high`.
+
 
 ## Example case
 We may do two test runs, one on MATH, and another sligntly larger scaled one on openr1-math.
