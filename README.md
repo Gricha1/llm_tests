@@ -1,6 +1,6 @@
 ## Overview
 
-This is an verl-based implementation of [AEnt](https://www.arxiv.org/pdf/2509.03493), a clamped entropy regularization method for LLM-RL algorithms.
+This is an implementation of AEnt, the method introduced in the paper [On Entropy Control in LLM-RL Algorithms](https://www.arxiv.org/pdf/2509.03493).
 
 Entropy regularization has been a successful method for robotic and games RL, while it offers weak gains for LLM RL. It is argued in the [paper](https://www.arxiv.org/pdf/2509.03493) that entropy regularization suffers from LLM tasks' sparse optimality and the immense response set.
 
@@ -75,14 +75,16 @@ actor:
         entropy_high: -1 
         entropy_coeff_lr: -1 
         entropy_coeff_warmup: 0 
-        entropy_coeff_clip_high: 0.1 
+        entropy_coeff_clip_high: 0.0005 
         entropy_coeff_clip_low: 0.00004
         # optional, the l2 regularization constant used in coeff update
         entropy_coeff_reg: 0 
 ```
 A constant coeff will be used by default. Modify these args to enable adaptive coeff. 
 `entropy_low/high` sets the lower/upper tolerance of the clamped entropy, `entropy_coeff_clip_high/low` sets the bounding interval of the coefficient. 
-The coeffcient will start updating after `entropy_coeff_warmup` with a learning rate of `entropy_coeff_lr`. We find that the algorithm is mostly just sensitive to `entropy_high/low`.
+The coeffcient will start updating after `entropy_coeff_warmup` with a learning rate of `entropy_coeff_lr`. 
+
+Overall, the algorithm is mostly sensitive to `entropy_coeff`, `entropy_clamp` and `entropy_low/high`.
 
 
 Related code in `ray_aent_trainer.py`:
@@ -119,6 +121,13 @@ With the correctly formated dataset, one may run
 ```bash
 UNIQUEID=$(date +%s) PROJECT='aent_openr1' EXPERIMENT="run_$UNIQUEID" && mkdir -p "logs/$PROJECT" && export PROJECT EXPERIMENT && bash recipe/aent/run_aent_openr1.sh > >(tee "logs/$PROJECT/$EXPERIMENT.log") 2> >(tee "logs/$PROJECT/$EXPERIMENT.err" >&2)
 ```
+
+
+## Acknowledgement
+
+This implementation is based on the highly efficient and robust RL framework [verl](https://github.com/volcengine/verl). The [async implementation of this method](https://github.com/inclusionAI/AReaL/tree/main/recipe/AEnt) is built on the scalable RL framework
+[AReaL](https://github.com/inclusionAI/AReaL). We would like to thank the verl team and the AReaL team for providing support to open source LLM-RL research.
+We also would like to thank @garrett4wade and xujie shen for helping us developing the asynchronous version.
 
 
 ## Citation
