@@ -34,13 +34,29 @@ def run_ppo(config) -> None:
     # Check if Ray is not initialized
     if not ray.is_initialized():
         # Initialize Ray with a local cluster configuration
-        # Set environment variables in the runtime environment to control tokenizer parallelism,
-        # NCCL debug level, VLLM logging level, and allow runtime LoRA updating
-        # `num_cpus` specifies the number of CPU cores Ray can use, obtained from the configuration
-        ray.init(
-            runtime_env={"env_vars": {"TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN", "VLLM_LOGGING_LEVEL": "WARN", "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "true"}},
-            num_cpus=config.ray_init.num_cpus,
-        )
+        # Set environment variables in the runtime env to control tokenizer parallelism,
+        # NCCL debug level, VLLM logging level, and allow runtime LoRA updating.
+        # Explicit num_gpus helps Ray register GPUs in Docker / multi-GPU nodes so child
+        # actors see CUDA (otherwise torch may stay on CPU in workers).
+        nnodes = int(OmegaConf.select(config, "trainer.nnodes", default=1) or 1)
+        n_gpus_per_node = int(OmegaConf.select(config, "trainer.n_gpus_per_node", default=0) or 0)
+        total_gpus = max(0, n_gpus_per_node * nnodes)
+        ray_init_kwargs = {
+            "runtime_env": {
+                "env_vars": {
+                    "TOKENIZERS_PARALLELISM": "true",
+                    "NCCL_DEBUG": "WARN",
+                    "VLLM_LOGGING_LEVEL": "WARN",
+                    "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "true",
+                    # Avoid Ray clearing accelerator env in edge cases (Ray 2.4+ warning).
+                    "RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO": "0",
+                }
+            },
+            "num_cpus": config.ray_init.num_cpus,
+        }
+        if total_gpus > 0:
+            ray_init_kwargs["num_gpus"] = total_gpus
+        ray.init(**ray_init_kwargs)
 
     # Create a remote instance of the TaskRunner class, and
     # Execute the `run` method of the TaskRunner instance remotely and wait for it to complete

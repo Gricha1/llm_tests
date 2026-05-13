@@ -19,6 +19,10 @@ from verl import DataProto
 
 
 class BaseShardingManager:
+    def __init__(self):
+        # Subclasses (vLLM/SGLang) may repopulate this in __enter__; HF rollout uses Base only.
+        self.timing: dict = {}
+
     def __enter__(self):
         pass
 

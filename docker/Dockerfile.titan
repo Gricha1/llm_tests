@@ -1,0 +1,47 @@
+## Local docker image for running AEnt/verl on NVIDIA GPUs.
+##
+## Notes for TITAN RTX + driver 535.x:
+## - PyTorch cu124 wheels often fail with "forward compatibility" / cuda.is_available()=False on older drivers.
+## - Use CUDA 12.1 + PyTorch cu121 for broad compatibility with driver 535.
+## - vLLM is omitted here (it tends to pin newer CUDA/torch); use rollout.name=hf for smoke tests (see docker/run_train_aent_math_titan_2gpu.sh).
+FROM nvidia/cuda:12.1.1-cudnn8-devel-ubuntu22.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1
+ENV PIP_ROOT_USER_ACTION=ignore
+ENV HF_HUB_ENABLE_HF_TRANSFER=1
+ENV VLLM_WORKER_MULTIPROC_METHOD=spawn
+# Reduces allocator fragmentation; helps long-seq RL backward on 24GB GPUs.
+ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git curl ca-certificates \
+    python3 python3-pip python3-venv \
+    build-essential ninja-build \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python3 -m pip install --upgrade pip setuptools wheel
+
+# PyTorch CUDA 12.1 wheels (matches base image; works with host driver 535 + Turing).
+RUN pip install --no-cache-dir \
+    "torch==2.4.0" "torchvision==0.19.0" "torchaudio==2.4.0" --index-url https://download.pytorch.org/whl/cu121 && \
+    pip install --no-cache-dir \
+    accelerate datasets peft "transformers==4.46.3" \
+    ray[default] hydra-core codetiming \
+    "tensordict<=0.6.2" torchdata \
+    numpy "pyarrow>=19.0.0" pandas \
+    dill pybind11 pylatexenc packaging \
+    wandb tensorboard fastapi uvicorn hf_transfer \
+    math_verify liger-kernel
+
+# Other deps can pull a mismatched torchvision from PyPI (missing torchvision::nms ops).
+# Re-install the CUDA-matched torch stack last so extensions line up with torch.
+RUN pip install --no-cache-dir --force-reinstall \
+    "torch==2.4.0" "torchvision==0.19.0" "torchaudio==2.4.0" \
+    --index-url https://download.pytorch.org/whl/cu121
+
+# Re-pin transformers: 4.51+ registers torch.custom_op paths that break on torch 2.4.
+RUN pip install --no-cache-dir --force-reinstall "transformers==4.46.3"
+
+WORKDIR /workspace/aent

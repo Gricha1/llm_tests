@@ -43,7 +43,7 @@ from verl.utils.activation_offload import enable_activation_offloading
 from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
 from verl.utils.debug import DistProfiler, DistProfilerExtension, ProfilerConfig, log_gpu_memory_usage, simple_timer
 from verl.utils.debug.performance import reduce_timing
-from verl.utils.device import get_device_id, get_device_name, get_nccl_backend, get_torch_device, is_cuda_available, is_npu_available
+from verl.utils.device import get_device_id, get_device_name, get_nccl_backend, get_torch_device, is_cuda_available, is_npu_available, prime_ray_worker_cuda
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.fs import copy_to_local
 from verl.utils.fsdp_utils import (
@@ -69,14 +69,13 @@ from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManage
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
-device_name = get_device_name()
-
 
 def create_device_mesh(world_size, fsdp_size):
+    dev = get_device_name()
     if fsdp_size < 0 or fsdp_size >= world_size:
-        device_mesh = init_device_mesh(device_name, mesh_shape=(world_size,), mesh_dim_names=["fsdp"])
+        device_mesh = init_device_mesh(dev, mesh_shape=(world_size,), mesh_dim_names=["fsdp"])
     else:
-        device_mesh = init_device_mesh(device_name, mesh_shape=(world_size // fsdp_size, fsdp_size), mesh_dim_names=["ddp", "fsdp"])
+        device_mesh = init_device_mesh(dev, mesh_shape=(world_size // fsdp_size, fsdp_size), mesh_dim_names=["ddp", "fsdp"])
     return device_mesh
 
 
@@ -104,6 +103,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self.config = config
         import torch.distributed
 
+        prime_ray_worker_cuda()
+
         if not torch.distributed.is_initialized():
             rank = int(os.environ.get("RANK", 0))
             world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -119,7 +120,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self.ulysses_sequence_parallel_size = self.config.actor.get("ulysses_sequence_parallel_size", 1)
         dp = world_size // self.ulysses_sequence_parallel_size
         if self.ulysses_sequence_parallel_size > 1:
-            self.ulysses_device_mesh = init_device_mesh(device_name, mesh_shape=(dp, self.ulysses_sequence_parallel_size), mesh_dim_names=["dp", "sp"])
+            self.ulysses_device_mesh = init_device_mesh(get_device_name(), mesh_shape=(dp, self.ulysses_sequence_parallel_size), mesh_dim_names=["dp", "sp"])
 
         self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
         self._lora_rank = self.config.model.get("lora_rank", 0)
@@ -218,7 +219,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             torch_dtype = PrecisionType.to_dtype(torch_dtype)
 
         # override model kwargs
-        actor_model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code, attn_implementation="flash_attention_2")
+        actor_model_config = AutoConfig.from_pretrained(
+            local_path,
+            trust_remote_code=trust_remote_code,
+            attn_implementation=os.environ.get("VERL_ATTN_IMPLEMENTATION", "flash_attention_2"),
+        )
 
         # patch for kimi-vl
         if getattr(actor_model_config, "model_type", None) == "kimi_vl":
@@ -404,7 +409,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         infer_tp = self.config.rollout.tensor_model_parallel_size
         dp = self.world_size // infer_tp
         assert self.world_size % infer_tp == 0, f"rollout world_size: {self.world_size} is not divisible by infer_tp: {infer_tp}"
-        rollout_device_mesh = init_device_mesh(device_name, mesh_shape=(dp, infer_tp), mesh_dim_names=["dp", "infer_tp"])
+        rollout_device_mesh = init_device_mesh(get_device_name(), mesh_shape=(dp, infer_tp), mesh_dim_names=["dp", "infer_tp"])
         rollout_name = self.config.rollout.name
         if rollout_name == "hf":
             from verl.workers.rollout import HFRollout
@@ -832,6 +837,8 @@ class CriticWorker(Worker, DistProfilerExtension):
         DistProfilerExtension.__init__(self, DistProfiler(rank=self.rank, config=profiler_config))
         import torch.distributed
 
+        prime_ray_worker_cuda()
+
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group(backend=get_nccl_backend(), init_method=os.environ.get("DIST_INIT_METHOD", None))
         self.config = config
@@ -847,7 +854,7 @@ class CriticWorker(Worker, DistProfilerExtension):
         self.ulysses_sequence_parallel_size = self.config.get("ulysses_sequence_parallel_size", 1)
         dp = world_size // self.ulysses_sequence_parallel_size
         if self.ulysses_sequence_parallel_size > 1:
-            self.ulysses_device_mesh = init_device_mesh(device_name, mesh_shape=(dp, self.ulysses_sequence_parallel_size), mesh_dim_names=["dp", "sp"])
+            self.ulysses_device_mesh = init_device_mesh(get_device_name(), mesh_shape=(dp, self.ulysses_sequence_parallel_size), mesh_dim_names=["dp", "sp"])
 
         self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
 
@@ -907,7 +914,11 @@ class CriticWorker(Worker, DistProfilerExtension):
 
         from transformers import AutoConfig
 
-        critic_model_config = AutoConfig.from_pretrained(local_path, attn_implementation="flash_attention_2", trust_remote_code=config.model.get("trust_remote_code", False))
+        critic_model_config = AutoConfig.from_pretrained(
+            local_path,
+            attn_implementation=os.environ.get("VERL_ATTN_IMPLEMENTATION", "flash_attention_2"),
+            trust_remote_code=config.model.get("trust_remote_code", False),
+        )
         critic_model_config.num_labels = 1
         # patch for kimi-vl
         if getattr(critic_model_config, "model_type", None) == "kimi_vl":
@@ -1181,6 +1192,8 @@ class RewardModelWorker(Worker, DistProfilerExtension):
 
         import torch.distributed
 
+        prime_ray_worker_cuda()
+
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group(backend=get_nccl_backend(), init_method=os.environ.get("DIST_INIT_METHOD", None))
         self.config = config
@@ -1196,7 +1209,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
         self.ulysses_sequence_parallel_size = self.config.get("ulysses_sequence_parallel_size", 1)
         dp = world_size // self.ulysses_sequence_parallel_size
         if self.ulysses_sequence_parallel_size > 1:
-            self.ulysses_device_mesh = init_device_mesh(device_name, mesh_shape=(dp, self.ulysses_sequence_parallel_size), mesh_dim_names=["dp", "sp"])
+            self.ulysses_device_mesh = init_device_mesh(get_device_name(), mesh_shape=(dp, self.ulysses_sequence_parallel_size), mesh_dim_names=["dp", "sp"])
 
         self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
 
@@ -1238,7 +1251,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                 pretrained_model_name_or_path=local_path,
                 config=model_config,
                 torch_dtype=torch.bfloat16,
-                attn_implementation="flash_attention_2",
+                attn_implementation=os.environ.get("VERL_ATTN_IMPLEMENTATION", "flash_attention_2"),
                 trust_remote_code=trust_remote_code,
             )
 
@@ -1297,7 +1310,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
 
         from verl.utils.ulysses import gather_outpus_and_unpad, ulysses_pad_and_slice_inputs
 
-        with torch.no_grad(), torch.autocast(device_type=device_name, dtype=torch.bfloat16):
+        with torch.no_grad(), torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
             input_ids = micro_batch["input_ids"]
             batch_size, seqlen = input_ids.shape
             attention_mask = micro_batch["attention_mask"]

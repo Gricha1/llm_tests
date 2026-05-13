@@ -38,16 +38,28 @@ from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.ulysses import gather_outpus_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
 from verl.workers.actor import BasePPOActor
 
+logger = logging.getLogger(__file__)
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+FLASH_ATTN_BERT_PADDING_AVAILABLE = False
 if is_cuda_available:
-    from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
+    try:
+        from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
+
+        FLASH_ATTN_BERT_PADDING_AVAILABLE = True
+    except Exception as e:  # pragma: no cover
+        index_first_axis = pad_input = rearrange = unpad_input = None  # type: ignore[assignment]
+        logger.warning(
+            "flash-attn is not available; use_remove_padding=True will not work. "
+            "Install flash-attn or set actor_rollout_ref.model.use_remove_padding=False. "
+            f"Import error: {type(e).__name__}: {e}"
+        )
 elif is_npu_available:
     from transformers.integrations.npu_flash_attention import index_first_axis, pad_input, rearrange, unpad_input
+    FLASH_ATTN_BERT_PADDING_AVAILABLE = True
 
 
 __all__ = ["DataParallelPPOActor"]
-
-logger = logging.getLogger(__file__)
-logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 class DataParallelPPOActor(BasePPOActor):
@@ -58,6 +70,12 @@ class DataParallelPPOActor(BasePPOActor):
         self.actor_optimizer = actor_optimizer
 
         self.use_remove_padding = self.config.get("use_remove_padding", False)
+        if self.use_remove_padding and not FLASH_ATTN_BERT_PADDING_AVAILABLE:
+            raise RuntimeError(
+                "use_remove_padding=True requires flash-attn (flash_attn.bert_padding) on CUDA. "
+                "Either install flash-attn compatible with your GPU/torch/CUDA stack, "
+                "or set actor_rollout_ref.model.use_remove_padding=False."
+            )
         if torch.distributed.get_rank() == 0:
             print(f"Actor use_remove_padding={self.use_remove_padding}")
         self.use_fused_kernels = self.config.get("use_fused_kernels", False)

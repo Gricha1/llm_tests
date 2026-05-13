@@ -9,6 +9,7 @@
 # This source code is licensed under the BSD-style license in https://github.com/pytorch/torchtune/blob/main/LICENSE
 
 import logging
+import os
 
 import torch
 
@@ -25,8 +26,40 @@ def is_torch_npu_available() -> bool:
         return False
 
 
-is_cuda_available = torch.cuda.is_available()
-is_npu_available = is_torch_npu_available()
+class _LazyDeviceFlag:
+    """Re-evaluate availability on each check (bool/if), not at import time.
+
+    Ray workers and driver import the same modules in different orders; a one-shot
+    `torch.cuda.is_available()` at import time can stay false in GPU workers.
+    """
+
+    def __init__(self, fn):
+        self._fn = fn
+
+    def __bool__(self) -> bool:
+        return bool(self._fn())
+
+
+is_cuda_available = _LazyDeviceFlag(lambda: torch.cuda.is_available())
+is_npu_available = _LazyDeviceFlag(is_torch_npu_available)
+
+
+def prime_ray_worker_cuda() -> None:
+    """Best-effort CUDA init for Ray GPU actors.
+
+    Some Ray / container setups leave `torch.cuda.is_available()` false until the
+    runtime is explicitly probed, which breaks `init_process_group` (NCCL).
+    """
+    try:
+        n = torch.cuda.device_count()
+        if n <= 0:
+            return
+        idx = int(os.environ.get("RAY_LOCAL_RANK", os.environ.get("LOCAL_RANK", "0")))
+        idx = max(0, min(idx, n - 1))
+        torch.cuda.set_device(idx)
+        _ = torch.empty(1, device=f"cuda:{idx}")
+    except Exception as e:  # pragma: no cover
+        logger.warning("prime_ray_worker_cuda failed: %s", e)
 
 
 def get_device_name() -> str:
@@ -75,4 +108,10 @@ def get_nccl_backend() -> str:
     elif is_npu_available:
         return "hccl"
     else:
-        raise RuntimeError(f"No available nccl backend found on device type {get_device_name()}.")
+        raise RuntimeError(
+            "No available nccl backend found on device type "
+            f"{get_device_name()} (torch.cuda.is_available()={torch.cuda.is_available()}, "
+            f"device_count={torch.cuda.device_count()}, "
+            f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')}, "
+            f"NVIDIA_VISIBLE_DEVICES={os.environ.get('NVIDIA_VISIBLE_DEVICES')})"
+        )

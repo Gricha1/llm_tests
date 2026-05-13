@@ -38,21 +38,40 @@ from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.ulysses import gather_outpus_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
 from verl.workers.actor.dp_actor import DataParallelPPOActor
 
-if is_cuda_available:
-    from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
-elif is_npu_available:
-    from transformers.integrations.npu_flash_attention import index_first_axis, pad_input, rearrange, unpad_input
-
-from functools import partial
-
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+FLASH_ATTN_BERT_PADDING_AVAILABLE = False
+if is_cuda_available:
+    try:
+        from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
+
+        FLASH_ATTN_BERT_PADDING_AVAILABLE = True
+    except Exception as e:  # pragma: no cover
+        index_first_axis = pad_input = rearrange = unpad_input = None  # type: ignore[assignment]
+        logger.warning(
+            "flash-attn is not available; use_remove_padding=True will not work. "
+            "Install flash-attn or set actor_rollout_ref.model.use_remove_padding=False. "
+            f"Import error: {type(e).__name__}: {e}"
+        )
+elif is_npu_available:
+    from transformers.integrations.npu_flash_attention import index_first_axis, pad_input, rearrange, unpad_input
+    FLASH_ATTN_BERT_PADDING_AVAILABLE = True
+
+from functools import partial
 
 
 class DataParallelAEntActor(DataParallelPPOActor):
     def __init__(self, *args, **kwargs):
         """When optimizer is None, it is Reference Policy"""
         super().__init__(*args, **kwargs)
+
+        if self.config.get("use_remove_padding", False) and not FLASH_ATTN_BERT_PADDING_AVAILABLE:
+            raise RuntimeError(
+                "use_remove_padding=True requires flash-attn (flash_attn.bert_padding) on CUDA. "
+                "Either install flash-attn compatible with your GPU/torch/CUDA stack, "
+                "or set actor_rollout_ref.model.use_remove_padding=False."
+            )
 
         if self.config.entropy_from_logits_with_chunking:   
             if self.config.get('clamp_entropy'):
