@@ -20,21 +20,24 @@ import os
 from enum import Enum
 from functools import partial
 from pathlib import Path
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Optional, Union
+
+# Set while a Comet `Experiment` is active (driver process only); used by `ValidationGenerationsLogger`.
+_active_comet_ml_experiment: Optional[Any] = None
 
 
 class Tracking:
     """A unified tracking interface for logging experiment data to multiple backends.
 
     This class provides a centralized way to log experiment metrics, parameters, and artifacts
-    to various tracking backends including WandB, MLflow, SwanLab, TensorBoard, and console.
+    to various tracking backends including WandB, MLflow, SwanLab, TensorBoard, Comet ML, and console.
 
     Attributes:
         supported_backend: List of supported tracking backends.
         logger: Dictionary of initialized logger instances for each backend.
     """
 
-    supported_backend = ["wandb", "mlflow", "swanlab", "vemlp_wandb", "tensorboard", "console", "clearml"]
+    supported_backend = ["wandb", "mlflow", "swanlab", "vemlp_wandb", "tensorboard", "comet_ml", "console", "clearml"]
 
     def __init__(self, project_name, experiment_name, default_backend: Union[str, List[str]] = "console", config=None):
         if isinstance(default_backend, str):
@@ -59,8 +62,6 @@ class Tracking:
             self.logger["wandb"] = wandb
 
         if "mlflow" in default_backend:
-            import os
-
             import mlflow
 
             MLFLOW_TRACKING_URI = os.environ.get("MLFLOW_TRACKING_URI", None)
@@ -75,8 +76,6 @@ class Tracking:
             self.logger["mlflow"] = _MlflowLoggingAdapter()
 
         if "swanlab" in default_backend:
-            import os
-
             import swanlab
 
             SWANLAB_API_KEY = os.environ.get("SWANLAB_API_KEY", None)
@@ -97,8 +96,6 @@ class Tracking:
             self.logger["swanlab"] = swanlab
 
         if "vemlp_wandb" in default_backend:
-            import os
-
             import volcengine_ml_platform
             from volcengine_ml_platform import wandb as vemlp_wandb
 
@@ -118,6 +115,28 @@ class Tracking:
 
         if "tensorboard" in default_backend:
             self.logger["tensorboard"] = _TensorboardAdapter(project_name, experiment_name)
+
+        if "comet_ml" in default_backend:
+            if os.environ.get("COMET_API_KEY"):
+                try:
+                    self.logger["comet_ml"] = _CometMlAdapter(project_name, experiment_name, config=config)
+                except ImportError as e:
+                    import warnings
+
+                    warnings.warn(
+                        f"trainer.logger includes 'comet_ml' but comet_ml is not installed ({e}). "
+                        "Install with `pip install comet_ml` or remove comet_ml from trainer.logger.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+            else:
+                import warnings
+
+                warnings.warn(
+                    "trainer.logger includes 'comet_ml' but COMET_API_KEY is unset; Comet logging disabled.",
+                    UserWarning,
+                    stacklevel=2,
+                )
 
         if "console" in default_backend:
             from verl.utils.logger import LocalLogger
@@ -142,6 +161,9 @@ class Tracking:
             self.logger["vemlp_wandb"].finish(exit_code=0)
         if "tensorboard" in self.logger:
             self.logger["tensorboard"].finish()
+
+        if "comet_ml" in self.logger:
+            self.logger["comet_ml"].finish()
 
         if "clearnml" in self.logger:
             self.logger["clearnml"].finish()
@@ -194,6 +216,51 @@ class ClearMLLogger:
 
     def finish(self):
         self._task.mark_completed()
+
+
+class _CometMlAdapter:
+    """Comet ML experiment wrapper; uses env `COMET_API_KEY`, optional `COMET_WORKSPACE`."""
+
+    def __init__(self, project_name: str, experiment_name: str, config=None):
+        global _active_comet_ml_experiment
+
+        from comet_ml import Experiment
+
+        workspace = os.environ.get("COMET_WORKSPACE")
+        kwargs: Dict[str, Any] = {
+            "project_name": project_name,
+            "parse_args": False,
+        }
+        if workspace:
+            kwargs["workspace"] = workspace
+        self._experiment = Experiment(**kwargs)
+        _active_comet_ml_experiment = self._experiment
+        if experiment_name:
+            self._experiment.set_name(experiment_name)
+        if config is not None:
+            try:
+                self._experiment.log_parameters(_compute_mlflow_params_from_objects(config))
+            except Exception as e:
+                print(f"WARNING: Comet log_parameters failed: {e}")
+
+    def log(self, data, step):
+        import numpy as np
+
+        for key, value in data.items():
+            if isinstance(value, (int, float, np.floating, np.integer)):
+                self._experiment.log_metric(key, float(value), step=step)
+            else:
+                try:
+                    self._experiment.log_metric(key, float(value), step=step)
+                except (TypeError, ValueError):
+                    self._experiment.log_other(key, repr(value))
+
+    def finish(self):
+        global _active_comet_ml_experiment
+
+        self._experiment.end()
+        if _active_comet_ml_experiment is self._experiment:
+            _active_comet_ml_experiment = None
 
 
 class _TensorboardAdapter:
@@ -275,6 +342,9 @@ class ValidationGenerationsLogger:
 
         if "vemlp_wandb" in loggers:
             self.log_generations_to_vemlp_wandb(samples, step)
+
+        if "comet_ml" in loggers:
+            self.log_generations_to_comet_ml(samples, step)
 
     def log_generations_to_vemlp_wandb(self, samples, step):
         from volcengine_ml_platform import wandb as vemlp_wandb
@@ -383,6 +453,26 @@ class ValidationGenerationsLogger:
             table_plot=pd.DataFrame.from_records(table),
             iteration=step,
         )
+
+    def log_generations_to_comet_ml(self, samples, step):
+        """Log validation generations to the active Comet experiment (if any)."""
+        exp = _active_comet_ml_experiment
+        if exp is None:
+            return
+
+        lines = [f"**Generation results — step {step}**\n"]
+        for i, sample in enumerate(samples):
+            lines.append(f"### Sample {i + 1}\n")
+            if len(sample) >= 3:
+                inp, out, score = sample[0], sample[1], sample[2]
+                lines.append(f"**Input:** {inp}\n\n**Output:** {out}\n\n**Score:** {score}\n\n---\n")
+            else:
+                lines.append(f"{sample}\n\n---\n")
+        text = "\n".join(lines)
+        try:
+            exp.log_text(text, step=step)
+        except Exception as e:
+            print(f"WARNING: Comet log_text for val/generations failed: {e}")
 
     def log_generations_to_tensorboard(self, samples, step):
         """Log samples to tensorboard as text"""

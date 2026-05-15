@@ -44,4 +44,8 @@ RUN pip install --no-cache-dir --force-reinstall \
 # Re-pin transformers: 4.51+ registers torch.custom_op paths that break on torch 2.4.
 RUN pip install --no-cache-dir --force-reinstall "transformers==4.46.3"
 
+# `torch.utils.tensorboard` imports the standalone `tensorboard` package; keep it after
+# torch/transformers reinstalls so pip does not leave the image without it.
+RUN pip install --no-cache-dir tensorboard comet_ml
+
 WORKDIR /workspace/aent

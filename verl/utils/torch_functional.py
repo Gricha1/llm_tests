@@ -16,6 +16,7 @@ Contain small torch utilities
 """
 
 import math
+import os
 from contextlib import contextmanager
 from typing import Dict, List, Optional, Union
 
@@ -140,22 +141,56 @@ def clip_by_value(x, tensor_min, tensor_max):
     return clipped
 
 
+def _entropy_from_logits_rows(logits_rows: torch.Tensor) -> torch.Tensor:
+    """Per-row Shannon entropy from vocab logits: (n, V) -> (n,)."""
+    pd = torch.nn.functional.softmax(logits_rows, dim=-1)
+    return torch.logsumexp(logits_rows, dim=-1) - torch.sum(pd * logits_rows, dim=-1)
+
+
 def entropy_from_logits(logits: torch.Tensor):
-    """Calculate entropy from logits."""
-    pd = torch.nn.functional.softmax(logits, dim=-1)
-    entropy = torch.logsumexp(logits, dim=-1) - torch.sum(pd * logits, dim=-1)
-    return entropy
+    """Calculate entropy from logits along the last (vocab) dimension.
+
+    Flattens leading dimensions and processes rows in chunks so peak VRAM stays bounded
+    for large (batch, seq, vocab) tensors (e.g. HF rollout without flash-attn rmpad).
+    Override chunk size with env ``VERL_ENTROPY_CHUNK_SIZE`` (default 64).
+    """
+    orig_shape = logits.shape
+    vocab = orig_shape[-1]
+    logits_2d = logits.reshape(-1, vocab)
+    n_rows = logits_2d.shape[0]
+    chunk_size = int(os.environ.get("VERL_ENTROPY_CHUNK_SIZE", "64"))
+    if chunk_size < 1:
+        chunk_size = 64
+
+    if n_rows <= chunk_size:
+        ent = _entropy_from_logits_rows(logits_2d)
+    else:
+        parts = []
+        for i in range(0, n_rows, chunk_size):
+            parts.append(_entropy_from_logits_rows(logits_2d[i : i + chunk_size]))
+        ent = torch.cat(parts, dim=0)
+
+    return ent.view(*orig_shape[:-1])
 
 
 def entropy_from_logits_with_chunking(logits: torch.Tensor, chunk_size: int = 2048):
-    """Memory-efficient entropy calculation with chunking."""
-    entropy = torch.zeros(logits.shape[0], device=logits.device)
-    for i in range(0, logits.shape[0], chunk_size):
-        logits_chunk = logits[i : i + chunk_size].float()
-        pd_chunk = torch.nn.functional.softmax(logits_chunk, dim=-1)
-        entropy_chunk = torch.logsumexp(logits_chunk, dim=-1) - torch.sum(pd_chunk * logits_chunk, dim=-1)
-        entropy[i : i + chunk_size] = entropy_chunk
-    return entropy
+    """Memory-efficient entropy: same as ``entropy_from_logits`` but with an explicit chunk size."""
+    orig_shape = logits.shape
+    vocab = orig_shape[-1]
+    logits_2d = logits.reshape(-1, vocab)
+    n_rows = logits_2d.shape[0]
+    if chunk_size < 1:
+        chunk_size = 2048
+
+    if n_rows <= chunk_size:
+        ent = _entropy_from_logits_rows(logits_2d)
+    else:
+        parts = []
+        for i in range(0, n_rows, chunk_size):
+            parts.append(_entropy_from_logits_rows(logits_2d[i : i + chunk_size]))
+        ent = torch.cat(parts, dim=0)
+
+    return ent.view(*orig_shape[:-1])
 
 
 def clamped_entropy_from_logits(logits: torch.Tensor, clamp_p: float=0.33):
@@ -179,24 +214,29 @@ def clamped_entropy_from_logits(logits: torch.Tensor, clamp_p: float=0.33):
 
 def clamped_entropy_from_logits_with_chunking(logits: torch.Tensor, clamp_p: float=0.2, chunk_size:int=2048):
     """Calculate entropy from logits with token space clamping."""
-    logits_cpu = logits.cpu().detach()
+    orig_shape = logits.shape
+    logits_flat = logits.reshape(-1, orig_shape[-1])
+    logits_cpu = logits_flat.cpu().detach()
     with torch.no_grad():   
         k = int(logits_cpu.size(-1)*clamp_p)
         _, rm_indices = torch.topk(logits_cpu,k=k,dim=-1,largest=False)
-        row_indices = torch.arange(logits_cpu.size(0)).unsqueeze(1)
+        row_indices = torch.arange(logits_cpu.size(0), device=logits_cpu.device).unsqueeze(1)
         rm_mask = torch.zeros_like(logits_cpu,dtype=torch.bool)
-        rm_mask[row_indices,rm_indices]=True
+        rm_mask[row_indices, rm_indices] = True
         del logits_cpu, row_indices, rm_indices
-    clamped_logits = logits.masked_fill(rm_mask.to(logits.device), -torch.inf)
+    clamped_logits = logits_flat.masked_fill(rm_mask.to(logits.device), -torch.inf)
     del rm_mask
     torch.cuda.empty_cache()
-    clamped_entropy = torch.zeros(logits.shape[0], device=logits.device)
-    for i in range(0, logits.shape[0], chunk_size):
+    n_rows = clamped_logits.shape[0]
+    parts = []
+    for i in range(0, n_rows, chunk_size):
         logits_chunk = clamped_logits[i : i + chunk_size]
         pd_chunk = torch.nn.functional.softmax(logits_chunk, dim=-1)
-        entropy_chunk = torch.logsumexp(logits_chunk, dim=-1) - torch.sum(pd_chunk * logits[i : i + chunk_size], dim=-1)
-        clamped_entropy[i : i + chunk_size] = entropy_chunk
-    return clamped_entropy
+        orig_chunk = logits_flat[i : i + chunk_size]
+        entropy_chunk = torch.logsumexp(logits_chunk, dim=-1) - torch.sum(pd_chunk * orig_chunk, dim=-1)
+        parts.append(entropy_chunk)
+    clamped_entropy = torch.cat(parts, dim=0)
+    return clamped_entropy.view(*orig_shape[:-1])
 
 
 def masked_sum(values, mask, axis=None):

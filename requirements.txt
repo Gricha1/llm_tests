@@ -19,6 +19,7 @@ torchdata
 transformers
 # vllm==0.8.4
 wandb
+comet_ml
 packaging>=20.0
 uvicorn
 fastapi

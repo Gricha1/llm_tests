@@ -374,7 +374,11 @@ class RayPPOTrainer:
             self.entropy_coeff_box = [actor_config.adaptive_entropy.entropy_coeff_clip_low,actor_config.adaptive_entropy.entropy_coeff_clip_high]
             assert self.entropy_coeff_box[0]<=self.entropy_coeff_box[1]
             assert actor_config.strategy in ['fsdp','fsdp2'] # todo: dimension issue if not removing padding
-            assert self.config.actor_rollout_ref.model.use_remove_padding # todo: dim issue in clamp entropy func if not rmpad
+            if actor_config.get("clamp_entropy", False):
+                assert self.config.actor_rollout_ref.model.use_remove_padding, (
+                    "use_remove_padding=True is required when clamp_entropy=True with adaptive entropy "
+                    "(needs flash_attn.bert_padding on CUDA)."
+                )
             print('Using adaptive entropy control with initial coeff ',self.initial_entropy_coeff)
 
         self._validate_config()

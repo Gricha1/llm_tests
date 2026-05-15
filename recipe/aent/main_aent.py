@@ -41,6 +41,9 @@ def run_ppo(config) -> None:
         nnodes = int(OmegaConf.select(config, "trainer.nnodes", default=1) or 1)
         n_gpus_per_node = int(OmegaConf.select(config, "trainer.n_gpus_per_node", default=0) or 0)
         total_gpus = max(0, n_gpus_per_node * nnodes)
+        from verl.utils.device import sanitize_accelerator_env
+
+        sanitize_accelerator_env()
         ray_init_kwargs = {
             "runtime_env": {
                 "env_vars": {
@@ -50,6 +53,8 @@ def run_ppo(config) -> None:
                     "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "true",
                     # Avoid Ray clearing accelerator env in edge cases (Ray 2.4+ warning).
                     "RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO": "0",
+                    # Workers: strip host NVIDIA_VISIBLE_DEVICES inside Docker (see sanitize_accelerator_env).
+                    "AENT_IN_DOCKER": "1" if os.path.exists("/.dockerenv") else "0",
                 }
             },
             "num_cpus": config.ray_init.num_cpus,

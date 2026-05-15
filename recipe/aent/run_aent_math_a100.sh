@@ -2,6 +2,8 @@ set -x
 export HYDRA_FULL_ERROR=1
 export TENSORBOARD_DIR="/home/admin/logs/tfevent"
 NUM_GPU=4
+# On ml3 use default /mnt/sh snapshot; in Docker or HF-only hosts: MODEL_PATH=Qwen/Qwen2.5-Math-0.5B bash ...
+MODEL_PATH="${MODEL_PATH:-/mnt/sh/models/Qwen__Qwen2.5-Math-0.5B}"
 
 python3 -m recipe.aent.main_aent \
     algorithm.adv_estimator=grpo \
@@ -14,7 +16,7 @@ python3 -m recipe.aent.main_aent \
     data.truncation='error' \
     actor_rollout_ref.ref.strategy=fsdp2 \
     actor_rollout_ref.actor.strategy=fsdp2 \
-    actor_rollout_ref.model.path=/mnt/sh/models/Qwen__Qwen2.5-Math-0.5B \
+    actor_rollout_ref.model.path="${MODEL_PATH}" \
     actor_rollout_ref.actor.optim.lr=2e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.ppo_mini_batch_size=128 \

@@ -477,9 +477,85 @@ def apply_fsdp2(model, fsdp_kwargs, config):
     fully_shard(model, **fsdp_kwargs)  # fsdp2 will not reshard_after_forward for root module
 
 
+def _fsdp2_get_total_norm(grads, norm_type=2.0, error_if_nonfinite=False, foreach=None):
+    """Fallback for PyTorch < 2.6 (private clip_grad helpers were added in 2.6)."""
+    from torch.utils._foreach_utils import (
+        _device_has_foreach_support,
+        _group_tensors_by_device_and_dtype,
+        _has_foreach_support,
+    )
+
+    if isinstance(grads, torch.Tensor):
+        grads = [grads]
+    else:
+        grads = list(grads)
+    norm_type = float(norm_type)
+    if len(grads) == 0:
+        return torch.tensor(0.0, device=get_device_id())
+    first_device = grads[0].device
+    grouped_tensors = _group_tensors_by_device_and_dtype([grads])
+    norms = []
+    for (device, _), ([device_tensors], _) in grouped_tensors.items():
+        if (foreach is None and _has_foreach_support(device_tensors, device)) or (
+            foreach and _device_has_foreach_support(device)
+        ):
+            norms.extend(torch._foreach_norm(device_tensors, norm_type))
+        elif foreach:
+            raise RuntimeError(f"foreach=True was passed, but can't use the foreach API on {device.type} tensors")
+        else:
+            norms.extend([torch.linalg.vector_norm(g, norm_type) for g in device_tensors])
+    total_norm = torch.linalg.vector_norm(torch.stack([norm.to(first_device) for norm in norms]), norm_type)
+    if error_if_nonfinite and torch.logical_or(total_norm.isnan(), total_norm.isinf()):
+        raise RuntimeError(
+            f"The total norm of order {norm_type} for gradients is non-finite. "
+            "Set error_if_nonfinite=False to clip anyway."
+        )
+    return total_norm
+
+
+def _fsdp2_clip_grads_with_norm_(parameters, max_norm, total_norm, foreach=None):
+    """Fallback for PyTorch < 2.6."""
+    from torch.utils._foreach_utils import (
+        _device_has_foreach_support,
+        _group_tensors_by_device_and_dtype,
+        _has_foreach_support,
+    )
+
+    if isinstance(parameters, torch.Tensor):
+        parameters = [parameters]
+    else:
+        parameters = list(parameters)
+    grads = [p.grad for p in parameters if p.grad is not None]
+    max_norm = float(max_norm)
+    if len(grads) == 0:
+        return
+    grouped_grads = _group_tensors_by_device_and_dtype([grads])
+    clip_coef = max_norm / (total_norm + 1e-6)
+    clip_coef_clamped = torch.clamp(clip_coef, max=1.0)
+    for (device, _), ([device_grads], _) in grouped_grads.items():
+        if (foreach is None and _has_foreach_support(device_grads, device)) or (
+            foreach and _device_has_foreach_support(device)
+        ):
+            torch._foreach_mul_(device_grads, clip_coef_clamped.to(device))
+        elif foreach:
+            raise RuntimeError(f"foreach=True was passed, but can't use the foreach API on {device.type} tensors")
+        else:
+            clip_coef_clamped_device = clip_coef_clamped.to(device)
+            for g in device_grads:
+                g.mul_(clip_coef_clamped_device)
+
+
 def fsdp2_clip_grad_norm_(parameters, max_norm, norm_type=2.0, error_if_nonfinite=False, foreach=None):
-    """torch.nn.utils.clip_grad_norm_ cann't run on cpu parameter DTensor"""
-    from torch.nn.utils.clip_grad import _clip_grads_with_norm_, _get_total_norm
+    """Clip grad norm for FSDP2; works when params are CPU DTensor (e.g. optimizer offload).
+
+    Uses torch.nn.utils.clip_grad private helpers on PyTorch >= 2.6; falls back to the same
+    logic inlined for PyTorch 2.4 (Titan docker image).
+    """
+    try:
+        from torch.nn.utils.clip_grad import _clip_grads_with_norm_, _get_total_norm
+    except ImportError:
+        _get_total_norm = _fsdp2_get_total_norm
+        _clip_grads_with_norm_ = _fsdp2_clip_grads_with_norm_
 
     if isinstance(parameters, torch.Tensor):
         parameters = [parameters]

@@ -16,7 +16,6 @@ from omegaconf import OmegaConf, open_dict
 from torch.utils.data import Dataset, Sampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
-import logging
 
 from verl import DataProto
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
@@ -64,26 +63,6 @@ def compute_val_metrics(metrics: Dict[str, Any]) -> Dict[str, Any]:
 class RayAEntTrainer(RayPPOTrainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-    
-        # adaptive entropy control
-        actor_config = self.config.actor_rollout_ref.actor
-        self.entropy_coeff = actor_config.entropy_coeff
-        self.adaptive_entropy_control = False
-        if actor_config.adaptive_entropy.entropy_low >=0 and \
-            actor_config.adaptive_entropy.entropy_high >= actor_config.adaptive_entropy.entropy_low and \
-            actor_config.adaptive_entropy.entropy_coeff_lr>0:
-            self.adaptive_entropy_control = True
-            self.initial_entropy_coeff = actor_config.entropy_coeff
-            self.entropy_coeff_lr = actor_config.adaptive_entropy.entropy_coeff_lr
-            self.entropy_coeff_reg = actor_config.adaptive_entropy.entropy_coeff_reg
-            self.entropy_coeff_warmup = actor_config.adaptive_entropy.entropy_coeff_warmup
-            self.entropy_box = [actor_config.adaptive_entropy.entropy_low,actor_config.adaptive_entropy.entropy_high]
-            self.entropy_coeff_box = [actor_config.adaptive_entropy.entropy_coeff_clip_low,actor_config.adaptive_entropy.entropy_coeff_clip_high]
-            assert self.entropy_coeff_box[0]<=self.entropy_coeff_box[1]
-            assert actor_config.strategy in ['fsdp','fsdp2'] # todo: test megatron
-            assert self.config.actor_rollout_ref.model.use_remove_padding # todo: dim issue in clamp entropy func if not rmpad
-            logging.info(f'Using adaptive entropy control with initial coeff {self.initial_entropy_coeff}')
-
 
     def fit(self):
         """

@@ -34,6 +34,7 @@ exec docker run -it --rm \
   --shm-size=64g \
   --ipc=host \
   -e NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+  -e AENT_IN_DOCKER=1 \
   -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   -e HF_HOME=/workspace/.cache/huggingface \
   -e TRANSFORMERS_CACHE=/workspace/.cache/huggingface \
