@@ -1,0 +1,3 @@
+# Bash under WSL: CRLF ломает интерпретацию (ошибка $'\r': command not found)
+*.bash text eol=lf
+*.sh text eol=lf

@@ -1,0 +1,12 @@
+# Cursor / VS Code: LF для shell-скриптов (WSL/bash ломается на CRLF).
+root = true
+
+[*]
+charset = utf-8
+insert_final_newline = true
+
+[*.{bash,sh}]
+end_of_line = lf
+
+[*.cs]
+end_of_line = lf

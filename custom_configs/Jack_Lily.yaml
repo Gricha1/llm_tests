@@ -1,0 +1,140 @@
+# Jack + Lily: одновременное обучение двух политик в одной сцене.
+# В Unity у обоих Behavior Name должны совпадать с ключами ниже:
+#   JackLowLevelAgent, LilyLowLevelAgent (Behavior Type = Default).
+#
+# Запуск (пример):
+#   mlagents-learn custom_configs/Jack_Lily.yaml --run-id jack_lily_1
+#
+# Совместный старт с весами из двух разных run (без --resume), см. train_scripts/train_ppo.bash:
+#   bash train_scripts/train_ppo.bash <build> <num_envs> Jack_Lily <lily_src_run> <jack_src_run> [out_run_id]
+#   — чекпоинты Лили: results/<lily_src_run>/LilyLowLevelAgent/ (checkpoint.pt или *-<step>.pt)
+#   — чекпоинты Джека: results/<jack_src_run>/JackLowLevelAgent/
+#   — пишет в новый run (авто run_N или явный 6-й аргумент); подставляет init_path в _autogen_Jack_Lily.yaml
+#
+# Основано на: Jack_single_agent.yaml, Lily_single_agent.yaml
+
+default_settings: null
+behaviors:
+  JackLowLevelAgent:
+    trainer_type: ppo
+    hyperparameters:
+      batch_size: 1024
+      buffer_size: 10240
+      learning_rate: 0.0003
+      beta: 0.005
+      epsilon: 0.2
+      lambd: 0.95
+      num_epoch: 3
+      shared_critic: false
+      learning_rate_schedule: linear
+      beta_schedule: linear
+      epsilon_schedule: linear
+    checkpoint_interval: 50000
+    network_settings:
+      normalize: false
+      hidden_units: 256
+      num_layers: 3
+      vis_encode_type: simple
+      memory: null
+      goal_conditioning_type: hyper
+      deterministic: false
+    reward_signals:
+      extrinsic:
+        gamma: 0.99
+        strength: 1.0
+        network_settings:
+          normalize: false
+          hidden_units: 256
+          num_layers: 3
+          vis_encode_type: simple
+          memory: null
+          goal_conditioning_type: hyper
+          deterministic: false
+    init_path: null
+    keep_checkpoints: 0
+    even_checkpoints: false
+    max_steps: 20000000
+    time_horizon: 256
+    summary_freq: 50000
+    threaded: false
+    self_play: null
+    behavioral_cloning: null
+
+  LilyLowLevelAgent:
+    trainer_type: ppo
+    hyperparameters:
+      batch_size: 1024
+      buffer_size: 10240
+      learning_rate: 0.0003
+      beta: 0.005
+      epsilon: 0.2
+      lambd: 0.95
+      num_epoch: 3
+      shared_critic: false
+      learning_rate_schedule: linear
+      beta_schedule: linear
+      epsilon_schedule: linear
+    checkpoint_interval: 50000
+    network_settings:
+      normalize: false
+      hidden_units: 256
+      num_layers: 3
+      vis_encode_type: simple
+      memory: null
+      goal_conditioning_type: hyper
+      deterministic: false
+    reward_signals:
+      extrinsic:
+        gamma: 0.99
+        strength: 1.0
+        network_settings:
+          normalize: false
+          hidden_units: 256
+          num_layers: 3
+          vis_encode_type: simple
+          memory: null
+          goal_conditioning_type: hyper
+          deterministic: false
+    init_path: null
+    keep_checkpoints: 0
+    even_checkpoints: false
+    max_steps: 50000000
+    time_horizon: 256
+    summary_freq: 50000
+    threaded: false
+    self_play: null
+    behavioral_cloning: null
+
+env_settings:
+  env_path: null
+  env_args: null
+  base_port: 5005
+  num_envs: 1
+  num_areas: 1
+  timeout_wait: 60
+  seed: -1
+  max_lifetime_restarts: 10
+  restarts_rate_limit_n: 1
+  restarts_rate_limit_period_s: 60
+engine_settings:
+  width: 1920
+  height: 1024
+  quality_level: 10
+  time_scale: 5
+  target_frame_rate: -1
+  capture_frame_rate: 60
+  no_graphics: false
+  no_graphics_monitor: false
+environment_parameters: null
+checkpoint_settings:
+  run_id: jack_lily
+  initialize_from: null
+  load_model: false
+  resume: false
+  force: false
+  train_model: true
+  inference: false
+  results_dir: results
+torch_settings:
+  device: null
+debug: false

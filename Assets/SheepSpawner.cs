@@ -19,10 +19,23 @@ public class SheepSpawner : MonoBehaviour
     private readonly float minZ = -7.4f;
     private readonly float maxZ = -2.11f;
 
-    private Vector3 SpawnCenter => new Vector3((minX + maxX) * 0.5f, y, (minZ + maxZ) * 0.5f);
+    private Vector3 SpawnCenterLocal => new Vector3((minX + maxX) * 0.5f, y, (minZ + maxZ) * 0.5f);
 
     private List<GameObject> sheeps = new List<GameObject>();
     private float nextRespawnTime;
+    private Transform _envRoot;
+
+    static bool IsAlive(GameObject go) => go != null;
+
+    private void Awake()
+    {
+        _envRoot = TrainingEnvSpace.FindRoot(transform);
+    }
+
+    private Vector3 ToWorld(Vector3 localPos)
+    {
+        return _envRoot != null ? _envRoot.TransformPoint(localPos) : localPos;
+    }
 
     private void Start()
     {
@@ -41,23 +54,26 @@ public class SheepSpawner : MonoBehaviour
 
     private void RemoveDestroyedSheep()
     {
-        sheeps.RemoveAll(s => s == null);
+        sheeps.RemoveAll(s => !IsAlive(s));
     }
 
     private void SpawnOneSheep()
     {
         for (int attempt = 0; attempt < 100; attempt++)
         {
-            Vector3 pos = new Vector3(
+            Vector3 pos = ToWorld(new Vector3(
                 Random.Range(minX, maxX),
                 y,
                 Random.Range(minZ, maxZ)
-            );
+            ));
 
             bool tooClose = false;
             foreach (var sheep in sheeps)
             {
-                if (sheep != null && Vector3.Distance(pos, sheep.transform.position) < minDistance)
+                if (!IsAlive(sheep))
+                    continue;
+
+                if (Vector3.Distance(pos, sheep.transform.position) < minDistance)
                 {
                     tooClose = true;
                     break;
@@ -83,7 +99,7 @@ public class SheepSpawner : MonoBehaviour
     {
         var wander = sheepObj.GetComponent<SheepWander>();
         if (wander != null)
-            wander.SetSpawnArea(SpawnCenter, maxDistanceFromSpawn);
+            wander.SetSpawnArea(ToWorld(SpawnCenterLocal), maxDistanceFromSpawn);
     }
 
     public void ResetSheep()
@@ -104,15 +120,18 @@ public class SheepSpawner : MonoBehaviour
             {
                 attempts++;
 
-                Vector3 pos = new Vector3(
+                Vector3 pos = ToWorld(new Vector3(
                     Random.Range(minX, maxX),
                     y,
                     Random.Range(minZ, maxZ)
-                );
+                ));
 
                 bool tooClose = false;
                 foreach (var sheep in sheeps)
                 {
+                    if (!IsAlive(sheep))
+                        continue;
+
                     if (Vector3.Distance(pos, sheep.transform.position) < minDistance)
                     {
                         tooClose = true;
@@ -146,7 +165,7 @@ public class SheepSpawner : MonoBehaviour
     {
         foreach (var sheep in sheeps)
         {
-            if (sheep != null)
+            if (IsAlive(sheep))
                 Destroy(sheep);
         }
         sheeps.Clear();

@@ -76,6 +76,7 @@ public class ZombieAttack : MonoBehaviour
 
         int damage = Mathf.Max(1, target.MaxHp / 5);
         target.TakeDamage(damage);
+        GameSfx.PlayZombieHitAgent(source: targetTr);
     }
 
     private void TryPlayAttackAnim()

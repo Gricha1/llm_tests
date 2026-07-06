@@ -22,9 +22,22 @@ fi
 cd "$(dirname "$0")"
 cd ..
 
-PY_BIN="python3"
-if ! command -v python3 >/dev/null 2>&1; then
-  PY_BIN="python"
+PY_BIN="${PY_BIN:-}"
+if [ -z "${PY_BIN}" ] && [ -n "${CONDA_PREFIX:-}" ] && [ -x "${CONDA_PREFIX}/bin/python" ]; then
+  PY_BIN="${CONDA_PREFIX}/bin/python"
+fi
+if [ -z "${PY_BIN}" ] && command -v mlagents-learn >/dev/null 2>&1; then
+  shebang="$(head -1 "$(command -v mlagents-learn)" | sed 's/^#! *//')"
+  if [ -n "${shebang}" ] && [ -x "${shebang}" ]; then
+    PY_BIN="${shebang}"
+  fi
+fi
+if [ -z "${PY_BIN}" ] || ! command -v "${PY_BIN}" >/dev/null 2>&1; then
+  if command -v python3 >/dev/null 2>&1; then
+    PY_BIN="python3"
+  else
+    PY_BIN="python"
+  fi
 fi
 
 raw="${1%/}"
@@ -71,11 +84,17 @@ cands.sort(reverse=True, key=lambda x: x[0])
 if not cands:
     sys.exit(1)
 
-import torch
+try:
+    import torch
+except ImportError:
+    step, p = cands[0]
+    print(f"{step}\t{p}")
+    sys.exit(0)
+
 for step, p in cands:
     try:
         try:
-            torch.load(p, map_location="cpu", weights_only=True)
+            torch.load(p, map_location="cpu", weights_only=False)
         except TypeError:
             torch.load(p, map_location="cpu")
         print(f"{step}\t{p}")
@@ -85,6 +104,27 @@ for step, p in cands:
 sys.exit(2)
 PY
   )" || true
+
+  if [ -z "${best_file}" ]; then
+    # Fallback: max step by filename (no torch validation).
+    best_file="$(
+      "${PY_BIN}" - <<'PY' "${beh_dir}" 2>/dev/null
+import glob, os, re, sys
+
+beh_dir = sys.argv[1]
+rx = re.compile(r"^(.+)-(\d+)\.pt$")
+cands = []
+for p in glob.glob(os.path.join(beh_dir, "*.pt")):
+    m = rx.match(os.path.basename(p))
+    if m:
+        cands.append((int(m.group(2)), p))
+if not cands:
+    sys.exit(1)
+step, p = max(cands, key=lambda x: x[0])
+print(f"{step}\t{p}")
+PY
+    )" || true
+  fi
 
   if [ -z "${best_file}" ]; then
     echo "[promote] skip (нет валидных *-<steps>.pt): ${beh_dir}"

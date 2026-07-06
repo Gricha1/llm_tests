@@ -25,6 +25,19 @@ public class FlowerSpawner : MonoBehaviour
 
     private List<GameObject> flowers = new List<GameObject>();
     private float nextRespawnTime;
+    private Transform _envRoot;
+
+    static bool IsAlive(GameObject go) => go != null;
+
+    private void Awake()
+    {
+        _envRoot = TrainingEnvSpace.FindRoot(transform);
+    }
+
+    private Vector3 ToWorld(Vector3 localPos)
+    {
+        return _envRoot != null ? _envRoot.TransformPoint(localPos) : localPos;
+    }
 
     private void Start()
     {
@@ -44,7 +57,7 @@ public class FlowerSpawner : MonoBehaviour
 
     private void RemoveDestroyed()
     {
-        flowers.RemoveAll(f => f == null);
+        flowers.RemoveAll(f => !IsAlive(f));
     }
 
     private void SpawnOne()
@@ -52,16 +65,19 @@ public class FlowerSpawner : MonoBehaviour
         for (int attempt = 0; attempt < 100; attempt++)
         {
             GameObject prefab = flowerPrefabs[Random.Range(0, flowerPrefabs.Length)];
-            Vector3 pos = new Vector3(
+            Vector3 pos = ToWorld(new Vector3(
                 Random.Range(areaMinX, areaMaxX),
                 spawnY,
                 Random.Range(areaMinZ, areaMaxZ)
-            );
+            ));
 
             bool tooClose = false;
             foreach (var f in flowers)
             {
-                if (f != null && Vector3.Distance(pos, f.transform.position) < minDistance)
+                if (!IsAlive(f))
+                    continue;
+
+                if (Vector3.Distance(pos, f.transform.position) < minDistance)
                 {
                     tooClose = true;
                     break;
@@ -108,15 +124,18 @@ public class FlowerSpawner : MonoBehaviour
             for (int attempt = 0; attempt < 100; attempt++)
             {
                 GameObject prefab = flowerPrefabs[Random.Range(0, flowerPrefabs.Length)];
-                Vector3 pos = new Vector3(
+                Vector3 pos = ToWorld(new Vector3(
                     Random.Range(areaMinX, areaMaxX),
                     spawnY,
                     Random.Range(areaMinZ, areaMaxZ)
-                );
+                ));
 
                 bool tooClose = false;
                 foreach (var f in flowers)
                 {
+                    if (!IsAlive(f))
+                        continue;
+
                     if (Vector3.Distance(pos, f.transform.position) < minDistance)
                     {
                         tooClose = true;
@@ -139,7 +158,7 @@ public class FlowerSpawner : MonoBehaviour
     {
         foreach (var f in flowers)
         {
-            if (f != null)
+            if (IsAlive(f))
                 Destroy(f);
         }
         flowers.Clear();

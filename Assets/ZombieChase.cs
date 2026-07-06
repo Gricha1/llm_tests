@@ -59,17 +59,19 @@ public class ZombieChase : MonoBehaviour
         stunnedUntilTime = Mathf.Max(stunnedUntilTime, Time.time + seconds);
     }
 
-    public void RegisterMeleeDoHitAndMaybeDie(int hitsToDie = 2)
+    public bool RegisterMeleeDoHitAndMaybeDie(int hitsToDie = 2)
     {
         meleeDoHitsFromAgents++;
         if (hitsToDie > 0 && meleeDoHitsFromAgents >= hitsToDie)
         {
             Destroy(gameObject);
+            return true;
         }
+        return false;
     }
 
     // Backward compatibility (old name used by Jack).
-    public void RegisterJackDoHitAndMaybeDie(int hitsToDie = 2) => RegisterMeleeDoHitAndMaybeDie(hitsToDie);
+    public bool RegisterJackDoHitAndMaybeDie(int hitsToDie = 2) => RegisterMeleeDoHitAndMaybeDie(hitsToDie);
 
     private void OnEnable()
     {
@@ -87,13 +89,27 @@ public class ZombieChase : MonoBehaviour
 
         if (jackTarget == null)
         {
-            var jack = FindObjectOfType<AgentGoToHouseDiscrete>();
-            if (jack != null) jackTarget = jack.transform;
+            var envRoot = TrainingEnvSpace.FindRoot(transform);
+            foreach (var jack in FindObjectsOfType<AgentGoToHouseDiscrete>())
+            {
+                if (envRoot == null || TrainingEnvSpace.IsDescendantOf(jack.transform, envRoot))
+                {
+                    jackTarget = jack.transform;
+                    break;
+                }
+            }
         }
         if (lilyTarget == null)
         {
-            var lily = FindObjectOfType<LilyScript>();
-            if (lily != null) lilyTarget = lily.transform;
+            var envRoot = TrainingEnvSpace.FindRoot(transform);
+            foreach (var lily in FindObjectsOfType<LilyScript>())
+            {
+                if (envRoot == null || TrainingEnvSpace.IsDescendantOf(lily.transform, envRoot))
+                {
+                    lilyTarget = lily.transform;
+                    break;
+                }
+            }
         }
     }
 
@@ -358,25 +374,33 @@ public class ZombieChase : MonoBehaviour
         pos.y = 0f;
 
         float distJack = float.MaxValue;
-        if (jackTarget != null && jackTarget.gameObject.activeInHierarchy)
+        if (jackTarget != null)
         {
-            Vector3 j = jackTarget.position;
-            j.y = 0f;
-            distJack = Vector3.Distance(pos, j);
+            var jackGo = jackTarget.gameObject;
+            if (jackGo != null && jackGo.activeInHierarchy)
+            {
+                Vector3 j = jackTarget.position;
+                j.y = 0f;
+                distJack = Vector3.Distance(pos, j);
+            }
         }
 
         float distLily = float.MaxValue;
-        if (lilyTarget != null && lilyTarget.gameObject.activeInHierarchy)
+        if (lilyTarget != null)
         {
-            Vector3 l = lilyTarget.position;
-            l.y = 0f;
-            distLily = Vector3.Distance(pos, l);
+            var lilyGo = lilyTarget.gameObject;
+            if (lilyGo != null && lilyGo.activeInHierarchy)
+            {
+                Vector3 l = lilyTarget.position;
+                l.y = 0f;
+                distLily = Vector3.Distance(pos, l);
+            }
         }
 
         if (distJack <= distLily && jackTarget != null)
             return jackTarget;
         if (lilyTarget != null)
             return lilyTarget;
-        return jackTarget;
+        return null;
     }
 }

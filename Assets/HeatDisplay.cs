@@ -1,29 +1,46 @@
 using UnityEngine;
 using TMPro;
-using Unity.MLAgents;
 
 public class HeatDisplay : MonoBehaviour
 {
     [SerializeField] private AgentGoToHouseDiscrete agent;
     [SerializeField] private TMP_SpriteAsset spriteAsset;
-    private TMP_Text text;
+    [SerializeField] private float pulseSpeed = 5f;
+    [SerializeField] private float pulseMinSizePercent = 85f;
+    [SerializeField] private float pulseMaxSizePercent = 135f;
+
+    TMP_Text _text;
 
     void Awake()
     {
-        text = GetComponent<TMP_Text>();
-        if (text != null)
-        {
-            text.richText = true;
-        }
+        _text = GetComponent<TMP_Text>();
+        if (_text != null)
+            _text.richText = true;
     }
 
-    void Update()
+    void LateUpdate()
     {
-        if (text == null || agent == null) return;
+        if (_text == null)
+            return;
 
-        if (spriteAsset != null && text.spriteAsset != spriteAsset)
-            text.spriteAsset = spriteAsset;
+        if (agent == null || !agent.gameObject.activeInHierarchy)
+            agent = TrainingEnvSpace.FindInPresentation<AgentGoToHouseDiscrete>();
 
-        text.text = $"<sprite=0> {agent.heat}";
+        if (agent == null)
+            return;
+
+        if (spriteAsset != null && _text.spriteAsset != spriteAsset)
+            _text.spriteAsset = spriteAsset;
+
+        if (agent.heat <= 0)
+        {
+            float wave = (Mathf.Sin(Time.unscaledTime * pulseSpeed) + 1f) * 0.5f;
+            int sizePct = Mathf.RoundToInt(Mathf.Lerp(pulseMinSizePercent, pulseMaxSizePercent, wave));
+            _text.text = $"<size={sizePct}%><sprite=0></size> {agent.heat}";
+        }
+        else
+        {
+            _text.text = $"<sprite=0> {agent.heat}";
+        }
     }
 }

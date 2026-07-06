@@ -84,11 +84,32 @@ public class LilyScript : Agent, IHasHp
     [SerializeField] private int maxLove = 100;
     [SerializeField] private float loveDecayInterval = 8f;
 
-    [Header("Zombie (только наблюдения / окружение)")]
+    [Header("Zombie (наблюдения + DO-удар, слой тот же)")]
     [SerializeField] private LayerMask zombieLayer;
+
+    [Header("DO — удар по зомби (логика как у JackScript)")]
+    [Tooltip("Если при DO рядом есть зомби — Лилия получает урон (по умолчанию выкл., как у Джека).")]
+    [SerializeField] private bool damageOnDoIfZombieNearby = false;
+    [SerializeField] private float zombieNearbyRadiusOnDo = 1.5f;
+    [SerializeField] private int zombieDamageOnDo = 0;
+    [Tooltip("Если при DO рядом есть зомби — отталкиваем ближайшего (один за раз).")]
+    [SerializeField] private bool knockbackZombieOnDo = true;
+    [SerializeField] private float zombieKnockbackRadiusOnDo = 1.6f;
+    [SerializeField] private float zombieKnockbackDistanceOnDo = 0.65f;
+    [SerializeField] private float zombieKnockbackUpOnDo = 0.18f;
+    [SerializeField] private float zombieKnockbackImpulseOnDo = 2.0f;
+    [SerializeField] private float zombieKnockbackUpFactorOnDo = 0.45f;
+    [SerializeField] private float zombieStunSecondsOnDo = 1.0f;
+    [SerializeField] private bool zombieDiesInTwoDoHits = true;
+    [SerializeField] private int zombieDamageToZombieOnDo = 1;
+    [SerializeField] private float rewardOnZombieHitDo = 1.0f;
+    [Tooltip("Зомби за спиной не бьются DO. dot(forward, к зомби): 0 = полусфера впереди, 0.5 ≈ 60°, 1 = строго вперёд.")]
+    [SerializeField] [Range(0f, 1f)] private float zombieDoMinForwardDot = 0.5f;
 
     [Header("HP")]
     [SerializeField] private int maxHp = 100;
+    [Tooltip("Штраф за каждый полученный урон (один вызов TakeDamage). 0 = выкл.")]
+    [SerializeField] private float hpLossPenaltyPerHit = 10f;
     public int hp { get; private set; }
 
     [Header("Curriculum (последовательное обучение)")]
@@ -113,6 +134,8 @@ public class LilyScript : Agent, IHasHp
 
     private CharacterController controller;
     private Animator animator;
+
+    private bool ControllerReady => controller != null && controller.enabled;
     private float verticalVelocity;
     [SerializeField] private float gravity = -9.81f;
     private float prevFlowerDist = -1f;
@@ -172,6 +195,18 @@ public class LilyScript : Agent, IHasHp
         _lastShowOptionTaskIcon = showOptionTaskIcon;
         EnsureOptionIconRenderer();
         UpdateOptionIconVisual();
+        AgentFootsteps.EnsureOn(gameObject);
+
+        // Как у Jack: не снимаем HP с агента за его же DO (старые значения в сцене).
+        damageOnDoIfZombieNearby = false;
+        zombieDamageOnDo = 0;
+
+        if (zombieLayer.value == 0)
+        {
+            int zombieLayerId = LayerMask.NameToLayer("Zombie");
+            if (zombieLayerId >= 0)
+                zombieLayer = 1 << zombieLayerId;
+        }
     }
 
     private void EnsureOptionIconRenderer()
@@ -297,18 +332,33 @@ public class LilyScript : Agent, IHasHp
         }
     }
 
+    private bool _deathSequenceStarted;
+
     public void TakeDamage(int amount)
     {
+        if (amount <= 0 || _deathSequenceStarted) return;
         hp = Mathf.Max(0, hp - amount);
+        AgentHitFlash.GetOrCreate(gameObject).Flash();
+        if (hpLossPenaltyPerHit != 0f)
+            AddReward(-hpLossPenaltyPerHit);
         if (hp <= 0)
         {
+            _deathSequenceStarted = true;
             EvalEpisodeTracker.NotifyEpisodeEnded();
-            EndEpisode();
+            AgentDeathOverlay.ShowAndEndEpisode(this, "Лили погибла");
         }
     }
 
     public override void OnEpisodeBegin()
     {
+        _deathSequenceStarted = false;
+        if (TrainingEnvSpace.IsPresentationTransform(transform))
+        {
+            DeathFreeze.UnfreezeWorld();
+            AgentDeathOverlay.Hide();
+            BackgroundMusic.ResumeMusic();
+        }
+
         stepCount = 0;
         prevFlowerDist = -1f;
         prevJackDist = -1f;
@@ -341,13 +391,13 @@ public class LilyScript : Agent, IHasHp
         controller.enabled = false;
         if (spawnAtFixedPosition)
         {
-            transform.position = fixedSpawnPosition;
-            transform.rotation = Quaternion.identity; // 0 0 0
+            transform.position = TrainingEnvSpace.LocalToWorld(transform, fixedSpawnPosition);
+            transform.rotation = TrainingEnvSpace.LocalToWorldRotation(transform, Vector3.zero);
         }
         else
         {
-            transform.position = new Vector3(randX, y, randZ);
-            transform.rotation = Quaternion.Euler(0f, Random.Range(0f, 360f), 0f);
+            transform.position = TrainingEnvSpace.LocalToWorld(transform, new Vector3(randX, y, randZ));
+            transform.rotation = TrainingEnvSpace.LocalToWorldRotation(transform, new Vector3(0f, Random.Range(0f, 360f), 0f));
         }
         controller.enabled = true;
 
@@ -368,8 +418,6 @@ public class LilyScript : Agent, IHasHp
 
         UpdateOptionIconVisual();
     }
-
-    // Опции "зомби" у Lily нет.
 
     private bool GetNearestFlower(out GameObject nearestFlower, out float distance)
     {
@@ -429,7 +477,7 @@ public class LilyScript : Agent, IHasHp
     {
         nearestZombie = null;
         distance = float.MaxValue;
-        if (zombieLayer == 0) return false;
+        if (zombieLayer.value == 0) return false;
         Collider[] hits = Physics.OverlapSphere(transform.position, MaxZombieDistForObs, zombieLayer);
         foreach (var hit in hits)
         {
@@ -442,6 +490,139 @@ public class LilyScript : Agent, IHasHp
             }
         }
         return nearestZombie != null;
+    }
+
+    private bool IsZombieColliderInFrontForDo(Vector3 origin, Collider c)
+    {
+        if (c == null) return false;
+        Vector3 toTarget = c.ClosestPoint(origin) - origin;
+        toTarget.y = 0f;
+        if (toTarget.sqrMagnitude < 1e-6f) return true;
+
+        Vector3 fwd = transform.forward;
+        fwd.y = 0f;
+        if (fwd.sqrMagnitude < 1e-6f) return true;
+        fwd.Normalize();
+        toTarget.Normalize();
+        return Vector3.Dot(fwd, toTarget) >= zombieDoMinForwardDot;
+    }
+
+    private bool IsZombieNearbyForDo()
+    {
+        if (zombieNearbyRadiusOnDo <= 0f) return false;
+        if (zombieLayer.value == 0) return false;
+
+        Vector3 origin = transform.position;
+        Collider[] hits = Physics.OverlapSphere(origin, zombieNearbyRadiusOnDo, zombieLayer);
+        if (hits == null || hits.Length == 0) return false;
+
+        foreach (var c in hits)
+        {
+            if (c == null) continue;
+            if (c.GetComponentInParent<ZombieChase>() == null) continue;
+            if (!IsZombieColliderInFrontForDo(origin, c)) continue;
+            return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>Копия логики JackScript.KnockbackNearbyZombiesOnDo: один ближайший зомби с ZombieChase, урон + откидывание.</summary>
+    private void KnockbackNearbyZombiesOnLilyDo()
+    {
+        if (zombieLayer.value == 0) return;
+        if (zombieKnockbackRadiusOnDo <= 0f) return;
+        if (zombieKnockbackDistanceOnDo <= 0f && zombieKnockbackImpulseOnDo <= 0f) return;
+
+        Vector3 origin = transform.position;
+        Collider[] hits = Physics.OverlapSphere(origin, zombieKnockbackRadiusOnDo, zombieLayer);
+        if (hits == null || hits.Length == 0) return;
+
+        ZombieChase bestZombie = null;
+        Collider bestZombieCollider = null;
+        float bestDist = float.MaxValue;
+        for (int i = 0; i < hits.Length; i++)
+        {
+            var c = hits[i];
+            if (c == null) continue;
+            var z = c.GetComponentInParent<ZombieChase>();
+            if (z == null) continue;
+            if (!IsZombieColliderInFrontForDo(origin, c)) continue;
+
+            float d = Vector3.Distance(origin, c.ClosestPoint(origin));
+            if (d < bestDist)
+            {
+                bestDist = d;
+                bestZombie = z;
+                bestZombieCollider = c;
+            }
+        }
+        if (bestZombie == null) return;
+
+        GameSfx.PlayJackLilyHitZombie(source: transform);
+
+        if (rewardOnZombieHitDo != 0f)
+            AddReward(rewardOnZombieHitDo);
+
+        var zhBest = bestZombie.GetComponent<ZombieHealth>()
+            ?? bestZombie.GetComponentInParent<ZombieHealth>()
+            ?? bestZombie.GetComponentInChildren<ZombieHealth>();
+        if (zhBest == null && bestZombieCollider != null)
+        {
+            zhBest = bestZombieCollider.GetComponent<ZombieHealth>()
+                ?? bestZombieCollider.GetComponentInParent<ZombieHealth>()
+                ?? bestZombieCollider.GetComponentInChildren<ZombieHealth>();
+        }
+
+        bool zombieKilled = false;
+        if (zhBest != null)
+        {
+            int damage = zombieDamageToZombieOnDo;
+            if (zombieDiesInTwoDoHits)
+                damage = Mathf.Max(1, Mathf.CeilToInt(zhBest.MaxHp / 2f));
+            if (damage > 0)
+            {
+                int prevHp = zhBest.Hp;
+                zhBest.TakeDamage(damage, transform.position);
+                if (prevHp > 0 && (zhBest == null || zhBest.Hp <= 0))
+                    zombieKilled = true;
+            }
+        }
+
+        if (!zombieKilled && bestZombie != null && bestZombie.RegisterJackDoHitAndMaybeDie(2))
+            zombieKilled = true;
+
+        if (zombieKilled)
+        {
+            FloatingRewardPopup.ShowZombieKill(transform, rewardOnZombieHitDo);
+            return;
+        }
+
+        Transform zt = bestZombie.transform;
+        Vector3 dir = zt.position - origin;
+        dir.y = 0f;
+        if (dir.sqrMagnitude < 0.0001f) dir = zt.forward;
+        dir = dir.normalized;
+
+        var zControllerBest = bestZombie.GetComponent<CharacterController>();
+        if (zControllerBest != null && zControllerBest.enabled)
+        {
+            Vector3 delta = dir * zombieKnockbackDistanceOnDo;
+            delta.y = zombieKnockbackUpOnDo;
+            zControllerBest.Move(delta);
+            if (zombieStunSecondsOnDo > 0f)
+                bestZombie.Stun(zombieStunSecondsOnDo);
+            return;
+        }
+
+        var zRbBest = bestZombie.GetComponent<Rigidbody>();
+        if (zRbBest != null)
+        {
+            Vector3 forceDir = (dir + Vector3.up * Mathf.Max(0f, zombieKnockbackUpFactorOnDo)).normalized;
+            zRbBest.AddForce(forceDir * zombieKnockbackImpulseOnDo, ForceMode.Impulse);
+            if (zombieStunSecondsOnDo > 0f)
+                bestZombie.Stun(zombieStunSecondsOnDo);
+        }
     }
 
     public override void CollectObservations(VectorSensor sensor)
@@ -475,6 +656,9 @@ public class LilyScript : Agent, IHasHp
 
     public override void OnActionReceived(ActionBuffers actions)
     {
+        if (_deathSequenceStarted)
+            return;
+
         if (followPath)
         {
             PathStep();
@@ -506,6 +690,15 @@ public class LilyScript : Agent, IHasHp
         if (collectReady && animator != null && doActionAnimTrigger.Length > 0)
             animator.SetTrigger(doActionAnimTrigger);
 
+        // DO по зомби: как у Jack — на фронте DO, независимо от того, собрали ли цветок / поцеловали ли.
+        if (collectReady)
+        {
+            if (damageOnDoIfZombieNearby && zombieDamageOnDo > 0 && IsZombieNearbyForDo())
+                TakeDamage(zombieDamageOnDo);
+            if (knockbackZombieOnDo)
+                KnockbackNearbyZombiesOnLilyDo();
+        }
+
         // Дискретные действия как у Jack: ветка0 — 1 вперёд, 3 назад, 2 стой; ветка1 — 1/3 поворот, 2 не крутить
         float moveInput = 0f;
         if (moveAction == 1) moveInput = 1f;
@@ -517,13 +710,17 @@ public class LilyScript : Agent, IHasHp
 
         transform.Rotate(0f, rotateInput * rotationSpeed * Time.deltaTime, 0f);
 
-        if (controller.isGrounded)
-            verticalVelocity = verticalVelocity < 0f ? -2f : verticalVelocity;
-        else
-            verticalVelocity += gravity * Time.deltaTime;
+        if (ControllerReady)
+        {
+            if (controller.isGrounded)
+                verticalVelocity = verticalVelocity < 0f ? -2f : verticalVelocity;
+            else
+                verticalVelocity += gravity * Time.deltaTime;
 
-        Vector3 move = transform.forward * moveInput * moveSpeed + Vector3.up * verticalVelocity;
-        controller.Move(move * Time.deltaTime);
+            Vector3 move = transform.forward * moveInput * moveSpeed + Vector3.up * verticalVelocity;
+            controller.Move(move * Time.deltaTime);
+            AgentFootsteps.NotifyMovement(gameObject, Mathf.Abs(moveInput) * moveSpeed);
+        }
 
         _lastPlanarMoveInput = moveInput;
 
@@ -575,6 +772,7 @@ public class LilyScript : Agent, IHasHp
             {
                 FlowerCount = Mathf.Min(maxFlowerCount, FlowerCount + 1);
                 AddReward(collectReward);
+                FloatingRewardPopup.ShowCollectedFlower(transform, collectReward);
                 prevFlowerDist = -1f;
             }
             else if (GetNearestFlower(out _, out float currDist))
@@ -595,6 +793,7 @@ public class LilyScript : Agent, IHasHp
             {
                 Love = Mathf.Min(maxLove, Love + 1);
                 AddReward(kissReward);
+                FloatingRewardPopup.ShowKissedJack(transform, kissReward);
                 prevJackDist = -1f;
             }
             else if (jackTarget != null)
@@ -769,23 +968,28 @@ public class LilyScript : Agent, IHasHp
         }
 
         // Гравитация + движение к точке
-        if (controller.isGrounded)
-            verticalVelocity = verticalVelocity < 0f ? -2f : verticalVelocity;
-        else
-            verticalVelocity += gravity * Time.deltaTime;
-
-        float moveLen = moveSpeed * Time.deltaTime;
-        Vector3 movePlanar = dist > 0.0001f ? delta.normalized * Mathf.Min(moveLen, dist) : Vector3.zero;
-        Vector3 move = movePlanar + Vector3.up * verticalVelocity * Time.deltaTime;
-        controller.Move(move);
-
-        if (animator != null)
+        if (ControllerReady)
         {
-            float t = moveSpeed > 1e-4f ? Mathf.Clamp01(movePlanar.magnitude / (moveSpeed * Time.deltaTime + 1e-6f)) : 0f;
-            if (walkAnimSpeedDamp > 0f)
-                animator.SetFloat("Speed", t, walkAnimSpeedDamp, Time.deltaTime);
+            if (controller.isGrounded)
+                verticalVelocity = verticalVelocity < 0f ? -2f : verticalVelocity;
             else
-                animator.SetFloat("Speed", t);
+                verticalVelocity += gravity * Time.deltaTime;
+
+            float moveLen = moveSpeed * Time.deltaTime;
+            Vector3 movePlanar = dist > 0.0001f ? delta.normalized * Mathf.Min(moveLen, dist) : Vector3.zero;
+            Vector3 move = movePlanar + Vector3.up * verticalVelocity * Time.deltaTime;
+            controller.Move(move);
+
+            AgentFootsteps.NotifyMovement(gameObject, movePlanar.magnitude / Mathf.Max(Time.deltaTime, 1e-5f));
+
+            if (animator != null)
+            {
+                float t = moveSpeed > 1e-4f ? Mathf.Clamp01(movePlanar.magnitude / (moveSpeed * Time.deltaTime + 1e-6f)) : 0f;
+                if (walkAnimSpeedDamp > 0f)
+                    animator.SetFloat("Speed", t, walkAnimSpeedDamp, Time.deltaTime);
+                else
+                    animator.SetFloat("Speed", t);
+            }
         }
 
         if (dist <= pathArriveDistance)

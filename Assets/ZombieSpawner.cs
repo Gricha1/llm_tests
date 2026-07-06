@@ -33,6 +33,9 @@ public class ZombieSpawner : MonoBehaviour
 
     private List<GameObject> zombies = new List<GameObject>();
     private float nextRespawnTime;
+    Transform _spawnProxy;
+
+    static bool IsAlive(GameObject go) => go != null;
 
     private void OnEnable()
     {
@@ -50,6 +53,8 @@ public class ZombieSpawner : MonoBehaviour
     {
         if (useTransformPositionAsSpawn)
             spawnPosition = transform.position;
+        else
+            spawnPosition = TrainingEnvSpace.LocalToWorld(transform, spawnPosition);
 
         if (spawn_idle)
         {
@@ -87,15 +92,53 @@ public class ZombieSpawner : MonoBehaviour
 
     private void RemoveDestroyed()
     {
-        zombies.RemoveAll(z => z == null);
+        zombies.RemoveAll(z => !IsAlive(z));
+    }
+
+    Transform EnsureActiveSpawnProxy()
+    {
+        if (_spawnProxy != null)
+            return _spawnProxy;
+
+        var proxyGo = new GameObject($"{gameObject.name}_SpawnProxy");
+        var envRoot = TrainingEnvSpace.FindRoot(transform);
+        proxyGo.transform.SetParent(envRoot != null ? envRoot : transform, false);
+        proxyGo.transform.SetPositionAndRotation(transform.position, transform.rotation);
+        proxyGo.SetActive(true);
+        _spawnProxy = proxyGo.transform;
+        return _spawnProxy;
+    }
+
+    Transform ResolveSpawnParent()
+    {
+        if (gameObject.activeInHierarchy)
+            return transform;
+
+        return EnsureActiveSpawnProxy();
+    }
+
+    void ClearSpawnProxyChildren()
+    {
+        if (_spawnProxy == null)
+            return;
+
+        for (int i = _spawnProxy.childCount - 1; i >= 0; i--)
+        {
+            var child = _spawnProxy.GetChild(i);
+            if (child != null)
+                Destroy(child.gameObject);
+        }
+    }
+
+    void OnDestroy()
+    {
+        if (_spawnProxy != null)
+            Destroy(_spawnProxy.gameObject);
     }
 
     private void SpawnOne()
     {
-        GameObject zombie = Instantiate(zombiePrefab, spawnPosition, Quaternion.Euler(0f, Random.Range(0f, 360f), 0f), transform);
-        SetZombieLayer(zombie);
-        EnsureZombieComponents(zombie);
-        zombies.Add(zombie);
+        SpawnOneAt(spawnPosition);
     }
 
     private void SpawnIdleGrid(int count)
@@ -124,7 +167,11 @@ public class ZombieSpawner : MonoBehaviour
 
     private void SpawnOneAt(Vector3 worldPos)
     {
-        GameObject zombie = Instantiate(zombiePrefab, worldPos, Quaternion.Euler(0f, Random.Range(0f, 360f), 0f), transform);
+        if (zombiePrefab == null)
+            return;
+
+        Transform parent = ResolveSpawnParent();
+        GameObject zombie = Instantiate(zombiePrefab, worldPos, Quaternion.Euler(0f, Random.Range(0f, 360f), 0f), parent);
         SetZombieLayer(zombie);
         EnsureZombieComponents(zombie);
         zombies.Add(zombie);
@@ -153,19 +200,64 @@ public class ZombieSpawner : MonoBehaviour
 
     private void SetLayerRecursively(GameObject go, int layer)
     {
+        if (!IsAlive(go))
+            return;
+
         go.layer = layer;
         foreach (Transform child in go.transform)
+        {
+            if (child == null)
+                continue;
             SetLayerRecursively(child.gameObject, layer);
+        }
     }
 
     /// <summary>Очистить всех зомби (например при новом эпизоде).</summary>
     public void ClearZombies()
     {
+        RemoveDestroyed();
         foreach (var z in zombies)
         {
-            if (z != null)
+            if (IsAlive(z))
                 Destroy(z);
         }
         zombies.Clear();
+        ClearSpawnProxyChildren();
+    }
+
+    /// <summary>Спавн count зомби вокруг worldPos (Twitch #zombie=N). Возвращает сколько создано.</summary>
+    public int SpawnZombiesNear(Vector3 worldPos, int count, float radius = 7f)
+    {
+        if (zombiePrefab == null)
+            return 0;
+
+        count = Mathf.Clamp(count, 1, 10);
+        RemoveDestroyed();
+
+        int spawned = 0;
+        float groundY = worldPos.y;
+
+        for (int i = 0; i < count; i++)
+        {
+            Vector2 ring = Random.insideUnitCircle * radius;
+            Vector3 pos = new Vector3(worldPos.x + ring.x, groundY, worldPos.z + ring.y);
+            SpawnOneAt(pos);
+            spawned++;
+        }
+
+        return spawned;
+    }
+
+    /// <summary>Убить всех зомби и заново запустить спавн (новый эпизод).</summary>
+    public void ResetForNewEpisode()
+    {
+        ClearZombies();
+        if (!gameObject.activeInHierarchy)
+        {
+            nextRespawnTime = Time.time + spawnInterval;
+            return;
+        }
+
+        BootstrapSpawn();
     }
 }

@@ -1,20 +1,13 @@
 using UnityEngine;
-using TMPro;
-using Unity.MLAgents;
 
+/// <summary>
+/// Legacy component on LilyRewardText — отключён, если на том же объекте есть RewardDisplay.
+/// </summary>
 public class LilyRewardDisplay : MonoBehaviour
 {
-    [SerializeField] private Agent agent;
-    private TMP_Text text;
-
-    void Start()
+    void Awake()
     {
-        text = GetComponent<TMP_Text>();
-    }
-
-    void Update()
-    {
-        if (agent != null && text != null)
-            text.text = $"Reward: {agent.GetCumulativeReward():F2}";
+        if (GetComponent<RewardDisplay>() != null)
+            enabled = false;
     }
 }

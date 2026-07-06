@@ -24,7 +24,6 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     [SerializeField] private Vector3 fixedSpawnEuler = new Vector3(0f, 177.644073f, 0f);
 
     [Header("HUD")]
-    [Tooltip("Показывать HUD HP (левый верхний угол) для Jack/Lily. Выключи, чтобы полностью убрать этот HUD до Play.")]
     [SerializeField] private bool showHudHpTopLeft = true;
 
     [Header("Option Sampling (Wood/Food)")]
@@ -93,11 +92,23 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     public int heat;
     private float heatTimer;
 
+    [Header("Freezing (heat = 0)")]
+    [SerializeField] private float freezeDamageInterval = 0.25f;
+    [SerializeField] private int freezeDamageAmount = 1;
+    [SerializeField] private float freezePenaltyPerTick = -0.5f;
+    private float _freezeTimer;
+
     [Header("Hunger / Satiety")]
     [SerializeField] private int maxSatiety = 20;  // максимум сытости
     public int satiety;                               // текущая сытость
     private float satietyTimer;
     [SerializeField] private float satietyDecayInterval = 5.0f; // секунд на 1 единицу сытости
+
+    [Header("Starving (satiety = 0)")]
+    [SerializeField] private float hungerDamageInterval = 0.25f;
+    [SerializeField] private int hungerDamageAmount = 1;
+    [SerializeField] private float hungerPenaltyPerTick = -0.5f;
+    private float _hungerTimer;
 
     [Header("Movement")]
     [SerializeField] private float moveSpeed = 3f;
@@ -116,6 +127,8 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
 
     [Header("HP")]
     [SerializeField] private int maxHp = 100;
+    [Tooltip("Штраф за каждый полученный урон (один вызов TakeDamage). 0 = выкл.")]
+    [SerializeField] private float hpLossPenaltyPerHit = 10f;
     public int hp { get; private set; }
     public int Hp => hp;
     public int MaxHp => maxHp;
@@ -139,16 +152,54 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
 
     private float prevTreeDist;
 
+    [Header("Survival Task")]
+    [SerializeField] private float survivalGoalSeconds = 120f;
+    [SerializeField] private float phase1CompleteReward = 5f;
+    [SerializeField] private ZombieSpawner zombieSpawner;
+    private float _episodeStartTime;
+    private int _survivalPhase = 1;
+
+    JackEnvTrainingConfig _trainingConfig;
+    JackTrainingMode _resolvedTrainingMode = JackTrainingMode.Full;
+
+    public JackTrainingMode ResolvedTrainingMode => _resolvedTrainingMode;
+    bool IsFullTrainingMode => _resolvedTrainingMode == JackTrainingMode.Full;
+    bool IsSimpleTrainingMode =>
+        _resolvedTrainingMode == JackTrainingMode.WoodOnly
+        || _resolvedTrainingMode == JackTrainingMode.FoodOnly;
+
+    public float SurvivalGoalSeconds => survivalGoalSeconds;
+    public float SurvivalTotalSeconds => survivalGoalSeconds * 2f;
+    public float SurvivalElapsedSeconds => Mathf.Max(0f, Time.unscaledTime - _episodeStartTime);
+    public float SurvivalProgress01 =>
+        survivalGoalSeconds > 0f
+            ? Mathf.Clamp01(SurvivalElapsedSeconds / SurvivalTotalSeconds)
+            : 0f;
+    public float Phase1EndProgress => 0.5f;
+    public int SurvivalPhase => _survivalPhase;
+    public bool IsSurvivalPhase2 => _survivalPhase >= 2;
+    public string SurvivalTaskLabel => IsSurvivalPhase2
+        ? "Задача Джека: выжить 2 минуты в зомби апокалипсисе"
+        : "Задача Джека: учимся выживать";
+
     private int stepCount;
 
     private CharacterController controller;
     private Animator animator;
+
+    private bool ControllerReady => controller != null && controller.enabled;
 
     private Vector3 prevPosition;
 
     
     private float verticalVelocity;
     [SerializeField] private float gravity = -9.81f;
+
+    [Header("Twitch chat")]
+    [Tooltip("#up=N — прыжок на N ростов (1–5). #forward=N — толчок вперёд (1–5, 5 = макс.).")]
+    int _pendingTwitchJumpHeights;
+    float _forwardPushSpeed;
+    float _forwardPushTimeLeft;
 
     [Header("Animation")]
     [Tooltip("Имя Trigger в Animator (должен совпадать с параметром в Animator Controller).")]
@@ -183,6 +234,8 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     [SerializeField] private int zombieDamageToZombieOnDo = 1;
     [Tooltip("Награда Джеку за успешный удар DO по зомби.")]
     [SerializeField] private float rewardOnZombieHitDo = 1.0f;
+    [Tooltip("Зомби за спиной не бьются DO. dot(forward, к зомби): 0 = полусфера впереди, 0.5 ≈ 60°, 1 = строго вперёд.")]
+    [SerializeField] [Range(0f, 1f)] private float zombieDoMinForwardDot = 0.5f;
 
     public override void Initialize()
     {
@@ -211,12 +264,59 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
 
         EnsureOptionIconRenderer();
         UpdateOptionIconVisual();
+        AgentFootsteps.EnsureOn(gameObject);
+
+        CacheTrainingConfig();
+        ResolveTrainingMode();
+        ApplyEpisodeStepLimit();
     }
 
     private void Awake()
     {
         // Нужно выставить до HudHpBars.Bootstrap (AfterSceneLoad), чтобы HUD вообще не создавался.
         HudHpBars.SetGlobalEnabled(showHudHpTopLeft);
+        EnsureCampfireAudio();
+    }
+
+    void CacheTrainingConfig()
+    {
+        if (_trainingConfig != null)
+            return;
+
+        var envRoot = TrainingEnvSpace.FindRoot(transform);
+        if (envRoot == null)
+            return;
+
+        _trainingConfig = envRoot.GetComponent<JackEnvTrainingConfig>();
+        if (_trainingConfig == null)
+            _trainingConfig = envRoot.gameObject.AddComponent<JackEnvTrainingConfig>();
+    }
+
+    void ResolveTrainingMode()
+    {
+        CacheTrainingConfig();
+        _resolvedTrainingMode = _trainingConfig != null
+            ? _trainingConfig.ResolveMode()
+            : JackTrainingMode.Full;
+    }
+
+    void ApplyEpisodeStepLimit()
+    {
+        if (IsFullTrainingMode && survivalGoalSeconds > 0f)
+            MaxStep = 0;
+        else if (IsSimpleTrainingMode)
+            MaxStep = _trainingConfig != null ? _trainingConfig.SimpleMaxSteps : 400;
+        else if (survivalGoalSeconds > 0f)
+            MaxStep = 0;
+    }
+
+    void EnsureCampfireAudio()
+    {
+        if (fireVfx == null)
+            return;
+
+        if (fireVfx.GetComponent<CampfireLoopAudio>() == null)
+            fireVfx.AddComponent<CampfireLoopAudio>();
     }
 
     private void EnsureOptionIconRenderer()
@@ -267,35 +367,106 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
 
         if (Input.GetKeyDown(KeyCode.E))
             SetOption(currentOptionTrain == 0 ? 1 : 0);
+
+        ProcessTwitchJump();
+    }
+
+    /// <summary>Один прыжок из Twitch #up=N: высота = N × рост персонажа (N 1–5).</summary>
+    public void RequestTwitchUp(int heightInBodyHeights)
+    {
+        if (!TrainingEnvSpace.IsPresentationTransform(transform))
+            return;
+        if (TwitchEphemeralEffects.IsTwitchClone(this))
+            return;
+
+        _pendingTwitchJumpHeights = Mathf.Clamp(heightInBodyHeights, 1, 5);
+    }
+
+    /// <summary>Толчок вперёд из Twitch #forward=N (1 слабо, 5 максимум).</summary>
+    public void RequestTwitchForward(int strength)
+    {
+        if (!TrainingEnvSpace.IsPresentationTransform(transform))
+            return;
+        if (TwitchEphemeralEffects.IsTwitchClone(this))
+            return;
+
+        strength = Mathf.Clamp(strength, 1, 5);
+        float t = (strength - 1) / 4f;
+        _forwardPushSpeed = Mathf.Lerp(moveSpeed * 4f, moveSpeed * 16f, t);
+        _forwardPushTimeLeft = 0.45f;
+    }
+
+    Vector3 GetTwitchForwardPushVelocity()
+    {
+        if (_forwardPushTimeLeft <= 0f || frozen_jack)
+            return Vector3.zero;
+
+        _forwardPushTimeLeft -= Time.deltaTime;
+        return transform.forward * _forwardPushSpeed;
+    }
+
+    void ProcessTwitchJump()
+    {
+        if (_pendingTwitchJumpHeights <= 0 || !ControllerReady || !controller.isGrounded)
+            return;
+
+        float height = controller.height * _pendingTwitchJumpHeights;
+        verticalVelocity = Mathf.Sqrt(2f * Mathf.Abs(gravity) * Mathf.Max(0.1f, height));
+        _pendingTwitchJumpHeights = 0;
     }
 
     public override void OnEpisodeBegin()
     {
+        _deathSequenceStarted = false;
+        bool isTwitchClone = TwitchEphemeralEffects.IsTwitchClone(this);
+
+        if (TrainingEnvSpace.IsPresentationTransform(transform) && !isTwitchClone)
+        {
+            DeathFreeze.EnsureEnvSimulationRunning();
+            DeathFreeze.UnfreezeWorld();
+            AgentDeathOverlay.Hide();
+            BackgroundMusic.ResumeMusic();
+            TwitchEphemeralEffects.OnPresentationJackEpisodeBegin(this);
+        }
+
+        if (animator == null)
+            animator = GetComponent<Animator>();
+        if (animator != null)
+            animator.speed = 1f;
+
         float minX = -20.78f;
         float maxX = -12.88f;
         float minZ = -7.30f;
         float maxZ = -0.01f;
         float y = 0.42f;
 
-        controller.enabled = false;
-        if (spawnAtHouseFixed)
+        if (!isTwitchClone)
         {
-            transform.position = fixedSpawnPosition;
-            transform.rotation = Quaternion.Euler(fixedSpawnEuler);
+            controller.enabled = false;
+            if (spawnAtHouseFixed)
+            {
+                transform.position = TrainingEnvSpace.LocalToWorld(transform, fixedSpawnPosition);
+                transform.rotation = TrainingEnvSpace.LocalToWorldRotation(transform, fixedSpawnEuler);
+            }
+            else
+            {
+                float randX = Random.Range(minX, maxX);
+                float randZ = Random.Range(minZ, maxZ);
+                transform.position = TrainingEnvSpace.LocalToWorld(transform, new Vector3(randX, y, randZ));
+                transform.rotation = TrainingEnvSpace.LocalToWorldRotation(transform, new Vector3(0f, Random.Range(0f, 360f), 0f));
+            }
+            controller.enabled = true;
         }
-        else
-        {
-            float randX = Random.Range(minX, maxX);
-            float randZ = Random.Range(minZ, maxZ);
-            transform.position = new Vector3(randX, y, randZ);
-            transform.rotation = Quaternion.Euler(0f, Random.Range(0f, 360f), 0f);
-        }
-        controller.enabled = true;
 
         prevPosition = transform.position;
         stepCount = 0;
+        _survivalPhase = 1;
+        _episodeStartTime = Time.unscaledTime;
         _lastChopActionForAnim = 0;
         _doCooldownRemaining = 0f;
+        _pendingTwitchJumpHeights = 0;
+        _forwardPushTimeLeft = 0f;
+        _forwardPushSpeed = 0f;
 
         wood = 0;
         satiety = maxSatiety / 2; // стартуем с половины сытости, например
@@ -305,19 +476,36 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
 
         burnTimer = 0f;
         fireVfxOffTimer = 0f;
+        _freezeTimer = 0f;
+        _hungerTimer = 0f;
         if (fireVfx != null)
         {
-            fireVfx.transform.position = fireVfxWorldPosition;
+            fireVfx.transform.position = TrainingEnvSpace.LocalToWorld(transform, fireVfxWorldPosition);
             fireVfx.SetActive(false);
         }
+        GameSfx.StopFireLoop(transform);
+
+        StopZombieSpawnerForEpisode();
 
         prevTreeDist = 0f;
         prevSheepDist = 0f;
 
         hp = maxHp;
 
-        // Выбор опции: либо utility+softmax, либо случайно
-        if (useUtilitySoftmaxSampling)
+        ResolveTrainingMode();
+        ApplyEpisodeStepLimit();
+
+        if (_resolvedTrainingMode == JackTrainingMode.WoodOnly)
+        {
+            currentOptionTrain = 0;
+            currentOption = 0;
+        }
+        else if (_resolvedTrainingMode == JackTrainingMode.FoodOnly)
+        {
+            currentOptionTrain = 1;
+            currentOption = 1;
+        }
+        else if (useUtilitySoftmaxSampling)
         {
             int sampled = SampleOptionUtilitySoftmax(currentOptionTrain);
             currentOptionTrain = sampled;
@@ -329,6 +517,13 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
             currentOptionTrain = randomOption;
             currentOption = randomOption;
         }
+
+        if (IsSimpleTrainingMode && (_trainingConfig == null || _trainingConfig.FreezeNeeds))
+        {
+            satiety = maxSatiety / 2;
+            heat = maxHeat / 2;
+        }
+
         UpdateOptionIconVisual();
 
         lastRewardForOption0 = 0f;
@@ -357,6 +552,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
 
         foreach (var hit in hits)
         {
+            if (hit == null) continue;
             float d = Vector3.Distance(transform.position, hit.transform.position);
             if (d < distance)
             {
@@ -514,13 +710,32 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         ApplyOptionIconLocalScale();
     }
 
+    private bool _deathSequenceStarted;
+
     public void TakeDamage(int amount)
     {
+        TakeDamage(amount, applyHpLossPenalty: true);
+    }
+
+    public void TakeDamage(int amount, bool applyHpLossPenalty)
+    {
+        if (amount <= 0 || _deathSequenceStarted) return;
         hp = Mathf.Max(0, hp - amount);
+        AgentHitFlash.GetOrCreate(gameObject).Flash();
+        if (applyHpLossPenalty && hpLossPenaltyPerHit != 0f)
+            AddReward(-hpLossPenaltyPerHit);
         if (hp <= 0)
         {
+            _deathSequenceStarted = true;
+            if (TwitchEphemeralEffects.IsTwitchClone(this))
+            {
+                TwitchEphemeralEffects.NotifyCloneDestroyed(gameObject);
+                Destroy(gameObject);
+                return;
+            }
+
             EvalEpisodeTracker.NotifyEpisodeEnded();
-            EndEpisode();
+            AgentDeathOverlay.ShowAndEndEpisode(this, "Джек погиб");
         }
     }
 
@@ -625,6 +840,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
 
         foreach (var hit in hits)
         {
+            if (hit == null) continue;
             float d = Vector3.Distance(transform.position, hit.transform.position);
             if (d < distance)
             {
@@ -661,8 +877,11 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
 
     public override void OnActionReceived(ActionBuffers actions)
     {
+        if (_deathSequenceStarted)
+            return;
+
         // Utility sampling: пересэмпливаем каждые 20 шагов (если включено)
-        if (useUtilitySoftmaxSampling && stepCount > 0 && (stepCount % 20) == 0)
+        if (IsFullTrainingMode && useUtilitySoftmaxSampling && stepCount > 0 && (stepCount % 20) == 0)
         {
             int sampled = SampleOptionUtilitySoftmax(currentOptionTrain);
             currentOptionTrain = sampled;
@@ -673,6 +892,9 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         int moveAction = actions.DiscreteActions[0];
         int rotateAction = actions.DiscreteActions[1];
         int chopAction   = actions.DiscreteActions[2];
+
+        if (TrainingEnvSpace.IsPresentationTransform(transform) && !TwitchEphemeralEffects.IsTwitchClone(this))
+            TrainingPolicyStats.RecordJackActions(moveAction, rotateAction, chopAction);
 
         bool chopJustPressed = chopAction == 1 && _lastChopActionForAnim != 1;
         bool doReady = chopJustPressed && _doCooldownRemaining <= 0f;
@@ -702,22 +924,28 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
             transform.Rotate(0f, rotateInput * rotationSpeed * Time.deltaTime, 0f);
 
         // --- Гравитация ---
-        if (controller.isGrounded)
+        if (ControllerReady)
         {
-            if (verticalVelocity < 0f)
-                verticalVelocity = -2f; // прижимаем к земле
-        }
-        else
-        {
-            verticalVelocity += gravity * Time.deltaTime;
-        }
+            if (controller.isGrounded)
+            {
+                if (verticalVelocity < 0f)
+                    verticalVelocity = -2f; // прижимаем к земле
+            }
+            else
+            {
+                verticalVelocity += gravity * Time.deltaTime;
+            }
 
-        // --- Итоговое движение ---
-        Vector3 move = frozen_jack
-            ? (Vector3.up * verticalVelocity)
-            : (transform.forward * moveInput * moveSpeed + Vector3.up * verticalVelocity);
+            // --- Итоговое движение ---
+            Vector3 pushVel = GetTwitchForwardPushVelocity();
+            Vector3 move = frozen_jack
+                ? (Vector3.up * verticalVelocity)
+                : (transform.forward * moveInput * moveSpeed + pushVel + Vector3.up * verticalVelocity);
 
-        controller.Move(move * Time.deltaTime);
+            controller.Move(move * Time.deltaTime);
+            float planarSpeed = frozen_jack ? 0f : Mathf.Max(Mathf.Abs(moveInput) * moveSpeed, pushVel.magnitude);
+            AgentFootsteps.NotifyMovement(gameObject, planarSpeed);
+        }
 
         _lastPlanarMoveInput = moveInput;
 
@@ -742,21 +970,24 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
             if (knockbackZombieOnDo)
                 KnockbackNearbyZombiesOnDo();
 
-            if (currentOptionSnapshot == 0)
-                choppedTree = TryChopTree(out gainedWoodFromChop);
-            else if (currentOptionSnapshot == 1)
+            choppedTree = TryChopTree(out gainedWoodFromChop);
+
+            if (currentOptionSnapshot == 1)
                 ateSheep = TryEatSheep();
 
             _doCooldownRemaining = Mathf.Max(0f, doActionCooldownSeconds);
         }
         
-        // Reward за рубку дерева - только если опция = дерево (0)
-        // Используем snapshot опции для защиты от изменения во время выполнения
-        // Награждаем только если реально добыли дерево (а не просто сломали при полном инвентаре).
+        // Reward за рубку дерева — только если опция = дерево (0) и wood < max.
+        // Дерево ломается при любом DO; звук — при любой успешной рубке.
+        if (choppedTree)
+            GameSfx.PlayWood(source: transform);
+
         if (choppedTree && gainedWoodFromChop && currentOptionSnapshot == 0)
         {
             float reward = 10.0f;
             AddReward(reward);
+            FloatingRewardPopup.ShowGotWood(transform, reward);
             currentStepReward += reward;
             accumulatedRewardForOption0 += reward;
             lastRewardForOption0 = accumulatedRewardForOption0;
@@ -768,6 +999,8 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         {
             float reward = 10.0f;
             AddReward(reward);
+            GameSfx.PlayFood(source: transform);
+            FloatingRewardPopup.ShowGotFood(transform, reward);
             currentStepReward += reward;
             accumulatedRewardForOption1 += reward;
             lastRewardForOption1 = accumulatedRewardForOption1;
@@ -834,24 +1067,32 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         prevPosition = transform.position;
         
         stepCount++;
+
+        if (IsSimpleTrainingMode)
+        {
+            TryEndSimpleTrainingEpisode(choppedTree, gainedWoodFromChop, ateSheep);
+            _lastChopActionForAnim = chopAction;
+            return;
+        }
+
+        if (!_deathSequenceStarted && survivalGoalSeconds > 0f
+            && SurvivalElapsedSeconds >= SurvivalTotalSeconds)
+        {
+            EndEpisode();
+            return;
+        }
+
+        if (!_deathSequenceStarted && _survivalPhase == 1 && survivalGoalSeconds > 0f
+            && SurvivalElapsedSeconds >= survivalGoalSeconds)
+        {
+            EnterSurvivalPhase2();
+        }
+
         satietyTimer += Time.deltaTime;
         if (satietyTimer >= satietyDecayInterval)
         {
             satiety = Mathf.Max(0, satiety - 1);
             satietyTimer = 0f;
-
-            // штраф, если сытость упала до нуля
-            if (satiety == 0)
-            {
-                if (currentOptionTrain == 1)
-                {
-                    float penalty = -0.1f;
-                    AddReward(penalty);
-                    currentStepReward += penalty;
-                    accumulatedRewardForOption1 += penalty;
-                    lastRewardForOption1 = accumulatedRewardForOption1;
-                }
-            }
         }
 
         heatTimer += Time.deltaTime;
@@ -859,19 +1100,10 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         {
             heat = Mathf.Max(0, heat - 1);
             heatTimer = 0f;
-
-            if (heat == 0)
-            {
-                if (currentOptionTrain == 0)
-                {
-                    float penalty = -0.1f;
-                    AddReward(penalty);
-                    currentStepReward += penalty;
-                    accumulatedRewardForOption0 += penalty;
-                    lastRewardForOption0 = accumulatedRewardForOption0;
-                }
-            }
         }
+
+        UpdateFreezing();
+        UpdateStarving();
 
         bool onHouse = Vector3.Distance(transform.position, houseTarget.position) <= houseRadius;
 
@@ -879,7 +1111,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         {
             if (fireVfx != null)
             {
-                fireVfx.transform.position = fireVfxWorldPosition;
+                fireVfx.transform.position = TrainingEnvSpace.LocalToWorld(transform, fireVfxWorldPosition);
                 fireVfx.SetActive(true);
                 fireVfxOffTimer = fireVfxOffDelaySeconds;
             }
@@ -899,6 +1131,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
                 {
                     float reward = 5.0f;
                     AddReward(reward);
+                    FloatingRewardPopup.ShowWarmedUp(transform, reward);
                     currentStepReward += reward;
                     accumulatedRewardForOption0 += reward;
                     lastRewardForOption0 = accumulatedRewardForOption0;
@@ -923,10 +1156,188 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
                 fireVfx.SetActive(false);
         }
 
-
-        // Лимит эпизода задаётся только через Agent.MaxStep (поле "Max Step" в инспекторе).
+        // Лимит эпизода: фаза 1 = survivalGoalSeconds, далее фаза 2 до смерти; или Max Step если survivalGoalSeconds = 0.
 
         _lastChopActionForAnim = chopAction;
+    }
+
+    void TryEndSimpleTrainingEpisode(bool choppedTree, bool gainedWoodFromChop, bool ateSheep)
+    {
+        if (_trainingConfig != null && _trainingConfig.StepPenalty != 0f)
+        {
+            float penalty = _trainingConfig.StepPenalty;
+            AddReward(penalty);
+            currentStepReward += penalty;
+            if (_resolvedTrainingMode == JackTrainingMode.WoodOnly)
+            {
+                accumulatedRewardForOption0 += penalty;
+                lastRewardForOption0 = accumulatedRewardForOption0;
+            }
+            else
+            {
+                accumulatedRewardForOption1 += penalty;
+                lastRewardForOption1 = accumulatedRewardForOption1;
+            }
+        }
+
+        if (_trainingConfig != null && _trainingConfig.EndOnSuccess)
+        {
+            if (_resolvedTrainingMode == JackTrainingMode.WoodOnly && choppedTree && gainedWoodFromChop)
+            {
+                float bonus = _trainingConfig.SuccessReward;
+                if (bonus != 0f)
+                {
+                    AddReward(bonus);
+                    currentStepReward += bonus;
+                    accumulatedRewardForOption0 += bonus;
+                    lastRewardForOption0 = accumulatedRewardForOption0;
+                }
+                EndEpisode();
+                return;
+            }
+
+            if (_resolvedTrainingMode == JackTrainingMode.FoodOnly && ateSheep)
+            {
+                float bonus = _trainingConfig.SuccessReward;
+                if (bonus != 0f)
+                {
+                    AddReward(bonus);
+                    currentStepReward += bonus;
+                    accumulatedRewardForOption1 += bonus;
+                    lastRewardForOption1 = accumulatedRewardForOption1;
+                }
+                EndEpisode();
+                return;
+            }
+        }
+
+        if (_trainingConfig != null
+            && _trainingConfig.SimpleEpisodeTimeoutSeconds > 0f
+            && SurvivalElapsedSeconds >= _trainingConfig.SimpleEpisodeTimeoutSeconds)
+        {
+            EndEpisode();
+        }
+    }
+
+    void EnsureZombieSpawner()
+    {
+        if (zombieSpawner != null)
+            return;
+
+        var envRoot = TrainingEnvSpace.FindRoot(transform);
+        if (envRoot == null)
+            return;
+
+        var spawners = envRoot.GetComponentsInChildren<ZombieSpawner>(true);
+        for (int i = 0; i < spawners.Length; i++)
+        {
+            var spawner = spawners[i];
+            if (spawner != null && spawner.gameObject.name == "ZombieSpawner")
+            {
+                zombieSpawner = spawner;
+                return;
+            }
+        }
+    }
+
+    void StopZombieSpawnerForEpisode()
+    {
+        EnsureZombieSpawner();
+        if (zombieSpawner == null)
+            return;
+
+        zombieSpawner.ClearZombies();
+        zombieSpawner.gameObject.SetActive(false);
+    }
+
+    void StartZombieSpawnerForEpisode()
+    {
+        EnsureZombieSpawner();
+        if (zombieSpawner == null)
+            return;
+
+        zombieSpawner.ClearZombies();
+        zombieSpawner.gameObject.SetActive(true);
+    }
+
+    void EnterSurvivalPhase2()
+    {
+        if (_survivalPhase >= 2)
+            return;
+
+        _survivalPhase = 2;
+
+        if (phase1CompleteReward != 0f)
+        {
+            AddReward(phase1CompleteReward);
+            currentStepReward += phase1CompleteReward;
+            accumulatedRewardForOption0 += phase1CompleteReward;
+            accumulatedRewardForOption1 += phase1CompleteReward;
+            lastRewardForOption0 = accumulatedRewardForOption0;
+            lastRewardForOption1 = accumulatedRewardForOption1;
+        }
+
+        StartZombieSpawnerForEpisode();
+    }
+
+    void UpdateFreezing()
+    {
+        if (_deathSequenceStarted || heat > 0)
+        {
+            _freezeTimer = 0f;
+            return;
+        }
+
+        _freezeTimer += Time.deltaTime;
+        if (_freezeTimer < freezeDamageInterval)
+            return;
+
+        _freezeTimer = 0f;
+
+        if (freezePenaltyPerTick != 0f)
+        {
+            AddReward(freezePenaltyPerTick);
+            currentStepReward += freezePenaltyPerTick;
+            accumulatedRewardForOption0 += freezePenaltyPerTick;
+            accumulatedRewardForOption1 += freezePenaltyPerTick;
+            lastRewardForOption0 = accumulatedRewardForOption0;
+            lastRewardForOption1 = accumulatedRewardForOption1;
+        }
+
+        FloatingRewardPopup.ShowFreezing(transform, freezePenaltyPerTick);
+
+        if (freezeDamageAmount > 0)
+            TakeDamage(freezeDamageAmount, applyHpLossPenalty: false);
+    }
+
+    void UpdateStarving()
+    {
+        if (_deathSequenceStarted || satiety > 0)
+        {
+            _hungerTimer = 0f;
+            return;
+        }
+
+        _hungerTimer += Time.deltaTime;
+        if (_hungerTimer < hungerDamageInterval)
+            return;
+
+        _hungerTimer = 0f;
+
+        if (hungerPenaltyPerTick != 0f)
+        {
+            AddReward(hungerPenaltyPerTick);
+            currentStepReward += hungerPenaltyPerTick;
+            accumulatedRewardForOption0 += hungerPenaltyPerTick;
+            accumulatedRewardForOption1 += hungerPenaltyPerTick;
+            lastRewardForOption0 = accumulatedRewardForOption0;
+            lastRewardForOption1 = accumulatedRewardForOption1;
+        }
+
+        FloatingRewardPopup.ShowHungry(transform, hungerPenaltyPerTick);
+
+        if (hungerDamageAmount > 0)
+            TakeDamage(hungerDamageAmount, applyHpLossPenalty: false);
     }
 
     private int SampleOptionUtilitySoftmax(int currentOpt)
@@ -973,6 +1384,21 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         return Random.value < p0 ? 0 : 1;
     }
 
+    private bool IsZombieColliderInFrontForDo(Vector3 origin, Collider c)
+    {
+        if (c == null) return false;
+        Vector3 toTarget = c.ClosestPoint(origin) - origin;
+        toTarget.y = 0f;
+        if (toTarget.sqrMagnitude < 1e-6f) return true;
+
+        Vector3 fwd = transform.forward;
+        fwd.y = 0f;
+        if (fwd.sqrMagnitude < 1e-6f) return true;
+        fwd.Normalize();
+        toTarget.Normalize();
+        return Vector3.Dot(fwd, toTarget) >= zombieDoMinForwardDot;
+    }
+
     private bool IsZombieNearbyForDo()
     {
         if (zombieNearbyRadiusOnDo <= 0f) return false;
@@ -985,9 +1411,9 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         foreach (var c in hits)
         {
             if (c == null) continue;
-            // Защита от случайных коллайдеров: нужен компонент поведения зомби (на корне или родителе)
-            if (c.GetComponentInParent<ZombieChase>() != null)
-                return true;
+            if (c.GetComponentInParent<ZombieChase>() == null) continue;
+            if (!IsZombieColliderInFrontForDo(origin, c)) continue;
+            return true;
         }
 
         return false;
@@ -1014,6 +1440,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
             if (c == null) continue;
             var z = c.GetComponentInParent<ZombieChase>();
             if (z == null) continue;
+            if (!IsZombieColliderInFrontForDo(origin, c)) continue;
 
             float d = Vector3.Distance(origin, c.ClosestPoint(origin));
             if (d < bestDist)
@@ -1025,6 +1452,8 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         }
         if (bestZombie == null) return;
 
+        GameSfx.PlayJackLilyHitZombie(source: transform);
+
         // Награда за сам факт попадания DO по зомби (один раз за DO).
         if (rewardOnZombieHitDo != 0f)
             AddReward(rewardOnZombieHitDo);
@@ -1033,36 +1462,38 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         var zhBest = bestZombie.GetComponent<ZombieHealth>()
             ?? bestZombie.GetComponentInParent<ZombieHealth>()
             ?? bestZombie.GetComponentInChildren<ZombieHealth>();
+        if (zhBest == null && bestZombieCollider != null)
+        {
+            zhBest = bestZombieCollider.GetComponent<ZombieHealth>()
+                ?? bestZombieCollider.GetComponentInParent<ZombieHealth>()
+                ?? bestZombieCollider.GetComponentInChildren<ZombieHealth>();
+        }
+
+        bool zombieKilled = false;
         if (zhBest != null)
         {
             int damage = zombieDamageToZombieOnDo;
             if (zombieDiesInTwoDoHits)
                 damage = Mathf.Max(1, Mathf.CeilToInt(zhBest.MaxHp / 2f));
             if (damage > 0)
-                zhBest.TakeDamage(damage, transform.position);
-        }
-        else
-        {
-            // Fallback: иногда ZombieHealth висит на коллайдере-ребёнке, но ZombieChase на корне.
-            if (bestZombieCollider != null)
             {
-                zhBest = bestZombieCollider.GetComponent<ZombieHealth>()
-                    ?? bestZombieCollider.GetComponentInParent<ZombieHealth>()
-                    ?? bestZombieCollider.GetComponentInChildren<ZombieHealth>();
-                if (zhBest != null)
-                {
-                    int damage = zombieDamageToZombieOnDo;
-                    if (zombieDiesInTwoDoHits)
-                        damage = Mathf.Max(1, Mathf.CeilToInt(zhBest.MaxHp / 2f));
-                    if (damage > 0)
-                        zhBest.TakeDamage(damage, transform.position);
-                }
+                int prevHp = zhBest.Hp;
+                zhBest.TakeDamage(damage, transform.position);
+                // После Destroy(gameObject) ссылка становится «fake null» — не читаем Hp напрямую.
+                if (prevHp > 0 && (zhBest == null || zhBest.Hp <= 0))
+                    zombieKilled = true;
             }
         }
 
-        // Гарантия: даже если по какой-то причине ZombieHealth не стоит/не найден —
-        // считаем 2 удара DO по зомби и уничтожаем его.
-        bestZombie.RegisterJackDoHitAndMaybeDie(2);
+        // Гарантия: 2 удара DO без ZombieHealth. Не вызываем, если зомби уже уничтожен по HP.
+        if (!zombieKilled && bestZombie != null && bestZombie.RegisterJackDoHitAndMaybeDie(2))
+            zombieKilled = true;
+
+        if (zombieKilled)
+        {
+            FloatingRewardPopup.ShowZombieKill(transform, rewardOnZombieHitDo);
+            return;
+        }
 
         Transform zt = bestZombie.transform;
         Vector3 dir = (zt.position - origin);

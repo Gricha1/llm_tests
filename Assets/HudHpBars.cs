@@ -48,6 +48,9 @@ public sealed class HudHpBars : MonoBehaviour
     private TextMeshProUGUI _lilyText;
 
     private Canvas _canvas;
+    private RectTransform _topLeftRoot;
+    private RectTransform _jackRow;
+    private RectTransform _lilyRow;
 
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
     private static void Bootstrap()
@@ -91,14 +94,42 @@ public sealed class HudHpBars : MonoBehaviour
         if (_canvas == null)
             CreateCanvasAndBars();
 
-        // Resolve references lazily (agents can spawn after scene load).
-        if (_jack == null)
-            _jack = FindObjectOfType<AgentGoToHouseDiscrete>();
-        if (_lily == null)
-            _lily = FindObjectOfType<LilyScript>();
+        _jack = FindActiveJack();
+        _lily = FindActiveLily();
 
-        UpdateBar(_jack, _jackFillRt, _jackText, "Jack");
-        UpdateBar(_lily, _lilyFillRt, _lilyText, "Lily");
+        if (_lilyRow != null)
+            _lilyRow.gameObject.SetActive(_lily != null);
+
+        LayoutRoot();
+
+        UpdateBar(_jack, _jackFillRt, _jackText, "Джек");
+        if (_lily != null)
+            UpdateBar(_lily, _lilyFillRt, _lilyText, "Lily");
+    }
+
+    static AgentGoToHouseDiscrete FindActiveJack()
+    {
+        var root = TrainingEnvSpace.PresentationRoot;
+        if (root != null)
+            return root.GetComponentInChildren<AgentGoToHouseDiscrete>(false);
+        return FindObjectOfType<AgentGoToHouseDiscrete>();
+    }
+
+    static LilyScript FindActiveLily()
+    {
+        var root = TrainingEnvSpace.PresentationRoot;
+        if (root != null)
+            return root.GetComponentInChildren<LilyScript>(false);
+        return FindObjectOfType<LilyScript>();
+    }
+
+    void LayoutRoot()
+    {
+        if (_topLeftRoot == null)
+            return;
+
+        int rows = 1 + (_lilyRow != null && _lilyRow.gameObject.activeSelf ? 1 : 0);
+        _topLeftRoot.sizeDelta = new Vector2(barWidth + 110f, (barHeight + rowSpacing) * rows + 10f);
     }
 
     private void ApplyVisibility()
@@ -143,11 +174,15 @@ public sealed class HudHpBars : MonoBehaviour
         root.anchoredPosition = new Vector2(padding.x, -(padding.y + topOffset));
         root.sizeDelta = new Vector2(barWidth + 110f, (barHeight + rowSpacing) * 2f + 10f);
 
-        CreateRow(root, 0, "Jack", jackFill, out _jackFillImg, out _jackFillRt, out _jackText);
-        CreateRow(root, 1, "Lily", lilyFill, out _lilyFillImg, out _lilyFillRt, out _lilyText);
+        _topLeftRoot = root;
+
+        _jackRow = CreateRow(root, 0, "Джек", jackFill, out _jackFillImg, out _jackFillRt, out _jackText);
+        _lilyRow = CreateRow(root, 1, "Lily", lilyFill, out _lilyFillImg, out _lilyFillRt, out _lilyText);
+        _lilyRow.gameObject.SetActive(FindActiveLily() != null);
+        LayoutRoot();
     }
 
-    private void CreateRow(RectTransform parent, int rowIndex, string title, Color fillColor,
+    private RectTransform CreateRow(RectTransform parent, int rowIndex, string title, Color fillColor,
         out Image fillImg, out RectTransform fillRt, out TextMeshProUGUI text)
     {
         float y = -rowIndex * (barHeight + rowSpacing);
@@ -204,6 +239,7 @@ public sealed class HudHpBars : MonoBehaviour
         text.alignment = TextAlignmentOptions.Left;
         text.text = $"{title}: --/--";
         text.enableWordWrapping = false;
+        return row;
     }
 }
 
