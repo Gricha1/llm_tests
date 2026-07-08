@@ -2,12 +2,14 @@ using UnityEngine;
 
 /// <summary>
 /// Профиль задачи на корне Env. Jack читает его через TrainingEnvSpace.FindRoot.
+/// Mode = Auto: только переименуй копии — Env, Env (1)… Env (4).
+///   0,2 → wood | 1,3 → food | 4+ → zombie.
 /// </summary>
 public sealed class JackEnvTrainingConfig : MonoBehaviour
 {
   [SerializeField] private JackTrainingMode mode = JackTrainingMode.Auto;
 
-  [Header("Simple modes (WoodOnly / FoodOnly)")]
+  [Header("Simple modes (WoodOnly / FoodOnly / ZombieOnly)")]
   [SerializeField] private int simpleMaxSteps = 400;
   [SerializeField] private float simpleEpisodeTimeoutSeconds = 45f;
   [SerializeField] private bool endOnSuccess = true;
@@ -28,17 +30,42 @@ public sealed class JackEnvTrainingConfig : MonoBehaviour
     if (mode != JackTrainingMode.Auto)
       return mode;
 
-    if (TrainingEnvSpace.IsPresentationEnv(transform))
+    if (TrainingEnvSpace.IsPresentationOnlyRequested()
+        && TrainingEnvSpace.IsPresentationEnv(transform))
       return JackTrainingMode.Full;
 
     int copyIndex = TrainingEnvSpace.GetEnvCopyIndex(transform);
-    if (copyIndex <= 0)
+
+    // Play в Editor без mlagents-learn — первая Env остаётся полной игрой.
+    if (!TrainingEnvSpace.HasMultipleTrainingEnvs()
+        && copyIndex == 0
+        && TrainingEnvSpace.IsPresentationEnv(transform)
+        && !TrainingEnvSpace.IsMlAgentsTrainingActive())
       return JackTrainingMode.Full;
 
-    // Env (1) wood, Env (2) food, Env (3) wood, …
-    return copyIndex % 2 == 1 ? JackTrainingMode.WoodOnly : JackTrainingMode.FoodOnly;
+    return ResolveAutoModeForCopyIndex(copyIndex);
+  }
+
+  public static JackTrainingMode ResolveAutoModeForCopyIndex(int copyIndex)
+  {
+    switch (copyIndex)
+    {
+      case 0:
+      case 2:
+        return JackTrainingMode.WoodOnly;
+      case 1:
+      case 3:
+        return JackTrainingMode.FoodOnly;
+      case 4:
+      case 5:
+        return JackTrainingMode.ZombieOnly;
+      default:
+        return copyIndex % 2 == 1 ? JackTrainingMode.FoodOnly : JackTrainingMode.WoodOnly;
+    }
   }
 
   public bool IsSimpleMode(JackTrainingMode resolved) =>
-    resolved == JackTrainingMode.WoodOnly || resolved == JackTrainingMode.FoodOnly;
+    resolved == JackTrainingMode.WoodOnly
+    || resolved == JackTrainingMode.FoodOnly
+    || resolved == JackTrainingMode.ZombieOnly;
 }

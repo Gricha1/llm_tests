@@ -8,16 +8,16 @@ public class SheepSpawner : MonoBehaviour
 
     [Header("Spawn Settings")]
     [SerializeField] private int sheepCount = 5;
-    [SerializeField] private float y = 0.6237636f;
+    [SerializeField] private float y = -5.515023f;
     [SerializeField] private float minDistance = 1.5f;
     [SerializeField] private float respawnInterval = 2f; // секунд между попытками доп. спавна
     [SerializeField] private float maxDistanceFromSpawn = 12f; // овца возвращается в зону, если ушла дальше
 
-    // Область спавна (из твоих координат)
-    private readonly float minX = -20.8f;
-    private readonly float maxX = -8.18f;
-    private readonly float minZ = -7.4f;
-    private readonly float maxZ = -2.11f;
+    // Область спавна (local Env, поляна у домика)
+    private readonly float minX = 1.43f;
+    private readonly float maxX = 14.05f;
+    private readonly float minZ = 10.65f;
+    private readonly float maxZ = 15.94f;
 
     private Vector3 SpawnCenterLocal => new Vector3((minX + maxX) * 0.5f, y, (minZ + maxZ) * 0.5f);
 
@@ -40,6 +40,9 @@ public class SheepSpawner : MonoBehaviour
     private void Start()
     {
         nextRespawnTime = Time.time + respawnInterval;
+        RemoveDestroyedSheep();
+        if (sheeps.Count == 0)
+            SpawnSheep();
     }
 
     private void Update()
@@ -48,8 +51,24 @@ public class SheepSpawner : MonoBehaviour
         nextRespawnTime = Time.time + respawnInterval;
 
         RemoveDestroyedSheep();
-        if (sheeps.Count < sheepCount)
-            SpawnOneSheep();
+        TryFillSpawnSlots();
+    }
+
+    /// <summary>Вызывается после съеденной овцы — сразу пытаемся восполнить пул, не ждём Update.</summary>
+    public void NotifySheepEaten()
+    {
+        RemoveDestroyedSheep();
+        TryFillSpawnSlots();
+    }
+
+    private void TryFillSpawnSlots()
+    {
+        int guard = sheepCount * 2;
+        while (sheeps.Count < sheepCount && guard-- > 0)
+        {
+            if (!SpawnOneSheep())
+                break;
+        }
     }
 
     private void RemoveDestroyedSheep()
@@ -57,7 +76,7 @@ public class SheepSpawner : MonoBehaviour
         sheeps.RemoveAll(s => !IsAlive(s));
     }
 
-    private void SpawnOneSheep()
+    private bool SpawnOneSheep()
     {
         for (int attempt = 0; attempt < 100; attempt++)
         {
@@ -90,9 +109,11 @@ public class SheepSpawner : MonoBehaviour
                 );
                 SetSheepSpawnArea(sheep);
                 sheeps.Add(sheep);
-                return;
+                return true;
             }
         }
+
+        return false;
     }
 
     private void SetSheepSpawnArea(GameObject sheepObj)
@@ -100,6 +121,17 @@ public class SheepSpawner : MonoBehaviour
         var wander = sheepObj.GetComponent<SheepWander>();
         if (wander != null)
             wander.SetSpawnArea(ToWorld(SpawnCenterLocal), maxDistanceFromSpawn);
+    }
+
+    public int TargetCount => sheepCount;
+
+    public int AliveCount
+    {
+        get
+        {
+            RemoveDestroyedSheep();
+            return sheeps.Count;
+        }
     }
 
     public void ResetSheep()
@@ -110,53 +142,11 @@ public class SheepSpawner : MonoBehaviour
 
     private void SpawnSheep()
     {
-        int attempts = 0;
-
         for (int i = 0; i < sheepCount; i++)
         {
-            bool placed = false;
-
-            while (!placed && attempts < 100)
+            if (!SpawnOneSheep())
             {
-                attempts++;
-
-                Vector3 pos = ToWorld(new Vector3(
-                    Random.Range(minX, maxX),
-                    y,
-                    Random.Range(minZ, maxZ)
-                ));
-
-                bool tooClose = false;
-                foreach (var sheep in sheeps)
-                {
-                    if (!IsAlive(sheep))
-                        continue;
-
-                    if (Vector3.Distance(pos, sheep.transform.position) < minDistance)
-                    {
-                        tooClose = true;
-                        break;
-                    }
-                }
-
-                if (!tooClose)
-                {
-                    GameObject sheep = Instantiate(
-                        sheepPrefab,
-                        pos,
-                        Quaternion.Euler(0f, Random.Range(0f, 360f), 0f),
-                        transform
-                    );
-                    SetSheepSpawnArea(sheep);
-                    sheeps.Add(sheep);
-                    placed = true;
-                }
-            }
-
-            if (attempts >= 100)
-            {
-                Debug.LogWarning("Не удалось разместить всех овец без пересечений");
-                break;
+                Debug.LogWarning($"SheepSpawner: не удалось разместить овцу {i + 1}/{sheepCount}");
             }
         }
     }
@@ -169,5 +159,56 @@ public class SheepSpawner : MonoBehaviour
                 Destroy(sheep);
         }
         sheeps.Clear();
+    }
+
+    /// <summary>Спавн count овец вокруг worldPos (Twitch). Не удаляет существующих.</summary>
+    public int SpawnSheepNear(Vector3 worldPos, int count, float radius = 7f)
+    {
+        if (sheepPrefab == null)
+            return 0;
+
+        count = Mathf.Clamp(count, 1, 20);
+        RemoveDestroyedSheep();
+
+        int spawned = 0;
+        float groundY = ToWorld(new Vector3(0f, y, 0f)).y;
+
+        for (int i = 0; i < count; i++)
+        {
+            for (int attempt = 0; attempt < 50; attempt++)
+            {
+                Vector2 ring = Random.insideUnitCircle * radius;
+                Vector3 pos = new Vector3(worldPos.x + ring.x, groundY, worldPos.z + ring.y);
+
+                bool tooClose = false;
+                foreach (var existing in sheeps)
+                {
+                    if (!IsAlive(existing))
+                        continue;
+
+                    if (Vector3.Distance(pos, existing.transform.position) < minDistance)
+                    {
+                        tooClose = true;
+                        break;
+                    }
+                }
+
+                if (tooClose)
+                    continue;
+
+                GameObject sheep = Instantiate(
+                    sheepPrefab,
+                    pos,
+                    Quaternion.Euler(0f, Random.Range(0f, 360f), 0f),
+                    transform
+                );
+                SetSheepSpawnArea(sheep);
+                sheeps.Add(sheep);
+                spawned++;
+                break;
+            }
+        }
+
+        return spawned;
     }
 }

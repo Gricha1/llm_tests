@@ -42,6 +42,9 @@ fi
 
 raw="${1%/}"
 case "${raw}" in
+  /*)
+    RUN_DIR="${raw}"
+    ;;
   results/*)
     RUN_DIR="${raw}"
     ;;

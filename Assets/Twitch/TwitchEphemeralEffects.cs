@@ -15,6 +15,8 @@ public static class TwitchEphemeralEffects
         public bool Captured;
     }
 
+    const int MaxTotalClones = 5;
+
     static readonly List<GameObject> Clones = new List<GameObject>();
     static readonly Dictionary<int, ScaleState> ScaleByJackId = new Dictionary<int, ScaleState>();
 
@@ -25,22 +27,48 @@ public static class TwitchEphemeralEffects
     {
         ClearClones();
         if (jack != null)
+        {
             ResetJackScale(jack);
+            ResetJackSpeed(jack);
+        }
     }
 
-    public static void SpawnJackClones(AgentGoToHouseDiscrete source, int count)
+    public static void OnPresentationJackDeath()
+    {
+        ClearClones();
+    }
+
+    public static int ActiveCloneCount
+    {
+        get
+        {
+            RemoveDeadClones();
+            return Clones.Count;
+        }
+    }
+
+    public static int SpawnJackClones(AgentGoToHouseDiscrete source, int count)
     {
         if (source == null || !TrainingEnvSpace.IsPresentationTransform(source.transform))
-            return;
+            return 0;
 
         if (IsTwitchClone(source))
-            return;
+            return 0;
+
+        if (!source.IsAliveForTwitch)
+            return 0;
 
         count = Mathf.Clamp(count, 1, 5);
         RemoveDeadClones();
 
-        var sourceAgent = source.GetComponent<Agent>();
+        int slotsLeft = MaxTotalClones - Clones.Count;
+        if (slotsLeft <= 0)
+            return 0;
+
+        count = Mathf.Min(count, slotsLeft);
+
         var sourceBehavior = source.GetComponent<BehaviorParameters>();
+        int spawned = 0;
 
         for (int i = 0; i < count; i++)
         {
@@ -54,7 +82,7 @@ public static class TwitchEphemeralEffects
                 spawnPos,
                 spawnRot,
                 source.transform.parent);
-
+            cloneGo.SetActive(false);
             cloneGo.name = $"Jack_TwitchClone_{Clones.Count + 1}";
 
             if (cloneGo.GetComponent<TwitchJackCloneMarker>() == null)
@@ -75,16 +103,17 @@ public static class TwitchEphemeralEffects
             if (cloneAgent != null)
                 cloneAgent.enabled = true;
             if (cloneJack != null)
-                cloneJack.enabled = true;
-
-            if (cloneAgent != null)
             {
-                cloneAgent.EndEpisode();
-                cloneGo.transform.SetPositionAndRotation(spawnPos, spawnRot);
+                cloneJack.enabled = true;
+                cloneJack.BootstrapTwitchCloneFrom(source, spawnPos, spawnRot);
             }
 
+            cloneGo.SetActive(true);
             Clones.Add(cloneGo);
+            spawned++;
         }
+
+        return spawned;
     }
 
     public static void NotifyCloneDestroyed(GameObject cloneGo)
@@ -113,6 +142,8 @@ public static class TwitchEphemeralEffects
             cc.radius = state.BaseRadius * mult;
             cc.center = state.BaseCenter * mult;
         }
+
+        jack.SetTwitchReachMultiplier(mult);
     }
 
     public static void ResetJackScale(AgentGoToHouseDiscrete jack)
@@ -132,6 +163,33 @@ public static class TwitchEphemeralEffects
             cc.radius = state.BaseRadius;
             cc.center = state.BaseCenter;
         }
+
+        jack.SetTwitchReachMultiplier(1f);
+    }
+
+    public static void ApplyJackSpeed(AgentGoToHouseDiscrete jack, int speedMultiplier)
+    {
+        if (jack == null || !TrainingEnvSpace.IsPresentationTransform(jack.transform))
+            return;
+
+        if (IsTwitchClone(jack))
+            return;
+
+        speedMultiplier = Mathf.Clamp(speedMultiplier, 1, 5);
+        jack.SetTwitchMoveSpeedMultiplier(speedMultiplier);
+    }
+
+    public static void ResetJackSpeed(AgentGoToHouseDiscrete jack)
+    {
+        if (jack == null)
+            return;
+
+        jack.ResetTwitchMoveSpeed();
+    }
+
+    public static float SpeedLevelToMultiplier(int speedLevel)
+    {
+        return Mathf.Clamp(speedLevel, 1, 5);
     }
 
     static ScaleState GetOrCaptureScaleState(AgentGoToHouseDiscrete jack)

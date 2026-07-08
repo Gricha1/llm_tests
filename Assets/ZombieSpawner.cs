@@ -34,6 +34,7 @@ public class ZombieSpawner : MonoBehaviour
     private List<GameObject> zombies = new List<GameObject>();
     private float nextRespawnTime;
     Transform _spawnProxy;
+    GameObject _resolvedZombiePrefab;
 
     static bool IsAlive(GameObject go) => go != null;
 
@@ -80,7 +81,7 @@ public class ZombieSpawner : MonoBehaviour
 
     private void Update()
     {
-        if (zombiePrefab == null) return;
+        if (ResolveZombiePrefab() == null) return;
         if (spawn_idle) return;
         if (Time.time < nextRespawnTime) return;
         nextRespawnTime = Time.time + (zombie_from_hills ? 2f : spawnInterval);
@@ -95,26 +96,38 @@ public class ZombieSpawner : MonoBehaviour
         zombies.RemoveAll(z => !IsAlive(z));
     }
 
-    Transform EnsureActiveSpawnProxy()
-    {
-        if (_spawnProxy != null)
-            return _spawnProxy;
-
-        var proxyGo = new GameObject($"{gameObject.name}_SpawnProxy");
-        var envRoot = TrainingEnvSpace.FindRoot(transform);
-        proxyGo.transform.SetParent(envRoot != null ? envRoot : transform, false);
-        proxyGo.transform.SetPositionAndRotation(transform.position, transform.rotation);
-        proxyGo.SetActive(true);
-        _spawnProxy = proxyGo.transform;
-        return _spawnProxy;
-    }
-
     Transform ResolveSpawnParent()
     {
         if (gameObject.activeInHierarchy)
             return transform;
 
-        return EnsureActiveSpawnProxy();
+        return null;
+    }
+
+    public static ZombieSpawner FindPresentationZombieSpawner()
+    {
+        var root = TrainingEnvSpace.PresentationRoot;
+        if (root != null)
+        {
+            var spawners = root.GetComponentsInChildren<ZombieSpawner>(true);
+            for (int i = 0; i < spawners.Length; i++)
+            {
+                if (spawners[i] != null && spawners[i].gameObject.name == "ZombieSpawner")
+                    return spawners[i];
+            }
+
+            if (spawners.Length > 0)
+                return spawners[0];
+        }
+
+        var all = Object.FindObjectsOfType<ZombieSpawner>(true);
+        for (int i = 0; i < all.Length; i++)
+        {
+            if (all[i] != null && all[i].gameObject.name == "ZombieSpawner")
+                return all[i];
+        }
+
+        return all.Length > 0 ? all[0] : null;
     }
 
     void ClearSpawnProxyChildren()
@@ -143,7 +156,7 @@ public class ZombieSpawner : MonoBehaviour
 
     private void SpawnIdleGrid(int count)
     {
-        if (zombiePrefab == null) return;
+        if (ResolveZombiePrefab() == null) return;
         if (count <= 0) return;
 
         Vector3 center = useTransformPositionAsSpawn ? transform.position : spawnPosition;
@@ -167,14 +180,100 @@ public class ZombieSpawner : MonoBehaviour
 
     private void SpawnOneAt(Vector3 worldPos)
     {
-        if (zombiePrefab == null)
+        GameObject prefab = ResolveZombiePrefab();
+        if (prefab == null)
             return;
 
-        Transform parent = ResolveSpawnParent();
-        GameObject zombie = Instantiate(zombiePrefab, worldPos, Quaternion.Euler(0f, Random.Range(0f, 360f), 0f), parent);
+        GameObject zombie = Instantiate(prefab, worldPos, Quaternion.Euler(0f, Random.Range(0f, 360f), 0f));
+        FinalizeSpawnedZombie(zombie);
+        zombies.Add(zombie);
+    }
+
+    void FinalizeSpawnedZombie(GameObject zombie)
+    {
+        if (zombie == null)
+            return;
+
+        zombie.SetActive(true);
+        var envRoot = TrainingEnvSpace.FindRoot(transform);
+        zombie.transform.SetParent(envRoot != null ? envRoot : transform, true);
+
         SetZombieLayer(zombie);
         EnsureZombieComponents(zombie);
-        zombies.Add(zombie);
+        AssignPresentationTargets(zombie);
+    }
+
+    static void AssignPresentationTargets(GameObject zombie)
+    {
+        var chase = zombie.GetComponentInChildren<ZombieChase>();
+        if (chase == null)
+            return;
+
+        var jack = TrainingEnvSpace.FindPresentationJack();
+        var lilyRoot = TrainingEnvSpace.PresentationRoot;
+        LilyScript lily = lilyRoot != null
+            ? lilyRoot.GetComponentInChildren<LilyScript>(false)
+            : Object.FindObjectOfType<LilyScript>();
+
+        chase.SetPresentationTargets(
+            jack != null ? jack.transform : null,
+            lily != null ? lily.transform : null);
+    }
+
+    GameObject ResolveZombiePrefab()
+    {
+        if (_resolvedZombiePrefab != null)
+            return _resolvedZombiePrefab;
+
+        if (zombiePrefab != null && !zombiePrefab.scene.IsValid())
+        {
+            _resolvedZombiePrefab = zombiePrefab;
+            return _resolvedZombiePrefab;
+        }
+
+#if UNITY_EDITOR
+        if (zombiePrefab != null)
+        {
+            var source = UnityEditor.PrefabUtility.GetCorrespondingObjectFromOriginalSource(zombiePrefab);
+            if (source != null)
+            {
+                _resolvedZombiePrefab = source;
+                return _resolvedZombiePrefab;
+            }
+        }
+
+        _resolvedZombiePrefab = UnityEditor.AssetDatabase.LoadAssetAtPath<GameObject>(
+            "Assets/3D Characters Zombie City Streets Lowpoly Pack - Lite/Prefabs/(P) Characters_Zombie_SuitMan_1.prefab");
+        if (_resolvedZombiePrefab != null)
+            return _resolvedZombiePrefab;
+#endif
+
+        _resolvedZombiePrefab = zombiePrefab;
+        return _resolvedZombiePrefab;
+    }
+
+    public Vector3 GetSpawnCenterWorld()
+    {
+        if (useTransformPositionAsSpawn)
+            return transform.position;
+
+        return TrainingEnvSpace.LocalToWorld(transform, spawnPosition);
+    }
+
+    /// <summary>Спавн ровно в точке ZombieSpawner (домик).</summary>
+    public int SpawnZombiesAtSpawner(int count)
+    {
+        if (ResolveZombiePrefab() == null)
+            return 0;
+
+        count = Mathf.Clamp(count, 1, 10);
+        RemoveDestroyed();
+
+        Vector3 pos = GetSpawnCenterWorld();
+        for (int i = 0; i < count; i++)
+            SpawnOneAt(pos);
+
+        return count;
     }
 
     private static void EnsureZombieComponents(GameObject zombie)
@@ -228,7 +327,7 @@ public class ZombieSpawner : MonoBehaviour
     /// <summary>Спавн count зомби вокруг worldPos (Twitch #zombie=N). Возвращает сколько создано.</summary>
     public int SpawnZombiesNear(Vector3 worldPos, int count, float radius = 7f)
     {
-        if (zombiePrefab == null)
+        if (ResolveZombiePrefab() == null)
             return 0;
 
         count = Mathf.Clamp(count, 1, 10);

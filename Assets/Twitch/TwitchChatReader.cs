@@ -385,11 +385,14 @@ public sealed class TwitchChatReader : MonoBehaviour
         switch (name)
         {
             case "add_tree":
+            case "add_sheep":
             case "up":
             case "forward":
             case "zombie":
             case "clone_jack":
             case "size":
+            case "speed_up":
+            case "reset":
                 return true;
             default:
                 return false;

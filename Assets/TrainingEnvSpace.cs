@@ -9,6 +9,28 @@ public static class TrainingEnvSpace
 {
     static Transform _presentationRoot;
 
+    public static bool IsPresentationOnlyRequested()
+    {
+        var env = System.Environment.GetEnvironmentVariable("FOREST_PRESENTATION_ONLY");
+        if (env == "1" || string.Equals(env, "true", System.StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        foreach (var arg in System.Environment.GetCommandLineArgs())
+        {
+            if (arg == "-forestPresentationOnly" || arg == "--forest-presentation-only")
+                return true;
+        }
+
+        return false;
+    }
+
+    public static bool IsMlAgentsTrainingActive()
+    {
+        if (!Unity.MLAgents.Academy.IsInitialized)
+            return false;
+        return Unity.MLAgents.Academy.Instance.IsCommunicatorOn;
+    }
+
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
     static void ConfigureParallelEnvPresentation()
     {
@@ -17,10 +39,19 @@ public static class TrainingEnvSpace
         if (presentation == null)
             return;
 
+        bool presentationOnly = IsPresentationOnlyRequested();
+
         foreach (var envRoot in FindAllEnvRoots())
         {
             if (envRoot == presentation)
                 continue;
+
+            if (presentationOnly)
+            {
+                envRoot.gameObject.SetActive(false);
+                continue;
+            }
+
             MuteEnvPresentation(envRoot);
         }
 
@@ -93,6 +124,67 @@ public static class TrainingEnvSpace
         if (root == null)
             return Object.FindObjectOfType<T>();
         return root.GetComponentInChildren<T>(true);
+    }
+
+    /// <summary>Живой Jack для HUD и Twitch: оригинал, иначе клон с HP &gt; 0.</summary>
+    public static AgentGoToHouseDiscrete FindPresentationJack()
+    {
+        var root = PresentationRoot;
+        AgentGoToHouseDiscrete[] jacks = root != null
+            ? root.GetComponentsInChildren<AgentGoToHouseDiscrete>(false)
+            : Object.FindObjectsOfType<AgentGoToHouseDiscrete>();
+
+        AgentGoToHouseDiscrete primary = null;
+        AgentGoToHouseDiscrete livingClone = null;
+
+        for (int i = 0; i < jacks.Length; i++)
+        {
+            var jack = jacks[i];
+            if (jack == null)
+                continue;
+
+            if (TwitchEphemeralEffects.IsTwitchClone(jack))
+            {
+                if (livingClone == null && jack.IsAliveForTwitch)
+                    livingClone = jack;
+            }
+            else if (primary == null)
+            {
+                primary = jack;
+            }
+        }
+
+        if (primary != null && primary.IsAliveForTwitch)
+            return primary;
+        if (livingClone != null)
+            return livingClone;
+        return primary != null ? primary : (jacks.Length > 0 ? jacks[0] : null);
+    }
+
+    /// <summary>Оригинальный Jack (не Twitch-клон) в presentation Env.</summary>
+    public static AgentGoToHouseDiscrete FindPresentationPrimaryJack()
+    {
+        var root = PresentationRoot;
+        if (root == null)
+        {
+            var all = Object.FindObjectsOfType<AgentGoToHouseDiscrete>();
+            for (int i = 0; i < all.Length; i++)
+            {
+                if (!TwitchEphemeralEffects.IsTwitchClone(all[i]))
+                    return all[i];
+            }
+
+            return all.Length > 0 ? all[0] : null;
+        }
+
+        var jacks = root.GetComponentsInChildren<AgentGoToHouseDiscrete>(false);
+        for (int i = 0; i < jacks.Length; i++)
+        {
+            if (jacks[i] != null && !TwitchEphemeralEffects.IsTwitchClone(jacks[i]))
+                return jacks[i];
+        }
+
+        return jacks.Length > 0 ? jacks[0] : null;
     }
 
     public static Transform FindRoot(Transform from)
@@ -182,7 +274,14 @@ public static class TrainingEnvSpace
 
     public static bool HasMultipleTrainingEnvs()
     {
-        return FindAllEnvRoots().Length > 1;
+        int active = 0;
+        foreach (var envRoot in FindAllEnvRoots())
+        {
+            if (envRoot != null && envRoot.gameObject.activeInHierarchy)
+                active++;
+        }
+
+        return active > 1;
     }
 
     public static Transform[] GetAllEnvRoots()
@@ -213,7 +312,6 @@ public static class TrainingEnvSpace
         foreach (var audio in envRoot.GetComponentsInChildren<AudioSource>(true))
             audio.mute = true;
 
-        // Фоновые Env не нужны на экране — отключаем рендер, чтобы не грузить GPU.
         foreach (var cam in envRoot.GetComponentsInChildren<Camera>(true))
             cam.enabled = false;
 

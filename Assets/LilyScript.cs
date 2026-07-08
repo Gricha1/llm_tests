@@ -209,9 +209,12 @@ public class LilyScript : Agent, IHasHp
         }
     }
 
+    bool ShouldShowOptionTaskIcon() =>
+        showOptionTaskIcon && TrainingEnvSpace.IsPresentationTransform(transform);
+
     private void EnsureOptionIconRenderer()
     {
-        if (!showOptionTaskIcon) return;
+        if (!ShouldShowOptionTaskIcon()) return;
         if (optionIconRenderer != null) return;
         if (optionFlowerSprite == null && optionKissSprite == null) return;
 
@@ -250,7 +253,7 @@ public class LilyScript : Agent, IHasHp
     {
         ApplyWalkAnimatorSpeed();
 
-        if (!showOptionTaskIcon || optionIconRenderer == null) return;
+        if (!ShouldShowOptionTaskIcon() || optionIconRenderer == null) return;
 
         Vector3 iconPos = transform.position + optionIconOffset;
         optionIconRenderer.transform.position = iconPos;
@@ -286,7 +289,7 @@ public class LilyScript : Agent, IHasHp
 
     private void UpdateOptionIconVisual()
     {
-        if (!showOptionTaskIcon)
+        if (!ShouldShowOptionTaskIcon())
         {
             if (optionIconRenderer != null)
                 optionIconRenderer.enabled = false;

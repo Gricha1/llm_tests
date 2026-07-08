@@ -9,7 +9,7 @@ public class ZombieAttack : MonoBehaviour
 {
     [SerializeField] private float hitCooldown = 1f;
     [SerializeField] private float damageDelaySeconds = 0.5f;
-    [SerializeField] private float damageRadius = 1.2f;
+    [SerializeField] private float damageRadius = 1.55f;
     private float lastHitTime = -999f;
     [SerializeField] private string attackLeftTrigger = "AttackL";
     [SerializeField] private string attackRightTrigger = "AttackR";

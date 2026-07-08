@@ -14,16 +14,23 @@ public sealed class TrainingGraphOverlay : MonoBehaviour
     const int MaxPoints = 160;
     const int GraphWidth = 360;
     const int GraphHeight = 150;
+    const int YAxisLabelCount = 5;
+    const int YAxisWidth = 46;
+    const int XAxisHeight = 20;
     // Сглаживание реварда по нескольким эпизодам: чтобы динамика читалась, а не «пила».
     // Чем меньше alpha — тем более плавный график.
     const float EmaAlpha = 0.03f;
     // Сколько завершённых эпизодов (по всем параллельным env) усредняем в одну точку графика.
     const int RewardAggregateEpisodes = 8;
+    // Presentation-only (стрим): длинные эпизоды — снимаем reward по окну, затем усредняем как обычно.
+    // 8 окон × ~45 с ≈ одна точка графика раз в ~6 мин (плавная динамика, не «пила»).
+    const float PresentationRewardSampleSeconds = 45f;
 
     static readonly Color JackColor = new Color(0.22f, 0.48f, 0.95f, 1f);
     static readonly Color LilyColor = new Color(0.98f, 0.38f, 0.62f, 1f);
     static readonly Color GridColor = new Color(1f, 1f, 1f, 0.08f);
     static readonly Color BgColor = new Color(0.04f, 0.06f, 0.08f, 0.82f);
+    static readonly Color AxisLabelColor = new Color(0.75f, 0.78f, 0.82f, 0.95f);
 
     static TrainingGraphOverlay _instance;
 
@@ -32,6 +39,8 @@ public sealed class TrainingGraphOverlay : MonoBehaviour
         public Agent Agent;
         public int LastCompletedEpisodes;
         public float LastCumulative;
+        public float WindowAnchorReward;
+        public float WindowAnchorTime;
     }
 
     [SerializeField] private bool showOnlyWhenTraining;
@@ -53,12 +62,20 @@ public sealed class TrainingGraphOverlay : MonoBehaviour
     int _lilyAggCount;
     bool _usesTrainingEnvs;
     bool _needsRedraw = true;
+    int _graphPointCounter;
+
+    float _lastYMin;
+    float _lastYMax;
 
     GameObject _panel;
     RawImage _graphImage;
     Texture2D _tex;
     TMP_Text _legend;
     TMP_Text _title;
+    TMP_Text _yAxisTitle;
+    TMP_Text _xAxisTitle;
+    readonly TMP_Text[] _yAxisLabels = new TMP_Text[YAxisLabelCount];
+    readonly TMP_Text[] _xAxisLabels = new TMP_Text[3];
 
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
     static void Bootstrap()
@@ -91,9 +108,11 @@ public sealed class TrainingGraphOverlay : MonoBehaviour
         // иначе #show metrics не видит историю «за всё время обучения».
         RefreshTrackers();
         TrackAll(_jackTrackers, _jackRewards, ref _jackEma, ref _jackLastRaw,
-            ref _jackAggSum, ref _jackAggCount, notifyPolicyStats: true);
+            ref _jackAggSum, ref _jackAggCount, notifyPolicyStats: true,
+            usePresentationSampling: !_usesTrainingEnvs);
         TrackAll(_lilyTrackers, _lilyRewards, ref _lilyEma, ref _lilyLastRaw,
-            ref _lilyAggSum, ref _lilyAggCount, notifyPolicyStats: false);
+            ref _lilyAggSum, ref _lilyAggCount, notifyPolicyStats: false,
+            usePresentationSampling: !_usesTrainingEnvs);
 
         bool show = visible && ShouldShow();
         if (_panel != null)
@@ -150,7 +169,7 @@ public sealed class TrainingGraphOverlay : MonoBehaviour
         }
         else
         {
-            var jack = FindPresentationJack();
+            var jack = TrainingEnvSpace.FindPresentationJack();
             if (jack != null)
                 agents.Add(jack);
         }
@@ -227,19 +246,25 @@ public sealed class TrainingGraphOverlay : MonoBehaviour
         ref float lastRaw,
         ref float aggSum,
         ref int aggCount,
-        bool notifyPolicyStats)
+        bool notifyPolicyStats,
+        bool usePresentationSampling)
     {
+        int aggregateTarget = RewardAggregateEpisodes;
+
         for (int i = 0; i < trackers.Count; i++)
         {
-            if (!TrackOne(trackers[i], out float episodeReward))
+            bool changed = TrackOne(trackers[i], out float episodeReward);
+            if (!changed && usePresentationSampling)
+                changed = TrackPresentationWindow(trackers[i], out episodeReward);
+
+            if (!changed)
                 continue;
 
             lastRaw = episodeReward;
             aggSum += episodeReward;
             aggCount++;
 
-            // Обновляем график реже: одна точка на несколько эпизодов.
-            if (aggCount < RewardAggregateEpisodes)
+            if (aggCount < aggregateTarget)
                 continue;
 
             float aggregated = aggSum / Mathf.Max(1, aggCount);
@@ -254,9 +279,13 @@ public sealed class TrainingGraphOverlay : MonoBehaviour
             if (history.Count > MaxPoints)
                 history.RemoveAt(0);
 
-            _needsRedraw = true;
             if (notifyPolicyStats)
+            {
+                _graphPointCounter++;
                 TrainingPolicyStats.NotifyEpisodeRewardEma(ema);
+            }
+
+            _needsRedraw = true;
         }
     }
 
@@ -275,11 +304,41 @@ public sealed class TrainingGraphOverlay : MonoBehaviour
         {
             tracker.LastCompletedEpisodes = ep;
             episodeReward = tracker.LastCumulative;
+            tracker.WindowAnchorTime = Time.unscaledTime;
+            tracker.WindowAnchorReward = agent.GetCumulativeReward();
             changed = true;
         }
 
         tracker.LastCumulative = current;
         return changed;
+    }
+
+    static bool TrackPresentationWindow(AgentEpisodeTracker tracker, out float sampleReward)
+    {
+        sampleReward = 0f;
+        var agent = tracker.Agent;
+        if (agent == null)
+            return false;
+
+        float now = Time.unscaledTime;
+        if (tracker.WindowAnchorTime <= 0f)
+        {
+            tracker.WindowAnchorTime = now;
+            tracker.WindowAnchorReward = agent.GetCumulativeReward();
+            return false;
+        }
+
+        if (now - tracker.WindowAnchorTime < PresentationRewardSampleSeconds)
+            return false;
+
+        float current = agent.GetCumulativeReward();
+        sampleReward = current - tracker.WindowAnchorReward;
+        if (sampleReward < 0f)
+            sampleReward = current;
+
+        tracker.WindowAnchorTime = now;
+        tracker.WindowAnchorReward = current;
+        return true;
     }
 
     public static float JackEma => _instance != null ? _instance._jackEma : 0f;
@@ -293,16 +352,13 @@ public sealed class TrainingGraphOverlay : MonoBehaviour
 
     public static float GetPresentationJackCumulativeReward()
     {
-        var jack = FindPresentationJack();
+        var jack = TrainingEnvSpace.FindPresentationJack();
         return jack != null ? jack.GetCumulativeReward() : 0f;
     }
 
     static AgentGoToHouseDiscrete FindPresentationJack()
     {
-        var root = TrainingEnvSpace.PresentationRoot;
-        if (root != null)
-            return root.GetComponentInChildren<AgentGoToHouseDiscrete>(false);
-        return Object.FindObjectOfType<AgentGoToHouseDiscrete>();
+        return TrainingEnvSpace.FindPresentationJack();
     }
 
     static LilyScript FindPresentationLily()
@@ -336,7 +392,7 @@ public sealed class TrainingGraphOverlay : MonoBehaviour
         panelRt.anchorMax = new Vector2(0f, 0f);
         panelRt.pivot = new Vector2(0f, 0f);
         panelRt.anchoredPosition = new Vector2(16f, 16f);
-        panelRt.sizeDelta = new Vector2(GraphWidth + 24f, GraphHeight + 56f);
+        panelRt.sizeDelta = new Vector2(GraphWidth + YAxisWidth + 36f, GraphHeight + 88f);
 
         var panelBg = _panel.AddComponent<Image>();
         panelBg.color = BgColor;
@@ -357,13 +413,33 @@ public sealed class TrainingGraphOverlay : MonoBehaviour
         if (TMP_Settings.defaultFontAsset != null)
             _title.font = TMP_Settings.defaultFontAsset;
 
+        var plotGo = new GameObject("PlotArea");
+        plotGo.transform.SetParent(_panel.transform, false);
+        var plotRt = plotGo.AddComponent<RectTransform>();
+        plotRt.anchorMin = new Vector2(0f, 0f);
+        plotRt.anchorMax = new Vector2(1f, 1f);
+        plotRt.offsetMin = new Vector2(8f, 46f);
+        plotRt.offsetMax = new Vector2(-8f, -30f);
+
+        _yAxisTitle = CreateAxisLabel(plotGo.transform, "YAxisTitle", "Награда",
+            new Vector2(0f, 0.5f), new Vector2(0f, 0.5f), new Vector2(0f, 0.5f),
+            new Vector2(-YAxisWidth * 0.5f - 4f, 0f), new Vector2(YAxisWidth, 16f), 11, true);
+
+        for (int i = 0; i < YAxisLabelCount; i++)
+        {
+            float t = i / (float)(YAxisLabelCount - 1);
+            _yAxisLabels[i] = CreateAxisLabel(plotGo.transform, $"YLabel{i}", "0",
+                new Vector2(0f, 1f - t), new Vector2(0f, 1f - t), new Vector2(1f, 0.5f),
+                new Vector2(0f, 0f), new Vector2(YAxisWidth - 4f, 16f), 11, false);
+        }
+
         var graphGo = new GameObject("Graph");
-        graphGo.transform.SetParent(_panel.transform, false);
+        graphGo.transform.SetParent(plotGo.transform, false);
         var graphRt = graphGo.AddComponent<RectTransform>();
         graphRt.anchorMin = new Vector2(0f, 0f);
         graphRt.anchorMax = new Vector2(1f, 1f);
-        graphRt.offsetMin = new Vector2(10f, 28f);
-        graphRt.offsetMax = new Vector2(-10f, -28f);
+        graphRt.offsetMin = new Vector2(YAxisWidth, XAxisHeight);
+        graphRt.offsetMax = new Vector2(0f, 0f);
 
         _graphImage = graphGo.AddComponent<RawImage>();
         _tex = new Texture2D(GraphWidth, GraphHeight, TextureFormat.RGBA32, false)
@@ -372,6 +448,31 @@ public sealed class TrainingGraphOverlay : MonoBehaviour
             wrapMode = TextureWrapMode.Clamp
         };
         _graphImage.texture = _tex;
+
+        _xAxisTitle = CreateAxisLabel(plotGo.transform, "XAxisTitle", "Эпизод (×8)",
+            new Vector2(0.5f, 0f), new Vector2(0.5f, 0f), new Vector2(0.5f, 0f),
+            new Vector2(YAxisWidth * 0.5f, 2f), new Vector2(80f, 14f), 11, true);
+
+        var xAxisGo = new GameObject("XAxis");
+        xAxisGo.transform.SetParent(plotGo.transform, false);
+        var xAxisRt = xAxisGo.AddComponent<RectTransform>();
+        xAxisRt.anchorMin = new Vector2(0f, 0f);
+        xAxisRt.anchorMax = new Vector2(1f, 0f);
+        xAxisRt.pivot = new Vector2(0.5f, 0f);
+        xAxisRt.offsetMin = new Vector2(YAxisWidth, 0f);
+        xAxisRt.offsetMax = new Vector2(0f, XAxisHeight);
+
+        string[] xDefaults = { "1", "…", "1" };
+        for (int i = 0; i < _xAxisLabels.Length; i++)
+        {
+            float anchorX = i / (float)(_xAxisLabels.Length - 1);
+            _xAxisLabels[i] = CreateAxisLabel(xAxisGo.transform, $"XLabel{i}", xDefaults[i],
+                new Vector2(anchorX, 0f), new Vector2(anchorX, 0f), new Vector2(0.5f, 0f),
+                new Vector2(0f, 0f), new Vector2(56f, 16f), 11, false);
+            _xAxisLabels[i].alignment = i == 0
+                ? TextAlignmentOptions.BottomLeft
+                : (i == _xAxisLabels.Length - 1 ? TextAlignmentOptions.BottomRight : TextAlignmentOptions.Bottom);
+        }
 
         var legendGo = new GameObject("Legend");
         legendGo.transform.SetParent(_panel.transform, false);
@@ -402,6 +503,8 @@ public sealed class TrainingGraphOverlay : MonoBehaviour
         float yMax = 1f;
         bool showLily = _lilyTrackers.Count > 0;
         ComputeRange(_jackRewards, showLily ? _lilyRewards : null, ref yMin, ref yMax);
+        _lastYMin = yMin;
+        _lastYMax = yMax;
 
         for (int i = 0; i <= 4; i++)
         {
@@ -415,6 +518,8 @@ public sealed class TrainingGraphOverlay : MonoBehaviour
 
         _tex.SetPixels(pixels);
         _tex.Apply(false);
+
+        UpdateAxisLabels();
 
         float jackDisplay = _jackRewards.Count > 0 ? _jackRewards[_jackRewards.Count - 1] : 0f;
         if (_legend != null)
@@ -539,5 +644,66 @@ public sealed class TrainingGraphOverlay : MonoBehaviour
     {
         Color32 c32 = c;
         return $"{c32.r:x2}{c32.g:x2}{c32.b:x2}";
+    }
+
+    TMP_Text CreateAxisLabel(Transform parent, string name, string text,
+        Vector2 anchorMin, Vector2 anchorMax, Vector2 pivot, Vector2 anchoredPos, Vector2 size,
+        int fontSize, bool centered)
+    {
+        var go = new GameObject(name);
+        go.transform.SetParent(parent, false);
+        var rt = go.AddComponent<RectTransform>();
+        rt.anchorMin = anchorMin;
+        rt.anchorMax = anchorMax;
+        rt.pivot = pivot;
+        rt.anchoredPosition = anchoredPos;
+        rt.sizeDelta = size;
+
+        var label = go.AddComponent<TextMeshProUGUI>();
+        label.text = text;
+        label.fontSize = fontSize;
+        label.color = AxisLabelColor;
+        label.enableWordWrapping = false;
+        label.alignment = centered ? TextAlignmentOptions.Center : TextAlignmentOptions.MidlineRight;
+        if (TMP_Settings.defaultFontAsset != null)
+            label.font = TMP_Settings.defaultFontAsset;
+        return label;
+    }
+
+    void UpdateAxisLabels()
+    {
+        for (int i = 0; i < YAxisLabelCount; i++)
+        {
+            if (_yAxisLabels[i] == null)
+                continue;
+
+            float t = i / (float)(YAxisLabelCount - 1);
+            float value = Mathf.Lerp(_lastYMax, _lastYMin, t);
+            _yAxisLabels[i].text = FormatRewardAxis(value);
+        }
+
+        int xMax = _graphPointCounter;
+        int xMin = _jackRewards.Count > 0 ? xMax - _jackRewards.Count + 1 : 0;
+        if (xMax <= 0)
+        {
+            if (_xAxisLabels[0] != null) _xAxisLabels[0].text = "0";
+            if (_xAxisLabels[1] != null) _xAxisLabels[1].text = "";
+            if (_xAxisLabels[2] != null) _xAxisLabels[2].text = "0";
+            return;
+        }
+
+        if (_xAxisLabels[0] != null) _xAxisLabels[0].text = xMin.ToString();
+        if (_xAxisLabels[1] != null) _xAxisLabels[1].text = ((xMin + xMax) / 2).ToString();
+        if (_xAxisLabels[2] != null) _xAxisLabels[2].text = xMax.ToString();
+    }
+
+    static string FormatRewardAxis(float value)
+    {
+        float abs = Mathf.Abs(value);
+        if (abs >= 100f)
+            return value.ToString("F0");
+        if (abs >= 10f)
+            return value.ToString("F1");
+        return value.ToString("F2");
     }
 }

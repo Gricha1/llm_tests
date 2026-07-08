@@ -16,12 +16,12 @@ public class FlowerSpawner : MonoBehaviour
     [SerializeField] private float minDistance = 1.5f;
     [SerializeField] private float respawnInterval = 1f;
 
-    // Зона спавна: чуть правее овец и чуть выше (около деревьев)
-    private readonly float areaMinX = -18.5f;
-    private readonly float areaMaxX = -5.5f;
-    private readonly float areaMinZ = -7.4f;
-    private readonly float areaMaxZ = -2.11f;
-    private readonly float spawnY = 0.55f;
+    // Зона спавна (local Env, поляна рядом с Jack)
+    private readonly float areaMinX = 3.73f;
+    private readonly float areaMaxX = 16.73f;
+    private readonly float areaMinZ = 10.65f;
+    private readonly float areaMaxZ = 15.94f;
+    private readonly float spawnY = -5.588786f;
 
     private List<GameObject> flowers = new List<GameObject>();
     private float nextRespawnTime;

@@ -26,6 +26,11 @@ echo "[lab_comp] python=${actual_py}"
 
 echo "[lab_comp] pip install mlagents==${MLA_VER}"
 pip install -U pip
+# Ubuntu 18.04: системный HDF5 1.10.0; setuptools 82+ убирает pkg_resources
+pip install "h5py==3.11.0" "setuptools<81"
+# Драйвер 470 на Ubuntu 18.04: torch cu124 не видит GPU; cu117 работает
+pip install "torch==2.0.1+cu117" "torchvision==0.15.2+cu117" \
+  --index-url https://download.pytorch.org/whl/cu117
 pip install "mlagents==${MLA_VER}"
 
 echo "[lab_comp] готово:"

@@ -12,7 +12,7 @@
 #
 # Переменные:
 #   BUILD=jack_cow.x86_64   имя папки в build_versions/
-#   NUM_ENVS=20             параллельных env
+#   NUM_ENVS=5             5 сред: wood, food, wood, food, zombie (Auto на JackEnvTrainingConfig)
 #   TIME_SCALE=5
 
 set -eu

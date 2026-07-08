@@ -16,10 +16,36 @@ public class RewardDisplay : MonoBehaviour
     [SerializeField] private string label = "";
     TMP_Text _text;
 
+    [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
+    static void BootstrapAll()
+    {
+        var displays = Resources.FindObjectsOfTypeAll<RewardDisplay>();
+        for (int i = 0; i < displays.Length; i++)
+        {
+            if (displays[i] != null)
+                displays[i].EnsureHudVisible();
+        }
+    }
+
     void Awake()
     {
         _text = GetComponent<TMP_Text>();
         ResolveLabel();
+        EnsureHudVisible();
+    }
+
+    void EnsureHudVisible()
+    {
+        var canvas = GetComponentInParent<Canvas>();
+        if (canvas != null)
+        {
+            var canvasRt = canvas.GetComponent<RectTransform>();
+            if (canvasRt != null && canvasRt.localScale.sqrMagnitude < 1e-4f)
+                canvasRt.localScale = Vector3.one;
+        }
+
+        if (!gameObject.activeSelf)
+            gameObject.SetActive(true);
     }
 
     void ResolveLabel()
@@ -69,13 +95,8 @@ public class RewardDisplay : MonoBehaviour
         _text.text = $"{label}: {agent.GetCumulativeReward():F2}";
     }
 
-    static AgentGoToHouseDiscrete FindActiveJack()
-    {
-        var root = TrainingEnvSpace.PresentationRoot;
-        if (root != null)
-            return root.GetComponentInChildren<AgentGoToHouseDiscrete>(false);
-        return FindObjectOfType<AgentGoToHouseDiscrete>();
-    }
+    static AgentGoToHouseDiscrete FindActiveJack() =>
+        TrainingEnvSpace.FindPresentationJack();
 
     static LilyScript FindActiveLily()
     {

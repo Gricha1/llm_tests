@@ -8,21 +8,21 @@ public class TreeSpawner : MonoBehaviour
 
     [Header("Spawn Settings")]
     [SerializeField] private int treeCount = 30;
-    [SerializeField] private float y = 0.42f;
+    [SerializeField] private float y = -5.718786f;
     [SerializeField] private float minDistance = 1.5f; // минимальное расстояние между деревьями
     [SerializeField] private float respawnInterval = 2f; // секунд между попытками доп. спавна
 
-    // Основная область спавна
-    private readonly float minX = -28.40f;
-    private readonly float maxX = -7.79f;
-    private readonly float minZ = 8.93f;
-    private readonly float maxZ = 14.59f;
+    // Основная область спавна (local Env, за домиком — как на стриме)
+    private readonly float minX = -6.17f;
+    private readonly float maxX = 14.44f;
+    private readonly float minZ = 26.98f;
+    private readonly float maxZ = 32.64f;
 
     // Дополнительная область
-    private readonly float extraMinX = -21.18f;
-    private readonly float extraMaxX = -7.6f;
-    private readonly float extraMinZ = 4f;
-    private readonly float extraMaxZ = 6.93f;
+    private readonly float extraMinX = 1.05f;
+    private readonly float extraMaxX = 14.63f;
+    private readonly float extraMinZ = 22.05f;
+    private readonly float extraMaxZ = 24.98f;
 
     private List<GameObject> trees = new List<GameObject>();
     private float nextRespawnTime;
@@ -40,9 +40,31 @@ public class TreeSpawner : MonoBehaviour
         return _envRoot != null ? _envRoot.TransformPoint(localPos) : localPos;
     }
 
+    private Vector3 RandomLocalSpawn()
+    {
+        bool useExtraArea = Random.value < 0.3f;
+        if (useExtraArea)
+        {
+            return new Vector3(
+                Random.Range(extraMinX, extraMaxX),
+                y,
+                Random.Range(extraMinZ, extraMaxZ)
+            );
+        }
+
+        return new Vector3(
+            Random.Range(minX, maxX),
+            y,
+            Random.Range(minZ, maxZ)
+        );
+    }
+
     private void Start()
     {
         nextRespawnTime = Time.time + respawnInterval;
+        RemoveDestroyedTrees();
+        if (trees.Count == 0)
+            SpawnTrees();
     }
 
     private void Update()
@@ -65,13 +87,7 @@ public class TreeSpawner : MonoBehaviour
         for (int attempt = 0; attempt < 100; attempt++)
         {
             GameObject prefab = treePrefabs[Random.Range(0, treePrefabs.Length)];
-            bool useExtraArea = Random.value < 0.3f;
-
-            Vector3 pos;
-            if (useExtraArea)
-                pos = ToWorld(new Vector3(Random.Range(extraMinX, extraMaxX), y, Random.Range(extraMinZ, extraMaxZ)));
-            else
-                pos = ToWorld(new Vector3(Random.Range(minX, maxX), y, Random.Range(minZ, maxZ)));
+            Vector3 pos = ToWorld(RandomLocalSpawn());
 
             bool tooClose = false;
             foreach (var tree in trees)
@@ -95,6 +111,17 @@ public class TreeSpawner : MonoBehaviour
         }
     }
 
+    public int TargetCount => treeCount;
+
+    public int AliveCount
+    {
+        get
+        {
+            RemoveDestroyedTrees();
+            return trees.Count;
+        }
+    }
+
     public void ResetTrees()
     {
         ClearTrees();
@@ -103,41 +130,15 @@ public class TreeSpawner : MonoBehaviour
 
     private void SpawnTrees()
     {
-        int attempts = 0;
-
         for (int i = 0; i < treeCount; i++)
         {
             bool treePlaced = false;
 
-            while (!treePlaced && attempts < 100)
+            for (int attempt = 0; attempt < 100 && !treePlaced; attempt++)
             {
-                attempts++;
-
-                // Выбираем случайный префаб
                 GameObject prefab = treePrefabs[Random.Range(0, treePrefabs.Length)];
+                Vector3 pos = ToWorld(RandomLocalSpawn());
 
-                // Выбираем случайную область: основную или дополнительную
-                bool useExtraArea = Random.value < 0.3f;
-
-                Vector3 pos;
-                if (useExtraArea)
-                {
-                    pos = ToWorld(new Vector3(
-                        Random.Range(extraMinX, extraMaxX),
-                        y,
-                        Random.Range(extraMinZ, extraMaxZ)
-                    ));
-                }
-                else
-                {
-                    pos = ToWorld(new Vector3(
-                        Random.Range(minX, maxX),
-                        y,
-                        Random.Range(minZ, maxZ)
-                    ));
-                }
-
-                // Проверяем минимальное расстояние до всех уже размещённых деревьев
                 bool tooClose = false;
                 foreach (var tree in trees)
                 {
@@ -159,11 +160,8 @@ public class TreeSpawner : MonoBehaviour
                 }
             }
 
-            if (attempts >= 100)
-            {
-                Debug.LogWarning("Не удалось разместить все деревья без пересечений");
-                break;
-            }
+            if (!treePlaced)
+                Debug.LogWarning($"TreeSpawner: не удалось разместить дерево {i + 1}/{treeCount}");
         }
     }
 

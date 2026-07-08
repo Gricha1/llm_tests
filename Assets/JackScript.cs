@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using UnityEngine;
 using Unity.MLAgents;
 using Unity.MLAgents.Actuators;
+using Unity.MLAgents.Policies;
 using Unity.MLAgents.Sensors;
 
 [RequireComponent(typeof(CharacterController))]
@@ -20,13 +21,13 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     [Tooltip("Если true — Jack спавнится у дома в фиксированной позиции/повороте (не случайно).")]
     [SerializeField] private bool spawnAtHouseFixed = false;
 
-    [SerializeField] private Vector3 fixedSpawnPosition = new Vector3(-25.4899998f, 0.257999986f, 0.649999976f);
+    [SerializeField] private Vector3 fixedSpawnPosition = new Vector3(3.95f, -5.228786f, 14.87f);
     [SerializeField] private Vector3 fixedSpawnEuler = new Vector3(0f, 177.644073f, 0f);
 
     [Header("HUD")]
     [SerializeField] private bool showHudHpTopLeft = true;
 
-    [Header("Option Sampling (Wood/Food)")]
+    [Header("Option Sampling (Wood/Food/Zombie)")]
     [Tooltip("Если true, опция (дерево/еда) выбирается по utility+softmax sampling каждые 20 шагов.")]
     [SerializeField] private bool useUtilitySoftmaxSampling = false;
     [Tooltip("Температура softmax (0.2 = почти жёстко, 0.7 = заметно случайно).")]
@@ -42,9 +43,11 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     [SerializeField] private SpriteRenderer optionIconRenderer;
     [SerializeField] private Sprite optionWoodSprite;
     [SerializeField] private Sprite optionFoodSprite;
+    [SerializeField] private Sprite optionZombieSprite;
     [SerializeField] private Vector3 optionIconOffset = new Vector3(0f, 2.2f, 0f);
     [SerializeField] private float optionWoodIconScale = 0.55f;
     [SerializeField] private float optionFoodIconScale = 0.35f;
+    [SerializeField] private float optionZombieIconScale = 0.8f;
     [Tooltip("Доп. множитель размера иконки, когда камера захвата/просмотра = CamOnJack.")]
     [SerializeField] private float optionIconScaleMultiplierCamOnJack = 0.55f;
     [SerializeField] private int optionIconSortingOrder = 100;
@@ -61,6 +64,11 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     [SerializeField] private LayerMask sheepLayer;     // слой овечки
 
     private float prevSheepDist;
+    private float prevZombieDist;
+
+    public const int OptionWood = 0;
+    public const int OptionFood = 1;
+    public const int OptionZombie = 2;
 
 
     [Header("Fire / House")]
@@ -99,7 +107,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     private float _freezeTimer;
 
     [Header("Hunger / Satiety")]
-    [SerializeField] private int maxSatiety = 20;  // максимум сытости
+    [SerializeField] private int maxSatiety = 20;  // шкала для UI/наблюдений, не лимит инвентаря
     public int satiety;                               // текущая сытость
     private float satietyTimer;
     [SerializeField] private float satietyDecayInterval = 5.0f; // секунд на 1 единицу сытости
@@ -122,7 +130,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     [SerializeField] private float reachDistance = 1.2f;
     [SerializeField] private float reachReward = 10f;
 
-    [SerializeField] private int maxWood = 10;
+    [SerializeField] private int maxWood = 10; // цель для задачи «идти к огню», не лимит инвентаря
     [SerializeField] private int maxHeat = 30;
 
     [Header("HP")]
@@ -132,23 +140,121 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     public int hp { get; private set; }
     public int Hp => hp;
     public int MaxHp => maxHp;
+    public bool IsAliveForTwitch => hp > 0 && !_deathSequenceStarted;
 
-    public int currentOptionTrain = 1; // 0 = дерево, 1 = еда
+    /// <summary>Инициализация Twitch-клона без EndEpisode (не трогает оригинал и других клонов).</summary>
+    public void BootstrapTwitchCloneFrom(AgentGoToHouseDiscrete source, Vector3 spawnPos, Quaternion spawnRot)
+    {
+        _deathSequenceStarted = false;
+        float reach = source != null ? source.TwitchReachMultiplier : 1f;
+        SetTwitchReachMultiplier(reach);
+        if (source != null)
+            SetTwitchMoveSpeedMultiplier(source.TwitchMoveSpeedMultiplier);
+        transform.SetPositionAndRotation(spawnPos, spawnRot);
 
-    public int currentOption = 1; // 0 = дерево, 1 = еда
+        if (animator == null)
+            animator = GetComponent<Animator>();
+        if (animator != null)
+            animator.speed = 1f;
 
-    // Публичные свойства (используются для наблюдений/утилит)
-    public int maxWoodPublic => maxWood;
-    public int maxHeatPublic => maxHeat;
-    public int maxSatietyPublic => maxSatiety;
-    public Transform houseTargetPublic => houseTarget;
+        prevPosition = spawnPos;
+        stepCount = 0;
+        _survivalPhase = 1;
+        _episodeStartTime = Time.unscaledTime;
+        _lastChopActionForAnim = 0;
+        _doCooldownRemaining = 0f;
+        _pendingTwitchJumpHeights = 0;
+        _forwardPushTimeLeft = 0f;
+        _forwardPushSpeed = 0f;
+
+        wood = 0;
+        satiety = maxSatiety / 2;
+        satietyTimer = 0f;
+        heat = maxHeat;
+        heatTimer = 0f;
+        burnTimer = 0f;
+        fireVfxOffTimer = 0f;
+        _freezeTimer = 0f;
+        _hungerTimer = 0f;
+        if (fireVfx != null)
+            fireVfx.SetActive(false);
+        GameSfx.StopFireLoop(transform);
+
+        prevTreeDist = 0f;
+        prevSheepDist = 0f;
+        hp = maxHp;
+
+        if (source != null)
+        {
+            currentOptionTrain = source.currentOptionTrain;
+            currentOption = source.currentOption;
+        }
+
+        UpdateOptionIconVisual();
+    }
+
+    float _twitchReachMultiplier = 1f;
+    public float TwitchReachMultiplier => _twitchReachMultiplier;
+
+    float _baseMoveSpeed;
+    bool _moveSpeedBaseCaptured;
+    float _twitchMoveSpeedMultiplier = 1f;
+    public float TwitchMoveSpeedMultiplier => _twitchMoveSpeedMultiplier;
+
+    internal void SetTwitchReachMultiplier(float mult) =>
+        _twitchReachMultiplier = Mathf.Max(0.1f, mult);
+
+    internal void SetTwitchMoveSpeedMultiplier(float mult)
+    {
+        CaptureBaseMoveSpeedIfNeeded();
+        _twitchMoveSpeedMultiplier = Mathf.Clamp(mult, 1f, 5f);
+        moveSpeed = _baseMoveSpeed * _twitchMoveSpeedMultiplier;
+    }
+
+    internal void ResetTwitchMoveSpeed()
+    {
+        if (_moveSpeedBaseCaptured)
+            moveSpeed = _baseMoveSpeed;
+        _twitchMoveSpeedMultiplier = 1f;
+    }
+
+    void CaptureBaseMoveSpeedIfNeeded()
+    {
+        if (_moveSpeedBaseCaptured)
+            return;
+        _baseMoveSpeed = moveSpeed;
+        _moveSpeedBaseCaptured = true;
+    }
+
+    float ChopReach => chopDistance * _twitchReachMultiplier;
+    float EatReach => eatDistance * _twitchReachMultiplier;
+    float HouseReach => houseRadius * _twitchReachMultiplier;
+    float ZombieDoReach => zombieNearbyRadiusOnDo * _twitchReachMultiplier;
+    float ZombieKnockbackReach => zombieKnockbackRadiusOnDo * _twitchReachMultiplier;
+
+    public int currentOptionTrain = 1; // 0 = дерево, 1 = еда, 2 = зомби
+
+    public int currentOption = 1; // 0 = дерево, 1 = еда, 2 = зомби
+
+    int _lastNonZombieOption = OptionWood;
+    bool _heuristicOptionLocked;
 
     // Отслеживание наград для каждой опции
     private float lastRewardForOption0 = 0f;
     private float lastRewardForOption1 = 0f;
+    private float lastRewardForOption2 = 0f;
     private float currentStepReward = 0f;
     private float accumulatedRewardForOption0 = 0f;
     private float accumulatedRewardForOption1 = 0f;
+    private float accumulatedRewardForOption2 = 0f;
+
+    // Публичные свойства (используются для наблюдений/утилит)
+    public int maxWoodPublic => maxWood;
+    public int MaxWood => maxWood;
+    public bool IsWoodGatherGoalReached => wood >= maxWood;
+    public int maxHeatPublic => maxHeat;
+    public int maxSatietyPublic => maxSatiety;
+    public Transform houseTargetPublic => houseTarget;
 
     private float prevTreeDist;
 
@@ -164,9 +270,11 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
 
     public JackTrainingMode ResolvedTrainingMode => _resolvedTrainingMode;
     bool IsFullTrainingMode => _resolvedTrainingMode == JackTrainingMode.Full;
+    bool IsZombieTrainingMode => _resolvedTrainingMode == JackTrainingMode.ZombieOnly;
     bool IsSimpleTrainingMode =>
         _resolvedTrainingMode == JackTrainingMode.WoodOnly
-        || _resolvedTrainingMode == JackTrainingMode.FoodOnly;
+        || _resolvedTrainingMode == JackTrainingMode.FoodOnly
+        || _resolvedTrainingMode == JackTrainingMode.ZombieOnly;
 
     public float SurvivalGoalSeconds => survivalGoalSeconds;
     public float SurvivalTotalSeconds => survivalGoalSeconds * 2f;
@@ -206,6 +314,8 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     [SerializeField] private string doActionAnimTrigger = "Do";
     [Tooltip("Минимум секунд между срабатываниями DO (анимация + попытка добычи).")]
     [SerializeField] private float doActionCooldownSeconds = 0.45f;
+    [Tooltip("Штраф за DO без результата (не дрова/еда/удар по зомби). ~−0.1: спам ≈ −0.2/с, один удачный DO +10.")]
+    [SerializeField] private float emptyDoActionPenalty = -0.1f;
     [Tooltip("Сглаживание параметра Speed в Animator (0 = без сглаживания — быстрее включение walk).")]
     [SerializeField] private float walkAnimSpeedDamp = 0f;
     private int _lastChopActionForAnim;
@@ -218,6 +328,11 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     [SerializeField] private float zombieNearbyRadiusOnDo = 1.5f;
     [SerializeField] private int zombieDamageOnDo = 0;
     [SerializeField] private LayerMask zombieLayer;
+
+    [Header("Zombie Option")]
+    [Tooltip("Если зомби ближе этой дистанции — включается опция «атака» [1,1].")]
+    [SerializeField] private float optionZombieActivationRadius = 6f;
+    [SerializeField] private float zombieApproachRewardScale = 0.5f;
 
     [Header("DO hits Zombie (knockback)")]
     [Tooltip("Если при выполнении DO рядом есть зомби — отталкиваем зомби немного назад.")]
@@ -319,11 +434,16 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
             fireVfx.AddComponent<CampfireLoopAudio>();
     }
 
+    bool ShouldShowOptionTaskIcon() =>
+        showOptionTaskIcon
+        && TrainingEnvSpace.IsPresentationTransform(transform)
+        && !TwitchEphemeralEffects.IsTwitchClone(this);
+
     private void EnsureOptionIconRenderer()
     {
-        if (!showOptionTaskIcon) return;
+        if (!ShouldShowOptionTaskIcon()) return;
         if (optionIconRenderer != null) return;
-        if (optionWoodSprite == null && optionFoodSprite == null) return;
+        if (optionWoodSprite == null && optionFoodSprite == null && optionZombieSprite == null) return;
 
         var existing = transform.Find("JackOptionIcon");
         if (existing != null)
@@ -347,11 +467,29 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     private void ApplyOptionIconLocalScale()
     {
         if (optionIconRenderer == null) return;
-        float s = currentOptionTrain == 0
-            ? Mathf.Max(0.01f, optionWoodIconScale)
-            : Mathf.Max(0.01f, optionFoodIconScale);
-        _optionIconBaseScale = s;
+        float s = currentOptionTrain switch
+        {
+            OptionWood => optionWoodIconScale,
+            OptionFood => optionFoodIconScale,
+            OptionZombie => ResolveZombieOptionIconScale(),
+            _ => optionFoodIconScale
+        };
+        _optionIconBaseScale = Mathf.Max(0.01f, s);
         optionIconRenderer.transform.localScale = Vector3.one * s;
+    }
+
+    float ResolveZombieOptionIconScale()
+    {
+        if (optionFoodSprite == null || optionZombieSprite == null)
+            return optionZombieIconScale;
+
+        float foodSize = Mathf.Max(optionFoodSprite.bounds.size.x, optionFoodSprite.bounds.size.y);
+        float zombieSize = Mathf.Max(optionZombieSprite.bounds.size.x, optionZombieSprite.bounds.size.y);
+        if (zombieSize < 1e-4f)
+            return optionZombieIconScale;
+
+        // Подгоняем зомби под размер стикера еды, не трогая еду и дерево.
+        return optionFoodIconScale * (foodSize / zombieSize);
     }
 
     private void Update()
@@ -365,10 +503,56 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
             UpdateOptionIconVisual();
         }
 
-        if (Input.GetKeyDown(KeyCode.E))
-            SetOption(currentOptionTrain == 0 ? 1 : 0);
+        ProcessHeuristicOptionKeys();
+        if (TrainingEnvSpace.IsPresentationTransform(transform)
+            && !TwitchEphemeralEffects.IsTwitchClone(this)
+            && !_heuristicOptionLocked)
+            RefreshTrainingOption();
 
         ProcessTwitchJump();
+    }
+
+    void ProcessHeuristicOptionKeys()
+    {
+        if (!IsManualOptionControlActive())
+            return;
+
+        if (Input.GetKeyDown(KeyCode.T))
+        {
+            _heuristicOptionLocked = !_heuristicOptionLocked;
+            if (!_heuristicOptionLocked)
+                RefreshTrainingOption(force: true);
+            return;
+        }
+
+        if (_heuristicOptionLocked && Input.GetKeyDown(KeyCode.E))
+            CycleHeuristicOption();
+    }
+
+    bool IsManualOptionControlActive()
+    {
+        if (!TrainingEnvSpace.IsPresentationTransform(transform))
+            return false;
+        if (TwitchEphemeralEffects.IsTwitchClone(this))
+            return false;
+
+        var bp = GetComponent<BehaviorParameters>();
+        if (bp != null && bp.BehaviorType == BehaviorType.HeuristicOnly)
+            return true;
+
+        // Play в Editor без mlagents-learn — тоже ручное управление опциями.
+        return !Academy.IsInitialized || !Academy.Instance.IsCommunicatorOn;
+    }
+
+    void CycleHeuristicOption()
+    {
+        int next = currentOptionTrain switch
+        {
+            OptionWood => OptionFood,
+            OptionFood => OptionZombie,
+            _ => OptionWood
+        };
+        SetOption(next);
     }
 
     /// <summary>Один прыжок из Twitch #up=N: высота = N × рост персонажа (N 1–5).</summary>
@@ -418,6 +602,8 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     public override void OnEpisodeBegin()
     {
         _deathSequenceStarted = false;
+        SetTwitchReachMultiplier(1f);
+        ResetTwitchMoveSpeed();
         bool isTwitchClone = TwitchEphemeralEffects.IsTwitchClone(this);
 
         if (TrainingEnvSpace.IsPresentationTransform(transform) && !isTwitchClone)
@@ -426,7 +612,9 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
             DeathFreeze.UnfreezeWorld();
             AgentDeathOverlay.Hide();
             BackgroundMusic.ResumeMusic();
-            TwitchEphemeralEffects.OnPresentationJackEpisodeBegin(this);
+            var primary = TrainingEnvSpace.FindPresentationPrimaryJack();
+            if (primary == this)
+                TwitchEphemeralEffects.OnPresentationJackEpisodeBegin(this);
         }
 
         if (animator == null)
@@ -434,28 +622,35 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         if (animator != null)
             animator.speed = 1f;
 
-        float minX = -20.78f;
-        float maxX = -12.88f;
-        float minZ = -7.30f;
-        float maxZ = -0.01f;
-        float y = 0.42f;
+        // Локальные координаты относительно корня Env (как в инспекторе у Jack).
+        const float groundY = -5.228786f;
+        float minX = -2f;
+        float maxX = 14f;
+        float minZ = 10f;
+        float maxZ = 17f;
 
         if (!isTwitchClone)
         {
-            controller.enabled = false;
-            if (spawnAtHouseFixed)
+            // Одна Env — не телепортируем, остаётся позиция из сцены (~4, -5.2, 15).
+            bool skipTeleport = !spawnAtHouseFixed && !TrainingEnvSpace.HasMultipleTrainingEnvs();
+
+            if (!skipTeleport)
             {
-                transform.position = TrainingEnvSpace.LocalToWorld(transform, fixedSpawnPosition);
-                transform.rotation = TrainingEnvSpace.LocalToWorldRotation(transform, fixedSpawnEuler);
+                controller.enabled = false;
+                if (spawnAtHouseFixed)
+                {
+                    transform.position = TrainingEnvSpace.LocalToWorld(transform, fixedSpawnPosition);
+                    transform.rotation = TrainingEnvSpace.LocalToWorldRotation(transform, fixedSpawnEuler);
+                }
+                else
+                {
+                    float randX = Random.Range(minX, maxX);
+                    float randZ = Random.Range(minZ, maxZ);
+                    transform.position = TrainingEnvSpace.LocalToWorld(transform, new Vector3(randX, groundY, randZ));
+                    transform.rotation = TrainingEnvSpace.LocalToWorldRotation(transform, new Vector3(0f, Random.Range(0f, 360f), 0f));
+                }
+                controller.enabled = true;
             }
-            else
-            {
-                float randX = Random.Range(minX, maxX);
-                float randZ = Random.Range(minZ, maxZ);
-                transform.position = TrainingEnvSpace.LocalToWorld(transform, new Vector3(randX, y, randZ));
-                transform.rotation = TrainingEnvSpace.LocalToWorldRotation(transform, new Vector3(0f, Random.Range(0f, 360f), 0f));
-            }
-            controller.enabled = true;
         }
 
         prevPosition = transform.position;
@@ -485,37 +680,49 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         }
         GameSfx.StopFireLoop(transform);
 
-        StopZombieSpawnerForEpisode();
-
         prevTreeDist = 0f;
         prevSheepDist = 0f;
+        prevZombieDist = 0f;
+        _lastNonZombieOption = OptionWood;
+        _heuristicOptionLocked = false;
 
         hp = maxHp;
 
         ResolveTrainingMode();
         ApplyEpisodeStepLimit();
 
-        if (_resolvedTrainingMode == JackTrainingMode.WoodOnly)
+        if (IsZombieTrainingMode)
         {
-            currentOptionTrain = 0;
-            currentOption = 0;
-        }
-        else if (_resolvedTrainingMode == JackTrainingMode.FoodOnly)
-        {
-            currentOptionTrain = 1;
-            currentOption = 1;
-        }
-        else if (useUtilitySoftmaxSampling)
-        {
-            int sampled = SampleOptionUtilitySoftmax(currentOptionTrain);
-            currentOptionTrain = sampled;
-            currentOption = sampled;
+            currentOptionTrain = OptionZombie;
+            currentOption = OptionZombie;
+            StartZombieSpawnerForEpisode();
         }
         else
         {
-            int randomOption = Random.Range(0, 2);
-            currentOptionTrain = randomOption;
-            currentOption = randomOption;
+            StopZombieSpawnerForEpisode();
+
+            if (_resolvedTrainingMode == JackTrainingMode.WoodOnly)
+            {
+                currentOptionTrain = 0;
+                currentOption = 0;
+            }
+            else if (_resolvedTrainingMode == JackTrainingMode.FoodOnly)
+            {
+                currentOptionTrain = 1;
+                currentOption = 1;
+            }
+            else if (useUtilitySoftmaxSampling)
+            {
+                int sampled = SampleOptionUtilitySoftmax(currentOptionTrain);
+                currentOptionTrain = sampled;
+                currentOption = sampled;
+            }
+            else
+            {
+                int randomOption = Random.Range(0, 2);
+                currentOptionTrain = randomOption;
+                currentOption = randomOption;
+            }
         }
 
         if (IsSimpleTrainingMode && (_trainingConfig == null || _trainingConfig.FreezeNeeds))
@@ -528,12 +735,37 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
 
         lastRewardForOption0 = 0f;
         lastRewardForOption1 = 0f;
+        lastRewardForOption2 = 0f;
         currentStepReward = 0f;
         accumulatedRewardForOption0 = 0f;
         accumulatedRewardForOption1 = 0f;
+        accumulatedRewardForOption2 = 0f;
 
-        treeSpawner.ResetTrees();
-        sheepSpawner.ResetSheep();
+        if (!isTwitchClone)
+        {
+            EnsureSpawners();
+            var envRoot = TrainingEnvSpace.FindRoot(transform);
+            PresentationWorldReset.ResetSpawners(envRoot);
+            if (IsZombieTrainingMode)
+                StartZombieSpawnerForEpisode();
+        }
+    }
+
+    void EnsureSpawners()
+    {
+        if (sheepSpawner == null)
+        {
+            var envRoot = TrainingEnvSpace.FindRoot(transform);
+            if (envRoot != null)
+                sheepSpawner = envRoot.GetComponentInChildren<SheepSpawner>(true);
+        }
+
+        if (treeSpawner == null)
+        {
+            var envRoot = TrainingEnvSpace.FindRoot(transform);
+            if (envRoot != null)
+                treeSpawner = envRoot.GetComponentInChildren<TreeSpawner>(true);
+        }
     }
 
     private bool GetNearestSheep(out GameObject nearestSheep, out float distance)
@@ -567,12 +799,12 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     private bool IsTreeNearby()
     {
         Vector3 origin = transform.position;
-        Collider[] hits = Physics.OverlapSphere(origin, chopDistance, treeLayer);
+        Collider[] hits = Physics.OverlapSphere(origin, ChopReach, treeLayer);
 
         foreach (var c in hits)
         {
             if (c == null) continue;
-            if (HarvestReachDistance(origin, c) <= chopDistance)
+            if (HarvestReachDistance(origin, c) <= ChopReach)
                 return true;
         }
 
@@ -586,7 +818,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
 
     public bool HasSheepNearby()
     {
-        float r = eatDistance * 2f;
+        float r = EatReach * 2f;
         Vector3 origin = transform.position;
         Collider[] hits = Physics.OverlapSphere(origin, r, sheepLayer);
         foreach (var c in hits)
@@ -619,12 +851,15 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     public void SetOption(int option)
     {
         // Проверяем валидность опции
-        if (option != 0 && option != 1)
+        if (option != OptionWood && option != OptionFood && option != OptionZombie)
         {
             Debug.LogWarning($"AgentGoToHouseDiscrete.SetOption: Некорректная опция {option}, игнорируем");
             return;
         }
         
+        if (option == OptionWood || option == OptionFood)
+            _lastNonZombieOption = option;
+
         currentOptionTrain = option;
         currentOption = option;
         
@@ -641,7 +876,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     {
         ApplyWalkAnimatorSpeed();
 
-        if (!showOptionTaskIcon || optionIconRenderer == null) return;
+        if (!ShouldShowOptionTaskIcon() || optionIconRenderer == null) return;
 
         Vector3 iconPos = transform.position + optionIconOffset;
         optionIconRenderer.transform.position = iconPos;
@@ -682,7 +917,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
 
     private void UpdateOptionIconVisual()
     {
-        if (!showOptionTaskIcon)
+        if (!ShouldShowOptionTaskIcon())
         {
             if (optionIconRenderer != null)
                 optionIconRenderer.enabled = false;
@@ -694,13 +929,17 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
 
         switch (currentOptionTrain)
         {
-            case 0:
+            case OptionWood:
                 optionIconRenderer.sprite = optionWoodSprite;
                 optionIconRenderer.enabled = optionWoodSprite != null;
                 break;
-            case 1:
+            case OptionFood:
                 optionIconRenderer.sprite = optionFoodSprite;
                 optionIconRenderer.enabled = optionFoodSprite != null;
+                break;
+            case OptionZombie:
+                optionIconRenderer.sprite = optionZombieSprite;
+                optionIconRenderer.enabled = optionZombieSprite != null;
                 break;
             default:
                 optionIconRenderer.enabled = false;
@@ -734,6 +973,9 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
                 return;
             }
 
+            if (TrainingEnvSpace.IsPresentationTransform(transform))
+                TwitchEphemeralEffects.OnPresentationJackDeath();
+
             EvalEpisodeTracker.NotifyEpisodeEnded();
             AgentDeathOverlay.ShowAndEndEpisode(this, "Джек погиб");
         }
@@ -746,8 +988,116 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     {
         if (option == 0)
             return lastRewardForOption0;
-        else
+        if (option == 1)
             return lastRewardForOption1;
+        return lastRewardForOption2;
+    }
+
+    static float GetOptionObservationBit0(int option) =>
+        option == OptionWood || option == OptionZombie ? 1f : 0f;
+
+    static float GetOptionObservationBit1(int option) =>
+        option == OptionFood || option == OptionZombie ? 1f : 0f;
+
+    bool HasZombieInActivationRadius() =>
+        GetNearestZombieForOption(optionZombieActivationRadius, out _, out _);
+
+    void RefreshTrainingOption(bool force = false)
+    {
+        if (_heuristicOptionLocked && !force)
+            return;
+
+        if (IsZombieTrainingMode)
+            return;
+
+        if (HasZombieInActivationRadius())
+        {
+            if (currentOptionTrain != OptionZombie)
+            {
+                if (currentOptionTrain == OptionWood || currentOptionTrain == OptionFood)
+                    _lastNonZombieOption = currentOptionTrain;
+                currentOptionTrain = OptionZombie;
+                currentOption = OptionZombie;
+                UpdateOptionIconVisual();
+            }
+            return;
+        }
+
+        if (currentOptionTrain == OptionZombie)
+        {
+            currentOptionTrain = _lastNonZombieOption;
+            currentOption = _lastNonZombieOption;
+            prevZombieDist = 0f;
+            UpdateOptionIconVisual();
+        }
+
+        if (!IsFullTrainingMode)
+            return;
+
+        if (IsWoodGatherGoalReached)
+        {
+            if (currentOptionTrain != OptionWood || currentOption != OptionWood)
+            {
+                currentOptionTrain = OptionWood;
+                currentOption = OptionWood;
+                UpdateOptionIconVisual();
+            }
+        }
+    }
+
+    bool GetNearestZombieForOption(float maxRange, out GameObject nearestZombie, out float distance)
+    {
+        nearestZombie = null;
+        distance = float.MaxValue;
+        if (maxRange <= 0f)
+            return false;
+
+        Vector3 origin = transform.position;
+        var envRoot = TrainingEnvSpace.FindRoot(transform);
+        if (TryFindNearestZombie(origin, maxRange, envRoot, true, ref nearestZombie, ref distance))
+            return true;
+
+        // Один Env: зомби могли остаться в корне сцены после старого спавна.
+        if (envRoot != null && !TrainingEnvSpace.HasMultipleTrainingEnvs())
+            return TryFindNearestZombie(origin, maxRange, null, false, ref nearestZombie, ref distance);
+
+        return false;
+    }
+
+    static bool TryFindNearestZombie(
+        Vector3 origin,
+        float maxRange,
+        Transform envRoot,
+        bool requireEnvScope,
+        ref GameObject nearestZombie,
+        ref float distance)
+    {
+        var chases = Object.FindObjectsOfType<ZombieChase>();
+
+        for (int i = 0; i < chases.Length; i++)
+        {
+            var chase = chases[i];
+            if (chase == null || !chase.gameObject.activeInHierarchy)
+                continue;
+            if (requireEnvScope && envRoot != null && !TrainingEnvSpace.IsDescendantOf(chase.transform, envRoot))
+                continue;
+
+            float d = HorizontalDistanceTo(origin, chase.transform.position);
+            if (d > maxRange || d >= distance)
+                continue;
+
+            distance = d;
+            nearestZombie = chase.gameObject;
+        }
+
+        return nearestZombie != null;
+    }
+
+    static float HorizontalDistanceTo(Vector3 from, Vector3 to)
+    {
+        from.y = 0f;
+        to.y = 0f;
+        return Vector3.Distance(from, to);
     }
 
     /// <summary>
@@ -798,7 +1148,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     private bool TryEatSheep()
     {
         Vector3 origin = transform.position;
-        Collider[] hits = Physics.OverlapSphere(origin, eatDistance, sheepLayer);
+        Collider[] hits = Physics.OverlapSphere(origin, EatReach, sheepLayer);
 
         GameObject bestRoot = null;
         float bestDist = float.MaxValue;
@@ -806,7 +1156,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         {
             if (c == null) continue;
             float d = HarvestReachDistance(origin, c);
-            if (d > eatDistance) continue;
+            if (d > EatReach) continue;
             GameObject root = GetSheepInstanceRoot(c);
             if (d < bestDist)
             {
@@ -818,8 +1168,9 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         if (bestRoot == null)
             return false;
 
-        satiety = Mathf.Min(maxSatiety, satiety + 2);
+        satiety += 2;
         Destroy(bestRoot);
+        sheepSpawner?.NotifySheepEaten();
         return true;
     }
 
@@ -858,21 +1209,21 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         sensor.AddObservation(transform.position);
         sensor.AddObservation(transform.forward);
 
-        sensor.AddObservation((float)wood / maxWood); // [0,1]
+        sensor.AddObservation(Mathf.Clamp01((float)wood / Mathf.Max(1, maxWood)));
         sensor.AddObservation((float)heat / maxHeat); // [0,1]
-        sensor.AddObservation((float)satiety / maxSatiety); // сытость [0,1]
+        sensor.AddObservation(Mathf.Clamp01((float)satiety / Mathf.Max(1, maxSatiety))); // сытость [0,1]
 
         bool onHouse =
-        Vector3.Distance(transform.position, houseTarget.position) <= houseRadius;
+        Vector3.Distance(transform.position, houseTarget.position) <= HouseReach;
 
         sensor.AddObservation(onHouse ? 1f : 0f);
         // рядом ли дерево
         bool nearTree = IsTreeNearby();
         sensor.AddObservation(nearTree ? 1f : 0f);
 
-        // One-hot опции: [1,0] = дерево, [0,1] = еда — даёт сети явное разделение режимов
-        sensor.AddObservation(currentOption == 0 ? 1f : 0f);
-        sensor.AddObservation(currentOption == 1 ? 1f : 0f);
+        // Опции: [1,0]=дерево, [0,1]=еда, [1,1]=атака зомби
+        sensor.AddObservation(GetOptionObservationBit0(currentOption));
+        sensor.AddObservation(GetOptionObservationBit1(currentOption));
     }
 
     public override void OnActionReceived(ActionBuffers actions)
@@ -881,13 +1232,22 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
             return;
 
         // Utility sampling: пересэмпливаем каждые 20 шагов (если включено)
-        if (IsFullTrainingMode && useUtilitySoftmaxSampling && stepCount > 0 && (stepCount % 20) == 0)
+        if (IsFullTrainingMode && useUtilitySoftmaxSampling && !_heuristicOptionLocked
+            && !IsZombieTrainingMode
+            && stepCount > 0 && (stepCount % 20) == 0)
         {
-            int sampled = SampleOptionUtilitySoftmax(currentOptionTrain);
-            currentOptionTrain = sampled;
-            currentOption = sampled;
-            UpdateOptionIconVisual();
+            if (!IsWoodGatherGoalReached && !HasZombieInActivationRadius())
+            {
+                int sampled = SampleOptionUtilitySoftmax(currentOptionTrain);
+                currentOptionTrain = sampled;
+                currentOption = sampled;
+                if (sampled == OptionWood || sampled == OptionFood)
+                    _lastNonZombieOption = sampled;
+                UpdateOptionIconVisual();
+            }
         }
+
+        RefreshTrainingOption();
         
         int moveAction = actions.DiscreteActions[0];
         int rotateAction = actions.DiscreteActions[1];
@@ -962,28 +1322,41 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         bool gainedWoodFromChop = false;
         bool ateSheep = false;
 
+        bool hitZombieOnDo = false;
+        bool zombieKilledOnDo = false;
         if (doReady)
         {
             if (damageOnDoIfZombieNearby && zombieDamageOnDo > 0 && IsZombieNearbyForDo())
                 TakeDamage(zombieDamageOnDo);
 
             if (knockbackZombieOnDo)
-                KnockbackNearbyZombiesOnDo();
+                hitZombieOnDo = KnockbackNearbyZombiesOnDo(out zombieKilledOnDo);
 
+            int woodBeforeChop = wood;
             choppedTree = TryChopTree(out gainedWoodFromChop);
-
-            if (currentOptionSnapshot == 1)
-                ateSheep = TryEatSheep();
+            ateSheep = TryEatSheep();
 
             _doCooldownRemaining = Mathf.Max(0f, doActionCooldownSeconds);
+
+            if (emptyDoActionPenalty < 0f)
+            {
+                bool usefulDo = (hitZombieOnDo && currentOptionSnapshot == OptionZombie)
+                    || (gainedWoodFromChop && currentOptionSnapshot == OptionWood && woodBeforeChop < maxWood)
+                    || (ateSheep && currentOptionSnapshot == OptionFood);
+                if (!usefulDo)
+                {
+                    AddReward(emptyDoActionPenalty);
+                    currentStepReward += emptyDoActionPenalty;
+                }
+            }
         }
         
-        // Reward за рубку дерева — только если опция = дерево (0) и wood < max.
+        // Reward за рубку дерева — только если опция = дерево (0).
         // Дерево ломается при любом DO; звук — при любой успешной рубке.
         if (choppedTree)
             GameSfx.PlayWood(source: transform);
 
-        if (choppedTree && gainedWoodFromChop && currentOptionSnapshot == 0)
+        if (choppedTree && gainedWoodFromChop && currentOptionSnapshot == OptionWood && wood - 1 < maxWood)
         {
             float reward = 10.0f;
             AddReward(reward);
@@ -995,7 +1368,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         
         // Reward за поедание овцы - только если опция = еда (1)
         // Используем snapshot опции для защиты от изменения во время выполнения
-        if (ateSheep && currentOptionSnapshot == 1)
+        if (ateSheep && currentOptionSnapshot == OptionFood)
         {
             float reward = 10.0f;
             AddReward(reward);
@@ -1006,8 +1379,19 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
             lastRewardForOption1 = accumulatedRewardForOption1;
         }
 
-        if (currentOptionTrain == 0)
+        if (hitZombieOnDo && currentOptionSnapshot == OptionZombie && rewardOnZombieHitDo != 0f)
         {
+            AddReward(rewardOnZombieHitDo);
+            currentStepReward += rewardOnZombieHitDo;
+            accumulatedRewardForOption2 += rewardOnZombieHitDo;
+            lastRewardForOption2 = accumulatedRewardForOption2;
+            if (zombieKilledOnDo)
+                FloatingRewardPopup.ShowZombieKill(transform, rewardOnZombieHitDo);
+        }
+
+        if (currentOptionTrain == OptionWood)
+        {
+            // Достигли цели по дровам — награда за движение к дому/огню.
             if (wood >= maxWood)
             {
                 float reward = prevDist - currDist;
@@ -1040,7 +1424,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         }
 
 
-        if (currentOptionTrain == 1)
+        if (currentOptionTrain == OptionFood)
         {
             if (GetNearestSheep(out GameObject sheep, out float currSheepDist))
             {
@@ -1064,13 +1448,35 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
             }
         }
 
+        if (currentOptionTrain == OptionZombie)
+        {
+            if (GetNearestZombieForOption(optionZombieActivationRadius, out _, out float currZombieDist))
+            {
+                if (prevZombieDist > 0f)
+                {
+                    float delta = prevZombieDist - currZombieDist;
+                    float reward = delta * zombieApproachRewardScale;
+                    AddReward(reward);
+                    currentStepReward += reward;
+                    accumulatedRewardForOption2 += reward;
+                    lastRewardForOption2 = accumulatedRewardForOption2;
+                }
+
+                prevZombieDist = currZombieDist;
+            }
+            else
+            {
+                prevZombieDist = 0f;
+            }
+        }
+
         prevPosition = transform.position;
         
         stepCount++;
 
         if (IsSimpleTrainingMode)
         {
-            TryEndSimpleTrainingEpisode(choppedTree, gainedWoodFromChop, ateSheep);
+            TryEndSimpleTrainingEpisode(choppedTree, gainedWoodFromChop, ateSheep, zombieKilledOnDo);
             _lastChopActionForAnim = chopAction;
             return;
         }
@@ -1105,7 +1511,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         UpdateFreezing();
         UpdateStarving();
 
-        bool onHouse = Vector3.Distance(transform.position, houseTarget.position) <= houseRadius;
+        bool onHouse = Vector3.Distance(transform.position, houseTarget.position) <= HouseReach;
 
         if (onHouse && wood > 0)
         {
@@ -1127,7 +1533,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
                 {
                     heat = Mathf.Min(maxHeat, heat + heatPerWood);
                 }
-                if (currentOptionTrain == 0)
+                if (currentOptionTrain == OptionWood)
                 {
                     float reward = 5.0f;
                     AddReward(reward);
@@ -1161,7 +1567,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         _lastChopActionForAnim = chopAction;
     }
 
-    void TryEndSimpleTrainingEpisode(bool choppedTree, bool gainedWoodFromChop, bool ateSheep)
+    void TryEndSimpleTrainingEpisode(bool choppedTree, bool gainedWoodFromChop, bool ateSheep, bool zombieKilledOnDo)
     {
         if (_trainingConfig != null && _trainingConfig.StepPenalty != 0f)
         {
@@ -1173,10 +1579,15 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
                 accumulatedRewardForOption0 += penalty;
                 lastRewardForOption0 = accumulatedRewardForOption0;
             }
-            else
+            else if (_resolvedTrainingMode == JackTrainingMode.FoodOnly)
             {
                 accumulatedRewardForOption1 += penalty;
                 lastRewardForOption1 = accumulatedRewardForOption1;
+            }
+            else if (_resolvedTrainingMode == JackTrainingMode.ZombieOnly)
+            {
+                accumulatedRewardForOption2 += penalty;
+                lastRewardForOption2 = accumulatedRewardForOption2;
             }
         }
 
@@ -1209,6 +1620,20 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
                 EndEpisode();
                 return;
             }
+
+            if (_resolvedTrainingMode == JackTrainingMode.ZombieOnly && zombieKilledOnDo)
+            {
+                float bonus = _trainingConfig.SuccessReward;
+                if (bonus != 0f)
+                {
+                    AddReward(bonus);
+                    currentStepReward += bonus;
+                    accumulatedRewardForOption2 += bonus;
+                    lastRewardForOption2 = accumulatedRewardForOption2;
+                }
+                EndEpisode();
+                return;
+            }
         }
 
         if (_trainingConfig != null
@@ -1225,19 +1650,28 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
             return;
 
         var envRoot = TrainingEnvSpace.FindRoot(transform);
-        if (envRoot == null)
-            return;
-
-        var spawners = envRoot.GetComponentsInChildren<ZombieSpawner>(true);
-        for (int i = 0; i < spawners.Length; i++)
+        if (envRoot != null)
         {
-            var spawner = spawners[i];
-            if (spawner != null && spawner.gameObject.name == "ZombieSpawner")
+            var spawners = envRoot.GetComponentsInChildren<ZombieSpawner>(true);
+            for (int i = 0; i < spawners.Length; i++)
             {
-                zombieSpawner = spawner;
+                var spawner = spawners[i];
+                if (spawner != null && spawner.gameObject.name == "ZombieSpawner")
+                {
+                    zombieSpawner = spawner;
+                    return;
+                }
+            }
+
+            if (spawners.Length > 0)
+            {
+                zombieSpawner = spawners[0];
                 return;
             }
         }
+
+        if (TrainingEnvSpace.IsPresentationTransform(transform))
+            zombieSpawner = ZombieSpawner.FindPresentationZombieSpawner();
     }
 
     void StopZombieSpawnerForEpisode()
@@ -1343,7 +1777,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     private int SampleOptionUtilitySoftmax(int currentOpt)
     {
         float heatRatio = maxHeat > 0 ? (float)heat / maxHeat : 0f;
-        float satietyRatio = maxSatiety > 0 ? (float)satiety / maxSatiety : 0f;
+        float satietyRatio = maxSatiety > 0 ? Mathf.Clamp01((float)satiety / maxSatiety) : 1f;
 
         float needHeat = Mathf.Clamp01(1f - heatRatio);
         float needFood = Mathf.Clamp01(1f - satietyRatio);
@@ -1405,7 +1839,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         if (zombieLayer.value == 0) return false;
 
         Vector3 origin = transform.position;
-        Collider[] hits = Physics.OverlapSphere(origin, zombieNearbyRadiusOnDo, zombieLayer);
+        Collider[] hits = Physics.OverlapSphere(origin, ZombieDoReach, zombieLayer);
         if (hits == null || hits.Length == 0) return false;
 
         foreach (var c in hits)
@@ -1419,15 +1853,16 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         return false;
     }
 
-    private void KnockbackNearbyZombiesOnDo()
+    private bool KnockbackNearbyZombiesOnDo(out bool zombieKilled)
     {
-        if (zombieLayer.value == 0) return;
-        if (zombieKnockbackRadiusOnDo <= 0f) return;
-        if (zombieKnockbackDistanceOnDo <= 0f && zombieKnockbackImpulseOnDo <= 0f) return;
+        zombieKilled = false;
+        if (zombieLayer.value == 0) return false;
+        if (zombieKnockbackRadiusOnDo <= 0f) return false;
+        if (zombieKnockbackDistanceOnDo <= 0f && zombieKnockbackImpulseOnDo <= 0f) return false;
 
         Vector3 origin = transform.position;
-        Collider[] hits = Physics.OverlapSphere(origin, zombieKnockbackRadiusOnDo, zombieLayer);
-        if (hits == null || hits.Length == 0) return;
+        Collider[] hits = Physics.OverlapSphere(origin, ZombieKnockbackReach, zombieLayer);
+        if (hits == null || hits.Length == 0) return false;
 
         // Выбираем ОДНОГО ближайшего зомби (именно объект с ZombieChase),
         // чтобы за один DO был один "удар" и урон шёл в правильный ZombieHealth.
@@ -1450,13 +1885,9 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
                 bestZombieCollider = c;
             }
         }
-        if (bestZombie == null) return;
+        if (bestZombie == null) return false;
 
         GameSfx.PlayJackLilyHitZombie(source: transform);
-
-        // Награда за сам факт попадания DO по зомби (один раз за DO).
-        if (rewardOnZombieHitDo != 0f)
-            AddReward(rewardOnZombieHitDo);
 
         // Ищем ZombieHealth на том же корне, что и ZombieChase (не на случайном коллайдере).
         var zhBest = bestZombie.GetComponent<ZombieHealth>()
@@ -1469,7 +1900,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
                 ?? bestZombieCollider.GetComponentInChildren<ZombieHealth>();
         }
 
-        bool zombieKilled = false;
+        bool zombieKilledLocal = false;
         if (zhBest != null)
         {
             int damage = zombieDamageToZombieOnDo;
@@ -1481,19 +1912,15 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
                 zhBest.TakeDamage(damage, transform.position);
                 // После Destroy(gameObject) ссылка становится «fake null» — не читаем Hp напрямую.
                 if (prevHp > 0 && (zhBest == null || zhBest.Hp <= 0))
-                    zombieKilled = true;
+                    zombieKilledLocal = true;
             }
         }
 
         // Гарантия: 2 удара DO без ZombieHealth. Не вызываем, если зомби уже уничтожен по HP.
-        if (!zombieKilled && bestZombie != null && bestZombie.RegisterJackDoHitAndMaybeDie(2))
-            zombieKilled = true;
+        if (!zombieKilledLocal && bestZombie != null && bestZombie.RegisterJackDoHitAndMaybeDie(2))
+            zombieKilledLocal = true;
 
-        if (zombieKilled)
-        {
-            FloatingRewardPopup.ShowZombieKill(transform, rewardOnZombieHitDo);
-            return;
-        }
+        zombieKilled = zombieKilledLocal;
 
         Transform zt = bestZombie.transform;
         Vector3 dir = (zt.position - origin);
@@ -1510,7 +1937,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
             zControllerBest.Move(delta);
             if (zombieStunSecondsOnDo > 0f)
                 bestZombie.Stun(zombieStunSecondsOnDo);
-            return;
+            return true;
         }
 
         var zRbBest = bestZombie.GetComponent<Rigidbody>();
@@ -1521,6 +1948,8 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
             if (zombieStunSecondsOnDo > 0f)
                 bestZombie.Stun(zombieStunSecondsOnDo);
         }
+
+        return true;
     }
 
     private bool TryChopTree(out bool gainedWood)
@@ -1528,7 +1957,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         gainedWood = false;
 
         Vector3 origin = transform.position;
-        Collider[] hits = Physics.OverlapSphere(origin, chopDistance, treeLayer);
+        Collider[] hits = Physics.OverlapSphere(origin, ChopReach, treeLayer);
 
         GameObject bestRoot = null;
         float bestDist = float.MaxValue;
@@ -1536,7 +1965,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         {
             if (c == null) continue;
             float d = HarvestReachDistance(origin, c);
-            if (d > chopDistance) continue;
+            if (d > ChopReach) continue;
             GameObject root = GetTreeInstanceRoot(c);
             if (d < bestDist)
             {
@@ -1548,13 +1977,8 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         if (bestRoot == null)
             return false;
 
-        // Если инвентарь полон — дерево всё равно можно "сломать",
-        // но ресурс не добавляем.
-        if (wood < maxWood)
-        {
-            wood++;
-            gainedWood = true;
-        }
+        wood++;
+        gainedWood = true;
         Destroy(bestRoot);
         return true;
     }

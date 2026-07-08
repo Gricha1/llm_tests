@@ -102,10 +102,13 @@ static class TwitchChatCommandCatalog
 {
     public const string HelpText =
         "#add_tree=N — деревья у Джека (1–10)\n" +
+        "#add_sheep=N — овцы у Джека (1–20)\n" +
         "#up=N — прыжок, высота N ростов (1–5)\n" +
         "#forward=N — толчок вперёд (1–5)\n" +
         "#zombie=N — зомби рядом (1–10)\n" +
-        "#clone_jack=N — второй Jack (та же сеть)\n" +
+        "#clone_jack=N — клоны Jack (1–5, та же сеть)\n" +
         "#size=N — размер (1=обычный, 2=×2, 5=×5)\n" +
+        "#speed_up=N — скорость бега (1–5, 3=×3)\n" +
+        "#reset — начать эпизод заново\n" +
         "#show metrics — графики обучения (вкл/выкл)";
 }

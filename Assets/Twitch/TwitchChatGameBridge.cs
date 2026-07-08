@@ -6,13 +6,16 @@ using UnityEngine;
 public sealed class TwitchChatGameBridge : MonoBehaviour
 {
     const int MaxTrees = 10;
+    const int MaxSheep = 20;
     const int MaxUpHeight = 5;
     const int MaxForwardStrength = 5;
     const int MaxZombiesPerCommand = 10;
     const int MaxJackClones = 5;
     const int MaxSizeLevel = 5;
+    const int MaxSpeedMultiplier = 5;
 
     [SerializeField] private float treeSpawnRadius = 7f;
+    [SerializeField] private float sheepSpawnRadius = 7f;
     [SerializeField] private float zombieSpawnRadius = 7f;
 
     void OnEnable()
@@ -47,6 +50,9 @@ public sealed class TwitchChatGameBridge : MonoBehaviour
             case "add_tree":
                 HandleAddTree(cmd);
                 break;
+            case "add_sheep":
+                HandleAddSheep(cmd);
+                break;
             case "up":
                 HandleUp(cmd);
                 break;
@@ -62,8 +68,14 @@ public sealed class TwitchChatGameBridge : MonoBehaviour
             case "size":
                 HandleSize(cmd);
                 break;
+            case "speed_up":
+                HandleSpeedUp(cmd);
+                break;
             case "show_metrics":
                 HandleShowMetrics(cmd);
+                break;
+            case "reset":
+                HandleReset(cmd);
                 break;
             default:
                 Debug.Log($"[TwitchChat] неизвестная команда: #{cmd.CommandName}={cmd.IntValue}");
@@ -74,7 +86,7 @@ public sealed class TwitchChatGameBridge : MonoBehaviour
     void HandleAddTree(TwitchChatCommand cmd)
     {
         int count = Mathf.Clamp(cmd.IntValue, 1, MaxTrees);
-        var jack = TrainingEnvSpace.FindInPresentation<AgentGoToHouseDiscrete>();
+        var jack = TrainingEnvSpace.FindPresentationJack();
         var spawner = TrainingEnvSpace.FindInPresentation<TreeSpawner>();
 
         if (jack == null || spawner == null)
@@ -87,10 +99,26 @@ public sealed class TwitchChatGameBridge : MonoBehaviour
         Debug.Log($"[TwitchChat] {cmd.DisplayName}: #add_tree={count} → деревьев +{spawned} у Джека");
     }
 
+    void HandleAddSheep(TwitchChatCommand cmd)
+    {
+        int count = Mathf.Clamp(cmd.IntValue, 1, MaxSheep);
+        var jack = TrainingEnvSpace.FindPresentationJack();
+        var spawner = TrainingEnvSpace.FindInPresentation<SheepSpawner>();
+
+        if (jack == null || spawner == null)
+        {
+            Debug.LogWarning("[TwitchChat] add_sheep: нет Jack или SheepSpawner в presentation Env");
+            return;
+        }
+
+        int spawned = spawner.SpawnSheepNear(jack.transform.position, count, sheepSpawnRadius);
+        Debug.Log($"[TwitchChat] {cmd.DisplayName}: #add_sheep={count} → овец +{spawned} у Джека");
+    }
+
     void HandleUp(TwitchChatCommand cmd)
     {
         int height = Mathf.Clamp(cmd.IntValue, 1, MaxUpHeight);
-        var jack = TrainingEnvSpace.FindInPresentation<AgentGoToHouseDiscrete>();
+        var jack = TrainingEnvSpace.FindPresentationJack();
         if (jack == null)
         {
             Debug.LogWarning("[TwitchChat] up: Jack не найден в presentation Env");
@@ -104,7 +132,7 @@ public sealed class TwitchChatGameBridge : MonoBehaviour
     void HandleForward(TwitchChatCommand cmd)
     {
         int strength = Mathf.Clamp(cmd.IntValue, 1, MaxForwardStrength);
-        var jack = TrainingEnvSpace.FindInPresentation<AgentGoToHouseDiscrete>();
+        var jack = TrainingEnvSpace.FindPresentationJack();
         if (jack == null)
         {
             Debug.LogWarning("[TwitchChat] forward: Jack не найден в presentation Env");
@@ -118,16 +146,15 @@ public sealed class TwitchChatGameBridge : MonoBehaviour
     void HandleZombie(TwitchChatCommand cmd)
     {
         int count = Mathf.Clamp(cmd.IntValue, 1, MaxZombiesPerCommand);
-        var jack = TrainingEnvSpace.FindInPresentation<AgentGoToHouseDiscrete>();
-        var spawner = FindPresentationZombieSpawner();
+        var spawner = ZombieSpawner.FindPresentationZombieSpawner();
 
-        if (jack == null || spawner == null)
+        if (spawner == null)
         {
-            Debug.LogWarning("[TwitchChat] zombie: нет Jack или ZombieSpawner в presentation Env");
+            Debug.LogWarning("[TwitchChat] zombie: ZombieSpawner не найден");
             return;
         }
 
-        int spawned = spawner.SpawnZombiesNear(jack.transform.position, count, zombieSpawnRadius);
+        int spawned = spawner.SpawnZombiesAtSpawner(count);
         if (spawned == 0)
             Debug.LogWarning("[TwitchChat] zombie: не создано (проверьте zombiePrefab на ZombieSpawner)");
         else
@@ -137,24 +164,28 @@ public sealed class TwitchChatGameBridge : MonoBehaviour
     void HandleCloneJack(TwitchChatCommand cmd)
     {
         int count = Mathf.Clamp(cmd.IntValue, 1, MaxJackClones);
-        var jack = TrainingEnvSpace.FindInPresentation<AgentGoToHouseDiscrete>();
-        if (jack == null)
+        var jack = TrainingEnvSpace.FindPresentationPrimaryJack();
+        if (jack == null || !jack.IsAliveForTwitch)
         {
-            Debug.LogWarning("[TwitchChat] clone_jack: Jack не найден в presentation Env");
+            Debug.LogWarning("[TwitchChat] clone_jack: живой Jack не найден в presentation Env");
             return;
         }
 
-        TwitchEphemeralEffects.SpawnJackClones(jack, count);
-        Debug.Log($"[TwitchChat] {cmd.DisplayName}: #clone_jack={count}");
+        int before = TwitchEphemeralEffects.ActiveCloneCount;
+        int spawned = TwitchEphemeralEffects.SpawnJackClones(jack, count);
+        if (spawned <= 0)
+            Debug.LogWarning($"[TwitchChat] clone_jack: лимит клонов ({before}/{MaxJackClones})");
+        else
+            Debug.Log($"[TwitchChat] {cmd.DisplayName}: #clone_jack={count} → клонов +{spawned} (всего {TwitchEphemeralEffects.ActiveCloneCount})");
     }
 
     void HandleSize(TwitchChatCommand cmd)
     {
         int sizeLevel = Mathf.Clamp(cmd.IntValue, 1, MaxSizeLevel);
-        var jack = TrainingEnvSpace.FindInPresentation<AgentGoToHouseDiscrete>();
+        var jack = TrainingEnvSpace.FindPresentationPrimaryJack();
         if (jack == null)
         {
-            Debug.LogWarning("[TwitchChat] size: Jack не найден в presentation Env");
+            Debug.LogWarning("[TwitchChat] size: оригинальный Jack не найден в presentation Env");
             return;
         }
 
@@ -163,25 +194,52 @@ public sealed class TwitchChatGameBridge : MonoBehaviour
         Debug.Log($"[TwitchChat] {cmd.DisplayName}: #size={sizeLevel} (×{mult:0.#})");
     }
 
+    void HandleSpeedUp(TwitchChatCommand cmd)
+    {
+        int mult = Mathf.Clamp(cmd.IntValue, 1, MaxSpeedMultiplier);
+        var jack = TrainingEnvSpace.FindPresentationPrimaryJack();
+        if (jack == null)
+        {
+            Debug.LogWarning("[TwitchChat] speed_up: оригинальный Jack не найден в presentation Env");
+            return;
+        }
+
+        TwitchEphemeralEffects.ApplyJackSpeed(jack, mult);
+        Debug.Log($"[TwitchChat] {cmd.DisplayName}: #speed_up={mult} (скорость ×{mult})");
+    }
+
     void HandleShowMetrics(TwitchChatCommand cmd)
     {
         TrainingMetricsBurstOverlay.Toggle();
         Debug.Log($"[TwitchChat] {cmd.DisplayName}: #show metrics → переключить графики");
     }
 
-    static ZombieSpawner FindPresentationZombieSpawner()
+    void HandleReset(TwitchChatCommand cmd)
     {
-        var root = TrainingEnvSpace.PresentationRoot;
-        if (root == null)
-            return Object.FindObjectOfType<ZombieSpawner>();
-
-        var spawners = root.GetComponentsInChildren<ZombieSpawner>(true);
-        for (int i = 0; i < spawners.Length; i++)
+        var jack = TrainingEnvSpace.FindPresentationPrimaryJack();
+        if (jack == null)
         {
-            if (spawners[i] != null && spawners[i].gameObject.name == "ZombieSpawner")
-                return spawners[i];
+            Debug.LogWarning("[TwitchChat] reset: Jack не найден в presentation Env");
+            return;
         }
 
-        return spawners.Length > 0 ? spawners[0] : null;
+        var envRoot = TrainingEnvSpace.FindRoot(jack.transform);
+        AgentDeathOverlay.Hide();
+        DeathFreeze.EnsureEnvSimulationRunning();
+        DeathFreeze.UnfreezeWorld();
+        BackgroundMusic.ResumeMusic();
+        TwitchEphemeralEffects.OnPresentationJackEpisodeBegin(jack);
+
+        PresentationWorldReset.ResetSpawners(envRoot, force: true);
+
+        jack.EndEpisode();
+
+        var lily = envRoot != null ? envRoot.GetComponentInChildren<LilyScript>(false) : null;
+        if (lily != null)
+            lily.EndEpisode();
+
+        Debug.Log(
+            $"[TwitchChat] {cmd.DisplayName}: #reset → новый эпизод. {PresentationWorldReset.DescribeState(envRoot)}");
     }
+
 }

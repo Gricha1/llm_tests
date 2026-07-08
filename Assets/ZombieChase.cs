@@ -53,6 +53,14 @@ public class ZombieChase : MonoBehaviour
 
     public bool IsStunned => Time.time < stunnedUntilTime;
 
+    public void SetPresentationTargets(Transform jack, Transform lily = null)
+    {
+        if (jack != null)
+            jackTarget = jack;
+        if (lily != null)
+            lilyTarget = lily;
+    }
+
     public void Stun(float seconds)
     {
         if (seconds <= 0f) return;

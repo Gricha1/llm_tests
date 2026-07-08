@@ -328,6 +328,7 @@ MonoBehaviour:
   gravity: -9.81
   doActionAnimTrigger: Do
   doActionCooldownSeconds: 0.45
+  optionZombieActivationRadius: 6
 --- !u!114 &5016354465868146490
 MonoBehaviour:
   m_ObjectHideFlags: 0
