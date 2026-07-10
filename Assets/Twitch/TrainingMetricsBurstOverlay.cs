@@ -198,8 +198,9 @@ public sealed class TrainingMetricsBurstOverlay : MonoBehaviour
         float jackLive = TrainingGraphOverlay.GetPresentationJackCumulativeReward();
         if (_valuesText != null)
         {
+            int graphPoints = TrainingGraphOverlay.GraphPointCount;
             _valuesText.text =
-                $"Reward EMA: {TrainingGraphOverlay.JackEma:F2} · эпизод сейчас: {jackLive:F2}   |   " +
+                $"Reward EMA: {TrainingGraphOverlay.JackEma:F2} · эпизод сейчас: {jackLive:F2} · точек: {graphPoints}   |   " +
                 $"Entropy: {TrainingPolicyStats.LastEntropy:F2}   |   " +
                 $"Grad≈: {TrainingPolicyStats.LastGradNormApprox:F3}";
         }

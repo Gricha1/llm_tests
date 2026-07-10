@@ -40,6 +40,9 @@ public class ZombieChase : MonoBehaviour
     private Animator animator;
     private float verticalVelocity;
     private bool useRigidbody;
+    private float _baseMoveSpeed;
+    private bool _baseMoveSpeedCaptured;
+    private float _moveSpeedMultiplier = 1f;
     private float _walkAnimIntent;
     private int _pathIndex;
     private float _pathWaitLeft;
@@ -92,6 +95,22 @@ public class ZombieChase : MonoBehaviour
         stayInPlace = false;
     }
 
+    public void SetMoveSpeedMultiplier(float multiplier)
+    {
+        CaptureBaseMoveSpeedIfNeeded();
+        _moveSpeedMultiplier = Mathf.Max(0.05f, multiplier);
+        moveSpeed = _baseMoveSpeed * _moveSpeedMultiplier;
+    }
+
+    void CaptureBaseMoveSpeedIfNeeded()
+    {
+        if (_baseMoveSpeedCaptured)
+            return;
+
+        _baseMoveSpeed = moveSpeed;
+        _baseMoveSpeedCaptured = true;
+    }
+
     public void Stun(float seconds)
     {
         if (seconds <= 0f) return;
@@ -117,6 +136,8 @@ public class ZombieChase : MonoBehaviour
         meleeDoHitsFromAgents = 0;
         _pathIndex = 0;
         _pathWaitLeft = 0f;
+        _baseMoveSpeedCaptured = false;
+        _moveSpeedMultiplier = 1f;
     }
 
     private void Start()

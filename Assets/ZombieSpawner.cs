@@ -35,6 +35,7 @@ public class ZombieSpawner : MonoBehaviour
     private float nextRespawnTime;
     Transform _spawnProxy;
     GameObject _resolvedZombiePrefab;
+    float _spawnMoveSpeedMultiplier = 1f;
 
     static bool IsAlive(GameObject go) => go != null;
 
@@ -205,8 +206,52 @@ public class ZombieSpawner : MonoBehaviour
         if (chase != null)
         {
             chase.EnableAgentChaseMode();
+            if (_spawnMoveSpeedMultiplier > 1f)
+                chase.SetMoveSpeedMultiplier(_spawnMoveSpeedMultiplier);
             AssignEnvLocalTargets(zombie, transform, chase);
         }
+    }
+
+    public void SetSpawnMoveSpeedMultiplier(float multiplier)
+    {
+        _spawnMoveSpeedMultiplier = Mathf.Max(0.05f, multiplier);
+    }
+
+    public GameObject SpawnBossZombie(
+        float scaleMultiplier = 3f,
+        float hpMultiplier = 5f,
+        float moveSpeedMultiplier = 1f,
+        float attackDamageMultiplier = 1f,
+        float attackCooldownMultiplier = 1f)
+    {
+        if (ResolveZombiePrefab() == null)
+            return null;
+
+        RemoveDestroyed();
+        Vector3 pos = GetSpawnCenterWorld();
+        GameObject zombie = Instantiate(ResolveZombiePrefab(), pos, Quaternion.Euler(0f, Random.Range(0f, 360f), 0f));
+        FinalizeSpawnedZombie(zombie);
+        zombies.Add(zombie);
+
+        float scale = Mathf.Max(0.1f, scaleMultiplier);
+        zombie.transform.localScale = zombie.transform.localScale * scale;
+
+        var health = zombie.GetComponentInChildren<ZombieHealth>();
+        if (health != null)
+        {
+            int bossHp = Mathf.Max(1, Mathf.RoundToInt(health.MaxHp * Mathf.Max(1f, hpMultiplier)));
+            health.ConfigureMaxHp(bossHp);
+        }
+
+        var chase = zombie.GetComponentInChildren<ZombieChase>();
+        if (chase != null && moveSpeedMultiplier > 0f)
+            chase.SetMoveSpeedMultiplier(moveSpeedMultiplier);
+
+        var attack = zombie.GetComponentInChildren<ZombieAttack>();
+        if (attack != null)
+            attack.ConfigureCombat(attackDamageMultiplier, attackCooldownMultiplier);
+
+        return zombie;
     }
 
     static void AssignEnvLocalTargets(GameObject zombie, Transform spawner, ZombieChase chase)
@@ -354,6 +399,7 @@ public class ZombieSpawner : MonoBehaviour
         }
         zombies.Clear();
         ClearSpawnProxyChildren();
+        _spawnMoveSpeedMultiplier = 1f;
     }
 
     /// <summary>Спавн count зомби вокруг worldPos (Twitch #zombie=N). Возвращает сколько создано.</summary>

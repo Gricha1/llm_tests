@@ -3,24 +3,8 @@ using UnityEditor;
 
 namespace YourPackage.Editor
 {
-    [InitializeOnLoad]
     public class WelcomeWindow : EditorWindow
     {
-
-static WelcomeWindow()
-        {
-            EditorApplication.update += RunOnce;
-        }
-        static void RunOnce()
-        {
-            EditorApplication.update -= RunOnce;
-            
-            if (EditorPrefs.GetBool("ShowWelcomeWindow", true))
-            {
-                Open();
-            }
-        }
-
         [MenuItem("Tools/ArtStore3D/Welcome")]
         public static void Open()
         {
@@ -38,7 +22,6 @@ static WelcomeWindow()
             banner = AssetDatabase.LoadAssetAtPath<Texture2D>("Assets/ArtStore3D/Fat Zombie(Low Poly)/Editor/Images/ArtStore3D.png");
             tonIcon = AssetDatabase.LoadAssetAtPath<Texture2D>("Assets/ArtStore3D/Fat Zombie(Low Poly)/Editor/Images/Ton.png");
             usdtIcon = AssetDatabase.LoadAssetAtPath<Texture2D>("Assets/ArtStore3D/Fat Zombie(Low Poly)/Editor/Images/USDTRC20.png");
-      Debug.Log("<color=green><b>Thank you for using my asset!</b></color> If you like it, please take a moment to rate it on the Asset Store. It helps me a lot!");
         }
 
         void OnGUI()

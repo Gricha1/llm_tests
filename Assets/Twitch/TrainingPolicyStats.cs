@@ -5,8 +5,8 @@ using UnityEngine;
 /// <summary>Снимки для оверлея метрик: энтропия действий, приближение grad norm.</summary>
 public static class TrainingPolicyStats
 {
-    const int MaxEntropySamples = 120;
-    const int MaxGradSamples = 120;
+    const int MaxEntropySamples = 8192;
+    const int MaxGradSamples = 8192;
 
     static readonly int[] MoveCounts = new int[4];
     static readonly int[] RotateCounts = new int[4];

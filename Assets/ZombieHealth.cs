@@ -11,6 +11,12 @@ public class ZombieHealth : MonoBehaviour, IHasHp
     public int Hp => hp;
     public int MaxHp => maxHp;
 
+    public void ConfigureMaxHp(int newMaxHp)
+    {
+        maxHp = Mathf.Max(1, newMaxHp);
+        hp = maxHp;
+    }
+
     [Header("Dismemberment (optional)")]
     [Tooltip("Отвалится при первом попадании (когда HP станет maxHp-1).")]
     [SerializeField] private Transform armToDetach;

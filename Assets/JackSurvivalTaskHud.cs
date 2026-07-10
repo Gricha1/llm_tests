@@ -3,7 +3,7 @@ using UnityEngine.UI;
 using TMPro;
 
 /// <summary>
-/// Нижняя плашка: этап 1 (зелёная половина) → этап 2 (красная половина), один эпизод с 0.
+/// Нижняя плашка: этап 1 → этап 2 → этап 3, один эпизод с 0.
 /// </summary>
 public sealed class JackSurvivalTaskHud : MonoBehaviour
 {
@@ -22,18 +22,23 @@ public sealed class JackSurvivalTaskHud : MonoBehaviour
     [SerializeField] private Color barBackgroundColor = new Color(1f, 1f, 1f, 0.12f);
     [SerializeField] private Color phase1FillColor = new Color(0.35f, 0.85f, 0.45f, 0.95f);
     [SerializeField] private Color phase2FillColor = new Color(0.92f, 0.28f, 0.24f, 0.95f);
+    [SerializeField] private Color phase3FillColor = new Color(0.55f, 0.18f, 0.72f, 0.95f);
     [SerializeField] private Color labelColor = new Color(0.95f, 0.95f, 0.95f, 1f);
     [SerializeField] private Color phase1MarkerColor = new Color(0.75f, 1f, 0.8f, 1f);
     [SerializeField] private Color phase2MarkerColor = new Color(1f, 0.7f, 0.65f, 1f);
+    [SerializeField] private Color phase3MarkerColor = new Color(0.85f, 0.65f, 1f, 1f);
 
     [SerializeField] private string phase1MarkerText = "Этап 1: Учимся выживать";
     [SerializeField] private string phase2MarkerText = "Этап 2: Зомби апокалипсис";
+    [SerializeField] private string phase3MarkerText = "Этап 3: Кошмар";
 
     Canvas _canvas;
     RectTransform _greenFillRt;
     RectTransform _redFillRt;
+    RectTransform _purpleFillRt;
     RectTransform _phase1MarkerRt;
     RectTransform _phase2MarkerRt;
+    RectTransform _phase3MarkerRt;
     TextMeshProUGUI _label;
     AgentGoToHouseDiscrete _jack;
     float _barInnerWidth;
@@ -91,7 +96,9 @@ public sealed class JackSurvivalTaskHud : MonoBehaviour
 
         float progress = _jack.SurvivalProgress01;
         float phase1End = _jack.Phase1EndProgress;
-        float halfWidth = _barInnerWidth * phase1End;
+        float phase2End = _jack.Phase2EndProgress;
+        float phase1Width = _barInnerWidth * phase1End;
+        float phase2Width = _barInnerWidth * (phase2End - phase1End);
         float barH = _greenFillRt.sizeDelta.y;
 
         _label.text = _jack.SurvivalTaskLabel;
@@ -101,9 +108,10 @@ public sealed class JackSurvivalTaskHud : MonoBehaviour
 
         if (progress > phase1End)
         {
-            float redWidth = (progress - phase1End) * _barInnerWidth;
+            float redProgress = Mathf.Min(progress, phase2End) - phase1End;
+            float redWidth = redProgress * _barInnerWidth;
             _redFillRt.gameObject.SetActive(true);
-            _redFillRt.anchoredPosition = new Vector2(halfWidth, 0f);
+            _redFillRt.anchoredPosition = new Vector2(phase1Width, 0f);
             _redFillRt.sizeDelta = new Vector2(redWidth, barH);
         }
         else if (_redFillRt != null)
@@ -111,8 +119,21 @@ public sealed class JackSurvivalTaskHud : MonoBehaviour
             _redFillRt.gameObject.SetActive(false);
         }
 
+        if (progress > phase2End)
+        {
+            float purpleWidth = (progress - phase2End) * _barInnerWidth;
+            _purpleFillRt.gameObject.SetActive(true);
+            _purpleFillRt.anchoredPosition = new Vector2(phase1Width + phase2Width, 0f);
+            _purpleFillRt.sizeDelta = new Vector2(purpleWidth, barH);
+        }
+        else if (_purpleFillRt != null)
+        {
+            _purpleFillRt.gameObject.SetActive(false);
+        }
+
         SetMarkerPosition(_phase1MarkerRt, 0f);
-        SetMarkerPosition(_phase2MarkerRt, halfWidth);
+        SetMarkerPosition(_phase2MarkerRt, phase1Width);
+        SetMarkerPosition(_phase3MarkerRt, phase1Width + phase2Width);
     }
 
     static void SetMarkerPosition(RectTransform rt, float x)
@@ -190,11 +211,15 @@ public sealed class JackSurvivalTaskHud : MonoBehaviour
 
         _greenFillRt = CreateBarFill(barBg, "GreenFill", phase1FillColor);
         _redFillRt = CreateBarFill(barBg, "RedFill", phase2FillColor);
+        _purpleFillRt = CreateBarFill(barBg, "PurpleFill", phase3FillColor);
         _redFillRt.gameObject.SetActive(false);
+        _purpleFillRt.gameObject.SetActive(false);
 
         _phase1MarkerRt = CreateBarMarker(barBg, phase1MarkerText, 16f, phase1MarkerColor, barHeight + 4f);
         _phase2MarkerRt = CreateBarMarker(barBg, phase2MarkerText, 16f, phase2MarkerColor, barHeight + 4f);
-        SetMarkerPosition(_phase2MarkerRt, _barInnerWidth * 0.5f);
+        _phase3MarkerRt = CreateBarMarker(barBg, phase3MarkerText, 16f, phase3MarkerColor, barHeight + 4f);
+        SetMarkerPosition(_phase2MarkerRt, _barInnerWidth * (1f / 3f));
+        SetMarkerPosition(_phase3MarkerRt, _barInnerWidth * (2f / 3f));
     }
 
     static RectTransform CreateBarFill(RectTransform barBg, string name, Color color)

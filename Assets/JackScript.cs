@@ -265,6 +265,14 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     [Header("Survival Task")]
     [SerializeField] private float survivalGoalSeconds = 120f;
     [SerializeField] private float phase1CompleteReward = 5f;
+    [SerializeField] private float phase2CompleteReward = 5f;
+    [SerializeField] private float nightmareZombieSpeedMultiplier = 3f;
+    [SerializeField] private float nightmareBossScaleMultiplier = 3f;
+    [SerializeField] private float nightmareBossHpMultiplier = 5f;
+    [SerializeField] private float nightmareBossSpeedMultiplier = 5f;
+    [SerializeField] private float nightmareBossAttackDamageMultiplier = 2.5f;
+    [SerializeField] private float nightmareBossAttackCooldownMultiplier = 0.6f;
+    [SerializeField] private float nightmareBossSpawnIntervalSeconds = 10f;
     [SerializeField] private ZombieSpawner zombieSpawner;
     [Tooltip("Второй спавнер (ZombieSpawner_2) — только Env (4) / ZombieOnly.")]
     [SerializeField] private ZombieSpawner zombieSpawnerSecondary;
@@ -272,6 +280,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     static readonly string[] SecondaryZombieSpawnerNames = { "ZombieSpawner_2", "zombie_spawner_2" };
     private float _episodeStartTime;
     private int _survivalPhase = 1;
+    private float _nextNightmareBossSpawnTime = float.PositiveInfinity;
 
     JackEnvTrainingConfig _trainingConfig;
     JackTrainingMode _resolvedTrainingMode = JackTrainingMode.Full;
@@ -287,18 +296,28 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         || _resolvedTrainingMode == JackTrainingMode.ZombieOnly;
 
     public float SurvivalGoalSeconds => survivalGoalSeconds;
-    public float SurvivalTotalSeconds => survivalGoalSeconds * 2f;
+    public float SurvivalTotalSeconds => survivalGoalSeconds * 3f;
     public float SurvivalElapsedSeconds => Mathf.Max(0f, Time.unscaledTime - _episodeStartTime);
     public float SurvivalProgress01 =>
         survivalGoalSeconds > 0f
             ? Mathf.Clamp01(SurvivalElapsedSeconds / SurvivalTotalSeconds)
             : 0f;
-    public float Phase1EndProgress => 0.5f;
+    public float Phase1EndProgress => 1f / 3f;
+    public float Phase2EndProgress => 2f / 3f;
     public int SurvivalPhase => _survivalPhase;
     public bool IsSurvivalPhase2 => _survivalPhase >= 2;
-    public string SurvivalTaskLabel => IsSurvivalPhase2
-        ? "Задача Джека: выжить 2 минуты в зомби апокалипсисе"
-        : "Задача Джека: учимся выживать";
+    public bool IsSurvivalPhase3 => _survivalPhase >= 3;
+    public string SurvivalTaskLabel
+    {
+        get
+        {
+            if (IsSurvivalPhase3)
+                return "Задача Джека: выжить в кошмаре";
+            if (IsSurvivalPhase2)
+                return "Задача Джека: выжить 2 минуты в зомби апокалипсисе";
+            return "Задача Джека: учимся выживать";
+        }
+    }
 
     private int stepCount;
 
@@ -568,6 +587,20 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
             RefreshTrainingOption();
 
         ProcessTwitchJump();
+        UpdateNightmareBossSpawns();
+    }
+
+    void UpdateNightmareBossSpawns()
+    {
+        if (_deathSequenceStarted || IsSimpleTrainingMode || IsWoodFoodSwitchMode || _survivalPhase < 3)
+            return;
+        if (survivalGoalSeconds <= 0f || nightmareBossSpawnIntervalSeconds <= 0f)
+            return;
+        if (Time.unscaledTime < _nextNightmareBossSpawnTime)
+            return;
+
+        SpawnNightmareBossZombie();
+        _nextNightmareBossSpawnTime = Time.unscaledTime + nightmareBossSpawnIntervalSeconds;
     }
 
     void ProcessHeuristicOptionKeys()
@@ -714,6 +747,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         prevPosition = transform.position;
         stepCount = 0;
         _survivalPhase = 1;
+        _nextNightmareBossSpawnTime = float.PositiveInfinity;
         _episodeStartTime = Time.unscaledTime;
         _lastChopActionForAnim = 0;
         _doCooldownRemaining = 0f;
@@ -1563,6 +1597,12 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
             EnterSurvivalPhase2();
         }
 
+        if (!_deathSequenceStarted && !IsWoodFoodSwitchMode && _survivalPhase == 2 && survivalGoalSeconds > 0f
+            && SurvivalElapsedSeconds >= survivalGoalSeconds * 2f)
+        {
+            EnterSurvivalPhase3();
+        }
+
         satietyTimer += Time.deltaTime;
         if (satietyTimer >= satietyDecayInterval)
         {
@@ -1626,7 +1666,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
                 SetCampfireVisible(false);
         }
 
-        // Лимит эпизода: фаза 1 = survivalGoalSeconds, далее фаза 2 до смерти; или Max Step если survivalGoalSeconds = 0.
+        // Лимит эпизода: фаза 1 = survivalGoalSeconds, фаза 2 и 3 по survivalGoalSeconds; или Max Step если survivalGoalSeconds = 0.
 
         _lastChopActionForAnim = chopAction;
     }
@@ -1762,6 +1802,15 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
 
         if (TrainingEnvSpace.IsPresentationTransform(transform))
         {
+            var presentationRoot = TrainingEnvSpace.PresentationRoot;
+            if (presentationRoot != null)
+            {
+                if (zombieSpawner == null)
+                    zombieSpawner = FindZombieSpawnerInEnv(presentationRoot, PrimaryZombieSpawnerName);
+                if (zombieSpawnerSecondary == null)
+                    zombieSpawnerSecondary = FindSecondaryZombieSpawnerInEnv(presentationRoot);
+            }
+
             if (zombieSpawner == null)
                 zombieSpawner = ZombieSpawner.FindPresentationZombieSpawner();
         }
@@ -1888,7 +1937,101 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
             lastRewardForOption1 = accumulatedRewardForOption1;
         }
 
+        if (TrainingEnvSpace.IsPresentationTransform(transform))
+            SurvivalPhaseAnnouncement.ShowPhase2();
+
         StartZombieSpawnerForEpisode(includeSecondarySpawner: false);
+    }
+
+    void EnterSurvivalPhase3()
+    {
+        if (_survivalPhase >= 3)
+            return;
+
+        _survivalPhase = 3;
+
+        if (phase2CompleteReward != 0f)
+        {
+            AddReward(phase2CompleteReward);
+            currentStepReward += phase2CompleteReward;
+            accumulatedRewardForOption0 += phase2CompleteReward;
+            accumulatedRewardForOption1 += phase2CompleteReward;
+            lastRewardForOption0 = accumulatedRewardForOption0;
+            lastRewardForOption1 = accumulatedRewardForOption1;
+        }
+
+        if (TrainingEnvSpace.IsPresentationTransform(transform))
+            SurvivalPhaseAnnouncement.ShowPhase3();
+
+        ActivateSecondaryZombieSpawner();
+        ApplyNightmareZombieSpeedToEnv();
+        SpawnNightmareBossZombie();
+        _nextNightmareBossSpawnTime = Time.unscaledTime + nightmareBossSpawnIntervalSeconds;
+    }
+
+    void ActivateSecondaryZombieSpawner()
+    {
+        EnsureZombieSpawners();
+        if (zombieSpawnerSecondary == null)
+            return;
+
+        int immediate = _trainingConfig != null ? _trainingConfig.ZombieImmediateSpawnCount : 2;
+        bool trainingBurst = IsZombieTrainingMode;
+        ActivateZombieSpawner(zombieSpawnerSecondary, trainingBurst, immediate);
+    }
+
+    void ApplyNightmareZombieSpeedToEnv()
+    {
+        EnsureZombieSpawners();
+        float speedMult = Mathf.Max(1f, nightmareZombieSpeedMultiplier);
+
+        if (zombieSpawner != null)
+            zombieSpawner.SetSpawnMoveSpeedMultiplier(speedMult);
+        if (zombieSpawnerSecondary != null)
+            zombieSpawnerSecondary.SetSpawnMoveSpeedMultiplier(speedMult);
+
+        var envRoot = TrainingEnvSpace.FindRoot(transform);
+        if (envRoot == null)
+            return;
+
+        var chases = envRoot.GetComponentsInChildren<ZombieChase>(true);
+        for (int i = 0; i < chases.Length; i++)
+        {
+            if (chases[i] != null)
+                chases[i].SetMoveSpeedMultiplier(speedMult);
+        }
+    }
+
+    void SpawnNightmareBossZombie()
+    {
+        EnsureZombieSpawners();
+        if (zombieSpawner == null)
+            return;
+
+        zombieSpawner.SpawnBossZombie(
+            nightmareBossScaleMultiplier,
+            nightmareBossHpMultiplier,
+            nightmareBossSpeedMultiplier,
+            nightmareBossAttackDamageMultiplier,
+            nightmareBossAttackCooldownMultiplier);
+    }
+
+    /// <summary>Play-тест: V — перейти к следующему этапу выживания.</summary>
+    public void AdvanceSurvivalPhaseDebug()
+    {
+        if (_deathSequenceStarted || IsSimpleTrainingMode || IsWoodFoodSwitchMode || survivalGoalSeconds <= 0f)
+            return;
+
+        if (_survivalPhase == 1)
+        {
+            _episodeStartTime = Time.unscaledTime - survivalGoalSeconds;
+            EnterSurvivalPhase2();
+        }
+        else if (_survivalPhase == 2)
+        {
+            _episodeStartTime = Time.unscaledTime - survivalGoalSeconds * 2f;
+            EnterSurvivalPhase3();
+        }
     }
 
     void UpdateFreezing()

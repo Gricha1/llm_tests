@@ -11,6 +11,8 @@ public class ZombieAttack : MonoBehaviour
     [SerializeField] private float damageDelaySeconds = 0.5f;
     [SerializeField] private float damageRadius = 1.55f;
     private float lastHitTime = -999f;
+    private float _damageMultiplier = 1f;
+    private float _hitCooldownMultiplier = 1f;
     [SerializeField] private string attackLeftTrigger = "AttackL";
     [SerializeField] private string attackRightTrigger = "AttackR";
     private Animator animator;
@@ -19,6 +21,12 @@ public class ZombieAttack : MonoBehaviour
     private void Start()
     {
         animator = GetComponentInChildren<Animator>() ?? GetComponent<Animator>();
+    }
+
+    public void ConfigureCombat(float damageMultiplier, float hitCooldownMultiplier = 1f)
+    {
+        _damageMultiplier = Mathf.Max(0.1f, damageMultiplier);
+        _hitCooldownMultiplier = Mathf.Clamp(hitCooldownMultiplier, 0.1f, 2f);
     }
 
     private void OnControllerColliderHit(ControllerColliderHit hit)
@@ -39,7 +47,7 @@ public class ZombieAttack : MonoBehaviour
 
         var target = other.GetComponentInParent<IHasHp>();
         if (target == null) return;
-        if (Time.time - lastHitTime < hitCooldown) return;
+        if (Time.time - lastHitTime < hitCooldown * _hitCooldownMultiplier) return;
 
         lastHitTime = Time.time;
         TryPlayAttackAnim();
@@ -74,7 +82,7 @@ public class ZombieAttack : MonoBehaviour
         float r = Mathf.Max(0.01f, damageRadius);
         if ((a - b).sqrMagnitude > r * r) yield break;
 
-        int damage = Mathf.Max(1, target.MaxHp / 5);
+        int damage = Mathf.Max(1, Mathf.RoundToInt(target.MaxHp / 5f * _damageMultiplier));
         target.TakeDamage(damage);
         GameSfx.PlayZombieHitAgent(source: targetTr);
     }

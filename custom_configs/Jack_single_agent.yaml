@@ -41,7 +41,7 @@ behaviors:
     max_steps: 20000000
     time_horizon: 256
     summary_freq: 50000
-    threaded: false
+    threaded: true
     self_play: null
     behavioral_cloning: null
 env_settings:

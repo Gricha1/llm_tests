@@ -6,7 +6,7 @@ using UnityEngine.InputSystem;
 /// <summary>
 /// Горячие клавиши для Play-теста presentation-сцены и Twitch-команд.
 /// Цифры 1–0 — те же команды, что в чате (#add_tree, #zombie, #reset…).
-/// P — показать/скрыть рендер параллельных Env. Z — быстро #zombie=1.
+/// P — показать/скрыть рендер параллельных Env. Z — быстро #zombie=1. V — следующий этап выживания. B — день/ночь.
 /// </summary>
 public sealed class PresentationDebugInput : MonoBehaviour
 {
@@ -47,6 +47,12 @@ public sealed class PresentationDebugInput : MonoBehaviour
         if (WasKeyPressed(KeyCode.Z))
             TwitchChatGameBridge.SimulateCommand("zombie", 1);
 
+        if (WasKeyPressed(KeyCode.V))
+            AdvancePresentationSurvivalPhase();
+
+        if (WasKeyPressed(KeyCode.B))
+            DayNightCycle.ToggleDayNightGlobal();
+
         if (WasKeyPressed(KeyCode.P))
         {
             TrainingEnvSpace.ToggleParallelEnvsVisible();
@@ -54,6 +60,15 @@ public sealed class PresentationDebugInput : MonoBehaviour
                 ? "[Debug] P: параллельные Env видны (рендер включён)."
                 : "[Debug] P: параллельные Env скрыты.");
         }
+    }
+
+    static void AdvancePresentationSurvivalPhase()
+    {
+        var jack = TrainingEnvSpace.FindPresentationPrimaryJack();
+        if (jack == null)
+            return;
+
+        jack.AdvanceSurvivalPhaseDebug();
     }
 
     static bool WasKeyPressed(KeyCode key)
@@ -88,6 +103,8 @@ public sealed class PresentationDebugInput : MonoBehaviour
             KeyCode.Alpha8 or KeyCode.Keypad8 => Keyboard.current.digit8Key,
             KeyCode.Alpha9 or KeyCode.Keypad9 => Keyboard.current.digit9Key,
             KeyCode.Z => Keyboard.current.zKey,
+            KeyCode.V => Keyboard.current.vKey,
+            KeyCode.B => Keyboard.current.bKey,
             KeyCode.P => Keyboard.current.pKey,
             _ => null
         };

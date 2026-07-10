@@ -11,7 +11,7 @@ using Unity.MLAgents;
 /// </summary>
 public sealed class TrainingGraphOverlay : MonoBehaviour
 {
-    const int MaxPoints = 160;
+    const int MaxPoints = 8192;
     const int GraphWidth = 360;
     const int GraphHeight = 150;
     const int YAxisLabelCount = 5;
@@ -342,6 +342,7 @@ public sealed class TrainingGraphOverlay : MonoBehaviour
     }
 
     public static float JackEma => _instance != null ? _instance._jackEma : 0f;
+    public static int GraphPointCount => _instance != null ? _instance._graphPointCounter : 0;
 
     public static List<float> GetJackRewardSeriesCopy()
     {
@@ -522,6 +523,7 @@ public sealed class TrainingGraphOverlay : MonoBehaviour
         UpdateAxisLabels();
 
         float jackDisplay = _jackRewards.Count > 0 ? _jackRewards[_jackRewards.Count - 1] : 0f;
+        int totalEpisodeBuckets = _graphPointCounter;
         if (_legend != null)
         {
             string src = _usesTrainingEnvs ? "training env" : "presentation";
@@ -531,13 +533,13 @@ public sealed class TrainingGraphOverlay : MonoBehaviour
                 _legend.text =
                     $"<color=#{ColorToHex(JackColor)}>●</color> Джек EMA: {jackDisplay:F1} (посл. {_jackLastRaw:F1})   " +
                     $"<color=#{ColorToHex(LilyColor)}>●</color> Лили EMA: {lilyDisplay:F1} (посл. {_lilyLastRaw:F1})   " +
-                    $"{src} · эп. {_jackRewards.Count}";
+                    $"{src} · эп. {totalEpisodeBuckets}";
             }
             else
             {
                 _legend.text =
                     $"<color=#{ColorToHex(JackColor)}>●</color> Джек EMA: {jackDisplay:F1} (посл. {_jackLastRaw:F1})   " +
-                    $"{src} · эп. {_jackRewards.Count}";
+                    $"{src} · эп. {totalEpisodeBuckets}";
             }
         }
     }
@@ -683,7 +685,10 @@ public sealed class TrainingGraphOverlay : MonoBehaviour
         }
 
         int xMax = _graphPointCounter;
-        int xMin = _jackRewards.Count > 0 ? xMax - _jackRewards.Count + 1 : 0;
+        int visiblePoints = _jackRewards.Count;
+        int xMin = visiblePoints > 0 ? xMax - visiblePoints + 1 : 0;
+        if (xMax > 0 && xMin <= 0)
+            xMin = 1;
         if (xMax <= 0)
         {
             if (_xAxisLabels[0] != null) _xAxisLabels[0].text = "0";

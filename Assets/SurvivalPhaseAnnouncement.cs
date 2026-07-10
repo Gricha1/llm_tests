@@ -36,6 +36,11 @@ public sealed class SurvivalPhaseAnnouncement : MonoBehaviour
         Instance.Show(message);
     }
 
+    public static void ShowPhase3(string message = "Этап 3. Кошмар")
+    {
+        Instance.Show(message);
+    }
+
     void Show(string message)
     {
         EnsureUi();
