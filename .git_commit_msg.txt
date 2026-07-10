@@ -1,3 +1,0 @@
-Fix Env-local spawns and zombie option switching for forest stream.
-
-Restore spawner coordinates relative to Env, parent spawned zombies under Env so Jack detects nearby threats, and save related stream/training tweaks.

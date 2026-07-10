@@ -28,10 +28,14 @@ public static class PresentationWorldReset
         treeSpawner?.ResetTrees();
         sheepSpawner?.ResetSheep();
 
-        foreach (var zombieSpawner in envRoot.GetComponentsInChildren<ZombieSpawner>(true))
+        var envConfig = envRoot.GetComponent<JackEnvTrainingConfig>();
+        if (envConfig == null || envConfig.ResolveMode() != JackTrainingMode.ZombieOnly)
         {
-            if (zombieSpawner != null)
-                zombieSpawner.ResetForNewEpisode();
+            foreach (var zombieSpawner in envRoot.GetComponentsInChildren<ZombieSpawner>(true))
+            {
+                if (zombieSpawner != null)
+                    zombieSpawner.ResetForNewEpisode();
+            }
         }
 
         VerifyAndRetry(treeSpawner, sheepSpawner);

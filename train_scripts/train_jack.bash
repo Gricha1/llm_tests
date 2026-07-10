@@ -105,10 +105,12 @@ if [ -z "${1:-}" ]; then
 fi
 
 BUILD="build_versions/$1"
-if [ ! -d "${BUILD}" ]; then
+BUILD="${BUILD%.x86_64}.x86_64"
+if [ ! -f "${BUILD}" ]; then
   echo "ERROR: ${BUILD} not found" >&2
   exit 1
 fi
+chmod +x "${BUILD}" 2>/dev/null || true
 
 NUM_ENVS="${2:-20}"
 TIME_SCALE="${TIME_SCALE:-5}"

@@ -8,20 +8,41 @@ using UnityEngine.SceneManagement;
 public static class TrainingEnvSpace
 {
     static Transform _presentationRoot;
+    static bool _parallelEnvsVisible;
 
-    public static bool IsPresentationOnlyRequested()
+    public static bool ParallelEnvsVisible => _parallelEnvsVisible;
+
+    /// <summary>Показать рендер копий Env (1)… для отладки в Play. Env var FOREST_SHOW_PARALLEL_ENVS=1 или -forestShowParallelEnvs.</summary>
+    public static bool IsShowParallelEnvsRequested()
     {
-        var env = System.Environment.GetEnvironmentVariable("FOREST_PRESENTATION_ONLY");
+        var env = System.Environment.GetEnvironmentVariable("FOREST_SHOW_PARALLEL_ENVS");
         if (env == "1" || string.Equals(env, "true", System.StringComparison.OrdinalIgnoreCase))
             return true;
 
         foreach (var arg in System.Environment.GetCommandLineArgs())
         {
-            if (arg == "-forestPresentationOnly" || arg == "--forest-presentation-only")
+            if (arg == "-forestShowParallelEnvs" || arg == "--forest-show-parallel-envs")
                 return true;
         }
 
         return false;
+    }
+
+    public static void SetParallelEnvsVisible(bool visible)
+    {
+        _parallelEnvsVisible = visible;
+        ApplyParallelEnvPresentation();
+    }
+
+    public static void ToggleParallelEnvsVisible()
+    {
+        SetParallelEnvsVisible(!_parallelEnvsVisible);
+    }
+
+    /// <summary>Presentation Env на стриме: Full-режим Jack при нескольких Env в сцене.</summary>
+    public static bool IsPresentationOnlyRequested()
+    {
+        return HasMultipleTrainingEnvs() && PresentationRoot != null;
     }
 
     public static bool IsMlAgentsTrainingActive()
@@ -35,27 +56,28 @@ public static class TrainingEnvSpace
     static void ConfigureParallelEnvPresentation()
     {
         _presentationRoot = null;
+        _parallelEnvsVisible = IsShowParallelEnvsRequested();
+        ApplyParallelEnvPresentation();
+        EnsureTrainingConfigs();
+        EnsureEnvLocalHierarchyComponents();
+    }
+
+    static void ApplyParallelEnvPresentation()
+    {
         var presentation = PresentationRoot;
         if (presentation == null)
             return;
-
-        bool presentationOnly = IsPresentationOnlyRequested();
 
         foreach (var envRoot in FindAllEnvRoots())
         {
             if (envRoot == presentation)
                 continue;
 
-            if (presentationOnly)
-            {
-                envRoot.gameObject.SetActive(false);
-                continue;
-            }
-
-            MuteEnvPresentation(envRoot);
+            if (_parallelEnvsVisible)
+                UnmuteEnvPresentation(envRoot);
+            else
+                MuteEnvPresentation(envRoot);
         }
-
-        EnsureTrainingConfigs();
     }
 
     public static bool IsPresentationEnv(Transform envRoot) =>
@@ -245,6 +267,47 @@ public static class TrainingEnvSpace
         return root.rotation * Quaternion.Euler(localEuler);
     }
 
+    /// <summary>Локальная позиция anchor внутри envRoot + смещение.</summary>
+    public static Vector3 AnchorLocalPosition(Transform envRoot, Transform anchor, Vector3 localOffset)
+    {
+        if (envRoot == null)
+            return localOffset;
+        if (anchor == null)
+            return localOffset;
+
+        return envRoot.InverseTransformPoint(anchor.position) + localOffset;
+    }
+
+    /// <summary>Гарантирует, что объект — потомок envRoot (контекст — любой Transform внутри Env).</summary>
+    public static bool EnsureDescendantOfEnv(Transform objectTransform, Transform context, bool preserveWorldPosition = true)
+    {
+        if (objectTransform == null)
+            return false;
+
+        var envRoot = FindRoot(context != null ? context : objectTransform);
+        if (envRoot == null)
+            return false;
+
+        if (IsDescendantOf(objectTransform, envRoot))
+            return true;
+
+        objectTransform.SetParent(envRoot, preserveWorldPosition);
+        Debug.LogWarning($"[{objectTransform.name}] перенесён под {envRoot.name} — объект должен жить в локальной иерархии Env.");
+        return true;
+    }
+
+    static void EnsureEnvLocalHierarchyComponents()
+    {
+        foreach (var envRoot in FindAllEnvRoots())
+        {
+            if (envRoot == null)
+                continue;
+
+            if (envRoot.GetComponent<EnvLocalHierarchy>() == null)
+                envRoot.gameObject.AddComponent<EnvLocalHierarchy>();
+        }
+    }
+
     static Transform ResolvePresentationRoot()
     {
         Transform fallback = null;
@@ -320,5 +383,26 @@ public static class TrainingEnvSpace
 
         foreach (var renderer in envRoot.GetComponentsInChildren<Renderer>(true))
             renderer.enabled = false;
+    }
+
+    static void UnmuteEnvPresentation(Transform envRoot)
+    {
+        foreach (var canvas in envRoot.GetComponentsInChildren<Canvas>(true))
+            canvas.enabled = true;
+
+        foreach (var audio in envRoot.GetComponentsInChildren<AudioSource>(true))
+            audio.mute = false;
+
+        foreach (var cam in envRoot.GetComponentsInChildren<Camera>(true))
+            cam.enabled = false;
+
+        foreach (var listener in envRoot.GetComponentsInChildren<AudioListener>(true))
+            listener.enabled = false;
+
+        foreach (var light in envRoot.GetComponentsInChildren<Light>(true))
+            light.enabled = true;
+
+        foreach (var renderer in envRoot.GetComponentsInChildren<Renderer>(true))
+            renderer.enabled = true;
     }
 }

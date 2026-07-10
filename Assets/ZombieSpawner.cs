@@ -200,24 +200,56 @@ public class ZombieSpawner : MonoBehaviour
 
         SetZombieLayer(zombie);
         EnsureZombieComponents(zombie);
-        AssignPresentationTargets(zombie);
+
+        var chase = zombie.GetComponentInChildren<ZombieChase>();
+        if (chase != null)
+        {
+            chase.EnableAgentChaseMode();
+            AssignEnvLocalTargets(zombie, transform, chase);
+        }
     }
 
-    static void AssignPresentationTargets(GameObject zombie)
+    static void AssignEnvLocalTargets(GameObject zombie, Transform spawner, ZombieChase chase)
     {
-        var chase = zombie.GetComponentInChildren<ZombieChase>();
         if (chase == null)
             return;
 
-        var jack = TrainingEnvSpace.FindPresentationJack();
-        var lilyRoot = TrainingEnvSpace.PresentationRoot;
-        LilyScript lily = lilyRoot != null
-            ? lilyRoot.GetComponentInChildren<LilyScript>(false)
-            : Object.FindObjectOfType<LilyScript>();
+        var envRoot = TrainingEnvSpace.FindRoot(spawner);
+        Transform jack = null;
+        Transform lily = null;
 
-        chase.SetPresentationTargets(
-            jack != null ? jack.transform : null,
-            lily != null ? lily.transform : null);
+        if (envRoot != null)
+        {
+            var jacks = envRoot.GetComponentsInChildren<AgentGoToHouseDiscrete>(false);
+            for (int i = 0; i < jacks.Length; i++)
+            {
+                var candidate = jacks[i];
+                if (candidate != null && !TwitchEphemeralEffects.IsTwitchClone(candidate))
+                {
+                    jack = candidate.transform;
+                    break;
+                }
+            }
+
+            var lilyScript = envRoot.GetComponentInChildren<LilyScript>(false);
+            if (lilyScript != null)
+                lily = lilyScript.transform;
+        }
+        else
+        {
+            var presentationJack = TrainingEnvSpace.FindPresentationJack();
+            if (presentationJack != null)
+                jack = presentationJack.transform;
+
+            var lilyRoot = TrainingEnvSpace.PresentationRoot;
+            LilyScript presentationLily = lilyRoot != null
+                ? lilyRoot.GetComponentInChildren<LilyScript>(false)
+                : Object.FindObjectOfType<LilyScript>();
+            if (presentationLily != null)
+                lily = presentationLily.transform;
+        }
+
+        chase.SetPresentationTargets(jack, lily);
     }
 
     GameObject ResolveZombiePrefab()
@@ -345,6 +377,22 @@ public class ZombieSpawner : MonoBehaviour
         }
 
         return spawned;
+    }
+
+    /// <summary>Старт эпизода обучения: зомби сразу, дальше по spawnInterval.</summary>
+    public void StartTrainingEpisode(int immediateCount = 2)
+    {
+        if (useTransformPositionAsSpawn)
+            spawnPosition = transform.position;
+        else
+            spawnPosition = TrainingEnvSpace.LocalToWorld(transform, spawnPosition);
+
+        RemoveDestroyed();
+        immediateCount = Mathf.Clamp(immediateCount, 1, maxZombies);
+        for (int i = 0; i < immediateCount; i++)
+            SpawnOne();
+
+        nextRespawnTime = Time.time + Mathf.Max(0.5f, spawnInterval);
     }
 
     /// <summary>Убить всех зомби и заново запустить спавн (новый эпизод).</summary>

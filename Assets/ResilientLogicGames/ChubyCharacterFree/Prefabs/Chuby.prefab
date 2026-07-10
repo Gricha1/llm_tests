@@ -302,7 +302,7 @@ MonoBehaviour:
   burnInterval: 0.35
   fireVfx: {fileID: 0}
   fireVfxOffDelaySeconds: 2
-  fireVfxWorldPosition: {x: -24.97772, y: 0.1365422, z: 0.7556604}
+  fireVfxHomeOffset: {x: 0, y: 0.15, z: 0}
   chopDistance: 1.5
   chopReward: 200
   treeLayer:

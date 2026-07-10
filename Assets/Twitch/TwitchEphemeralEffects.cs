@@ -15,7 +15,7 @@ public static class TwitchEphemeralEffects
         public bool Captured;
     }
 
-    const int MaxTotalClones = 5;
+    const int MaxTotalClones = 1;
 
     static readonly List<GameObject> Clones = new List<GameObject>();
     static readonly Dictionary<int, ScaleState> ScaleByJackId = new Dictionary<int, ScaleState>();
@@ -58,8 +58,11 @@ public static class TwitchEphemeralEffects
         if (!source.IsAliveForTwitch)
             return 0;
 
-        count = Mathf.Clamp(count, 1, 5);
+        count = 1;
         RemoveDeadClones();
+
+        if (Clones.Count >= MaxTotalClones)
+            return 0;
 
         int slotsLeft = MaxTotalClones - Clones.Count;
         if (slotsLeft <= 0)
@@ -89,19 +92,28 @@ public static class TwitchEphemeralEffects
                 cloneGo.AddComponent<TwitchJackCloneMarker>();
 
             var cloneBehavior = cloneGo.GetComponent<BehaviorParameters>();
+            var sourceDecision = source.GetComponent<Unity.MLAgents.DecisionRequester>();
+            bool policyFromTrainer = Academy.IsInitialized && Academy.Instance.IsCommunicatorOn;
             if (sourceBehavior != null && cloneBehavior != null)
             {
                 cloneBehavior.BehaviorName = sourceBehavior.BehaviorName;
-                cloneBehavior.BehaviorType = sourceBehavior.BehaviorType;
                 cloneBehavior.Model = sourceBehavior.Model;
                 cloneBehavior.TeamId = sourceBehavior.TeamId;
-                cloneBehavior.DeterministicInference = sourceBehavior.DeterministicInference;
+                cloneBehavior.DeterministicInference = false;
+                if (policyFromTrainer)
+                    cloneBehavior.BehaviorType = BehaviorType.Default;
+                else if (sourceBehavior.Model != null)
+                    cloneBehavior.BehaviorType = BehaviorType.InferenceOnly;
+                else
+                    cloneBehavior.BehaviorType = BehaviorType.Default;
             }
 
-            var cloneJack = cloneGo.GetComponent<AgentGoToHouseDiscrete>();
             var cloneAgent = cloneGo.GetComponent<Agent>();
+            var cloneJack = cloneGo.GetComponent<AgentGoToHouseDiscrete>();
             if (cloneAgent != null)
+            {
                 cloneAgent.enabled = true;
+            }
             if (cloneJack != null)
             {
                 cloneJack.enabled = true;
@@ -109,6 +121,17 @@ public static class TwitchEphemeralEffects
             }
 
             cloneGo.SetActive(true);
+
+            if (cloneAgent != null)
+                cloneAgent.LazyInitialize();
+
+            var cloneDecision = cloneGo.GetComponent<Unity.MLAgents.DecisionRequester>();
+            if (cloneDecision != null)
+            {
+                cloneDecision.enabled = true;
+                if (sourceDecision != null && sourceDecision.DecisionPeriod > 0)
+                    cloneDecision.DecisionPeriod = sourceDecision.DecisionPeriod + (i + 1);
+            }
             Clones.Add(cloneGo);
             spawned++;
         }

@@ -1,6 +1,6 @@
 using UnityEngine;
 
-/// <summary>Маркер Twitch-клона Jack (#clone_jack). Управляется той же политикой, что и оригинал.</summary>
+/// <summary>Маркер Twitch-клона Jack (#clone_jack). Своя политика/решения, те же веса.</summary>
 public sealed class TwitchJackCloneMarker : MonoBehaviour
 {
 }

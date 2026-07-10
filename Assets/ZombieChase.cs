@@ -61,6 +61,37 @@ public class ZombieChase : MonoBehaviour
             lilyTarget = lily;
     }
 
+    public void ResolveTargetsFromEnv()
+    {
+        jackTarget = null;
+        lilyTarget = null;
+
+        var envRoot = TrainingEnvSpace.FindRoot(transform);
+        if (envRoot == null)
+            return;
+
+        var jacks = envRoot.GetComponentsInChildren<AgentGoToHouseDiscrete>(false);
+        for (int i = 0; i < jacks.Length; i++)
+        {
+            var jack = jacks[i];
+            if (jack != null && !TwitchEphemeralEffects.IsTwitchClone(jack))
+            {
+                jackTarget = jack.transform;
+                break;
+            }
+        }
+
+        var lily = envRoot.GetComponentInChildren<LilyScript>(false);
+        if (lily != null)
+            lilyTarget = lily.transform;
+    }
+
+    public void EnableAgentChaseMode()
+    {
+        followPath = false;
+        stayInPlace = false;
+    }
+
     public void Stun(float seconds)
     {
         if (seconds <= 0f) return;
@@ -95,29 +126,15 @@ public class ZombieChase : MonoBehaviour
         animator = GetComponent<Animator>();
         useRigidbody = (controller == null && rb != null);
 
-        if (jackTarget == null)
+        var envRoot = TrainingEnvSpace.FindRoot(transform);
+        if (envRoot != null)
         {
-            var envRoot = TrainingEnvSpace.FindRoot(transform);
-            foreach (var jack in FindObjectsOfType<AgentGoToHouseDiscrete>())
-            {
-                if (envRoot == null || TrainingEnvSpace.IsDescendantOf(jack.transform, envRoot))
-                {
-                    jackTarget = jack.transform;
-                    break;
-                }
-            }
+            if (jackTarget == null || !TrainingEnvSpace.IsDescendantOf(jackTarget, envRoot))
+                ResolveTargetsFromEnv();
         }
-        if (lilyTarget == null)
+        else if (jackTarget == null)
         {
-            var envRoot = TrainingEnvSpace.FindRoot(transform);
-            foreach (var lily in FindObjectsOfType<LilyScript>())
-            {
-                if (envRoot == null || TrainingEnvSpace.IsDescendantOf(lily.transform, envRoot))
-                {
-                    lilyTarget = lily.transform;
-                    break;
-                }
-            }
+            ResolveTargetsFromEnv();
         }
     }
 

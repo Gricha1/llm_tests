@@ -11,7 +11,7 @@
 # Переменные:
 #   BUILD=stream_forest_survival_1_06_07_2026.x86_64
 #   RUN_ID=jack_stream_05_07_2026_copy
-#   NUM_ENVS=1   TIME_SCALE=1   FOREST_PRESENTATION_ONLY=1
+#   NUM_ENVS=1   TIME_SCALE=2   FOREST_SHOW_PARALLEL_ENVS=1  (отладка: видны копии Env)
 
 set -eu
 set -o pipefail
@@ -22,8 +22,7 @@ cd "${ROOT}"
 BUILD="${BUILD:-stream_forest_survival_1_06_07_2026.x86_64}"
 RUN_ID="${RUN_ID:-jack_stream_05_07_2026_copy}"
 NUM_ENVS="${NUM_ENVS:-1}"
-TIME_SCALE="${TIME_SCALE:-1}"
-export FOREST_PRESENTATION_ONLY="${FOREST_PRESENTATION_ONLY:-1}"
+TIME_SCALE="${TIME_SCALE:-2}"
 export DISPLAY="${DISPLAY:-:1}"
 
 CONFIG="custom_configs/Jack_single_agent.yaml"
@@ -84,7 +83,7 @@ fi
 
 echo "[stream] DISPLAY=${DISPLAY}"
 echo "[stream] build: ${BUILD_PATH} (with graphics, for OBS)"
-echo "[stream] run-id: ${RUN_ID}  num-envs: ${NUM_ENVS}  time-scale: ${TIME_SCALE}  presentation-only: ${FOREST_PRESENTATION_ONLY}"
+echo "[stream] run-id: ${RUN_ID}  num-envs: ${NUM_ENVS}  time-scale: ${TIME_SCALE}"
 echo "[stream] OBS: Window Capture на окно Unity"
 
 exec mlagents-learn "${ML_ARGS[@]}"

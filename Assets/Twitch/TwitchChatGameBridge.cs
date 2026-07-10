@@ -10,7 +10,7 @@ public sealed class TwitchChatGameBridge : MonoBehaviour
     const int MaxUpHeight = 5;
     const int MaxForwardStrength = 5;
     const int MaxZombiesPerCommand = 10;
-    const int MaxJackClones = 5;
+    const int MaxJackClones = 1;
     const int MaxSizeLevel = 5;
     const int MaxSpeedMultiplier = 5;
 
@@ -43,7 +43,22 @@ public sealed class TwitchChatGameBridge : MonoBehaviour
             go.AddComponent<TwitchChatGameBridge>();
     }
 
-    void HandleCommand(TwitchChatCommand cmd)
+    /// <summary>Тест в Play: те же обработчики, что для Twitch IRC.</summary>
+    public static void SimulateCommand(string commandName, int intValue = 1)
+    {
+        var bridge = FindObjectOfType<TwitchChatGameBridge>();
+        if (bridge == null)
+        {
+            Debug.LogWarning("[TwitchChat] SimulateCommand: TwitchChatGameBridge не найден");
+            return;
+        }
+
+        string raw = intValue > 0 ? $"#{commandName}={intValue}" : $"#{commandName}";
+        var cmd = new TwitchChatCommand("debug", "DebugPlay", raw, commandName, intValue);
+        bridge.HandleCommand(cmd);
+    }
+
+    public void HandleCommand(TwitchChatCommand cmd)
     {
         switch (cmd.CommandName)
         {
@@ -146,6 +161,7 @@ public sealed class TwitchChatGameBridge : MonoBehaviour
     void HandleZombie(TwitchChatCommand cmd)
     {
         int count = Mathf.Clamp(cmd.IntValue, 1, MaxZombiesPerCommand);
+        var jack = TrainingEnvSpace.FindPresentationJack();
         var spawner = ZombieSpawner.FindPresentationZombieSpawner();
 
         if (spawner == null)
@@ -154,16 +170,27 @@ public sealed class TwitchChatGameBridge : MonoBehaviour
             return;
         }
 
-        int spawned = spawner.SpawnZombiesAtSpawner(count);
+        if (jack == null)
+        {
+            Debug.LogWarning("[TwitchChat] zombie: Jack не найден в presentation Env");
+            return;
+        }
+
+        int spawned = spawner.SpawnZombiesNear(jack.transform.position, count, zombieSpawnRadius);
         if (spawned == 0)
             Debug.LogWarning("[TwitchChat] zombie: не создано (проверьте zombiePrefab на ZombieSpawner)");
         else
-            Debug.Log($"[TwitchChat] {cmd.DisplayName}: #zombie={count} → зомби +{spawned}");
+            Debug.Log($"[TwitchChat] {cmd.DisplayName}: #zombie={count} → зомби +{spawned} рядом с Jack");
     }
 
     void HandleCloneJack(TwitchChatCommand cmd)
     {
-        int count = Mathf.Clamp(cmd.IntValue, 1, MaxJackClones);
+        if (TwitchEphemeralEffects.ActiveCloneCount >= MaxJackClones)
+        {
+            Debug.LogWarning("[TwitchChat] clone_jack: клон уже есть (максимум 1)");
+            return;
+        }
+
         var jack = TrainingEnvSpace.FindPresentationPrimaryJack();
         if (jack == null || !jack.IsAliveForTwitch)
         {
@@ -171,12 +198,11 @@ public sealed class TwitchChatGameBridge : MonoBehaviour
             return;
         }
 
-        int before = TwitchEphemeralEffects.ActiveCloneCount;
-        int spawned = TwitchEphemeralEffects.SpawnJackClones(jack, count);
+        int spawned = TwitchEphemeralEffects.SpawnJackClones(jack, 1);
         if (spawned <= 0)
-            Debug.LogWarning($"[TwitchChat] clone_jack: лимит клонов ({before}/{MaxJackClones})");
+            Debug.LogWarning("[TwitchChat] clone_jack: не удалось создать клона");
         else
-            Debug.Log($"[TwitchChat] {cmd.DisplayName}: #clone_jack={count} → клонов +{spawned} (всего {TwitchEphemeralEffects.ActiveCloneCount})");
+            Debug.Log($"[TwitchChat] {cmd.DisplayName}: #clone_jack → клон Jack создан");
     }
 
     void HandleSize(TwitchChatCommand cmd)

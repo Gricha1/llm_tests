@@ -13,7 +13,7 @@
 # Переменные:
 #   BUILD=stream_forest_survival_1_06_07_2026   (без .x86_64)
 #   RUN_ID=jack_stream_05_07_2026_copy
-#   NUM_ENVS=1  TIME_SCALE=1  FOREST_PRESENTATION_ONLY=0
+#   NUM_ENVS=1  TIME_SCALE=1  FOREST_SHOW_PARALLEL_ENVS=1  (отладка)
 #   REMOTE=reedgern@192.168.194.7
 #   REMOTE_DIR=~/lab_work_space/forest_survival
 #   SYNC_CODE=1   — rsync train_scripts + custom_configs (+ Assets/*.cs если нужно)
@@ -29,7 +29,6 @@ BUILD="${BUILD%.x86_64}"
 RUN_ID="${RUN_ID:-jack_stream_05_07_2026_copy}"
 NUM_ENVS="${NUM_ENVS:-1}"
 TIME_SCALE="${TIME_SCALE:-1}"
-FOREST_PRESENTATION_ONLY="${FOREST_PRESENTATION_ONLY:-1}"
 REMOTE="${REMOTE:-reedgern@192.168.194.7}"
 REMOTE_DIR="${REMOTE_DIR:-~/lab_work_space/forest_survival}"
 SSH_KEY="${SSH_KEY:-${HOME}/.ssh/lab_comp_key}"
@@ -116,7 +115,7 @@ if [ "${RESUME}" -eq 1 ]; then
   TRAIN_ARGS+=(--resume)
 fi
 
-REMOTE_TRAIN="cd ${REMOTE_DIR} && export DISPLAY=\${DISPLAY:-:1} BUILD=${BUILD}.x86_64 RUN_ID=${RUN_ID} NUM_ENVS=${NUM_ENVS} TIME_SCALE=${TIME_SCALE} FOREST_PRESENTATION_ONLY=${FOREST_PRESENTATION_ONLY} && bash ${TRAIN_ARGS[*]}"
+REMOTE_TRAIN="cd ${REMOTE_DIR} && export DISPLAY=\${DISPLAY:-:1} BUILD=${BUILD}.x86_64 RUN_ID=${RUN_ID} NUM_ENVS=${NUM_ENVS} TIME_SCALE=${TIME_SCALE} && bash ${TRAIN_ARGS[*]}"
 
 echo "[deploy] === start stream training ==="
 echo "[deploy] BUILD=${BUILD}.x86_64  RUN_ID=${RUN_ID}"

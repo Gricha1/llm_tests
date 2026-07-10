@@ -3,7 +3,7 @@ using UnityEngine;
 /// <summary>
 /// Профиль задачи на корне Env. Jack читает его через TrainingEnvSpace.FindRoot.
 /// Mode = Auto: только переименуй копии — Env, Env (1)… Env (4).
-///   0,2 → wood | 1,3 → food | 4+ → zombie.
+///   0,2 → wood | 1 → food | 3 → wood+food switch | 4+ → zombie.
 /// </summary>
 public sealed class JackEnvTrainingConfig : MonoBehaviour
 {
@@ -17,9 +17,19 @@ public sealed class JackEnvTrainingConfig : MonoBehaviour
   [SerializeField] private float successReward = 5f;
   [SerializeField] private float stepPenalty = -0.001f;
 
+  [Header("ZombieOnly (Env 4)")]
+  [SerializeField] private int zombieMaxSteps = 3000;
+  [SerializeField] private float zombieEpisodeTimeoutSeconds = 180f;
+  [SerializeField] private bool zombieEndOnKill = false;
+  [SerializeField] private int zombieImmediateSpawnCount = 2;
+
   public JackTrainingMode Mode => mode;
   public int SimpleMaxSteps => simpleMaxSteps;
   public float SimpleEpisodeTimeoutSeconds => simpleEpisodeTimeoutSeconds;
+  public int ZombieMaxSteps => zombieMaxSteps;
+  public float ZombieEpisodeTimeoutSeconds => zombieEpisodeTimeoutSeconds;
+  public bool ZombieEndOnKill => zombieEndOnKill;
+  public int ZombieImmediateSpawnCount => zombieImmediateSpawnCount;
   public bool EndOnSuccess => endOnSuccess;
   public bool FreezeNeeds => freezeNeeds;
   public float SuccessReward => successReward;
@@ -30,7 +40,7 @@ public sealed class JackEnvTrainingConfig : MonoBehaviour
     if (mode != JackTrainingMode.Auto)
       return mode;
 
-    if (TrainingEnvSpace.IsPresentationOnlyRequested()
+    if (TrainingEnvSpace.HasMultipleTrainingEnvs()
         && TrainingEnvSpace.IsPresentationEnv(transform))
       return JackTrainingMode.Full;
 
@@ -54,8 +64,9 @@ public sealed class JackEnvTrainingConfig : MonoBehaviour
       case 2:
         return JackTrainingMode.WoodOnly;
       case 1:
-      case 3:
         return JackTrainingMode.FoodOnly;
+      case 3:
+        return JackTrainingMode.WoodFoodSwitch;
       case 4:
       case 5:
         return JackTrainingMode.ZombieOnly;

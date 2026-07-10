@@ -82,7 +82,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     [Header("Fire VFX")]
     [SerializeField] private GameObject fireVfx;
     [SerializeField] private float fireVfxOffDelaySeconds = 2.0f;
-    [SerializeField] private Vector3 fireVfxWorldPosition = new Vector3(-24.97772f, 0.1365422f, 0.7556604f);
+    [SerializeField] private Vector3 fireVfxHomeOffset = new Vector3(0f, 0.15f, 0f);
     private float fireVfxOffTimer;
 
     [Header("Wood")]
@@ -176,8 +176,8 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         fireVfxOffTimer = 0f;
         _freezeTimer = 0f;
         _hungerTimer = 0f;
-        if (fireVfx != null)
-            fireVfx.SetActive(false);
+        // Клон не должен ссылаться на общий костёр presentation Env.
+        fireVfx = null;
         GameSfx.StopFireLoop(transform);
 
         prevTreeDist = 0f;
@@ -186,8 +186,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
 
         if (source != null)
         {
-            currentOptionTrain = source.currentOptionTrain;
-            currentOption = source.currentOption;
+            _lastNonZombieOption = source._lastNonZombieOption;
         }
 
         UpdateOptionIconVisual();
@@ -232,6 +231,11 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     float ZombieDoReach => zombieNearbyRadiusOnDo * _twitchReachMultiplier;
     float ZombieKnockbackReach => zombieKnockbackRadiusOnDo * _twitchReachMultiplier;
 
+    bool ControlsSharedCampfire =>
+        fireVfx != null
+        && !TwitchEphemeralEffects.IsTwitchClone(this)
+        && TrainingEnvSpace.IsPresentationTransform(transform);
+
     public int currentOptionTrain = 1; // 0 = дерево, 1 = еда, 2 = зомби
 
     public int currentOption = 1; // 0 = дерево, 1 = еда, 2 = зомби
@@ -262,6 +266,10 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     [SerializeField] private float survivalGoalSeconds = 120f;
     [SerializeField] private float phase1CompleteReward = 5f;
     [SerializeField] private ZombieSpawner zombieSpawner;
+    [Tooltip("Второй спавнер (ZombieSpawner_2) — только Env (4) / ZombieOnly.")]
+    [SerializeField] private ZombieSpawner zombieSpawnerSecondary;
+    const string PrimaryZombieSpawnerName = "ZombieSpawner";
+    static readonly string[] SecondaryZombieSpawnerNames = { "ZombieSpawner_2", "zombie_spawner_2" };
     private float _episodeStartTime;
     private int _survivalPhase = 1;
 
@@ -270,6 +278,8 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
 
     public JackTrainingMode ResolvedTrainingMode => _resolvedTrainingMode;
     bool IsFullTrainingMode => _resolvedTrainingMode == JackTrainingMode.Full;
+    bool IsWoodFoodSwitchMode => _resolvedTrainingMode == JackTrainingMode.WoodFoodSwitch;
+    bool IsOptionSwitchTrainingMode => IsFullTrainingMode || IsWoodFoodSwitchMode;
     bool IsZombieTrainingMode => _resolvedTrainingMode == JackTrainingMode.ZombieOnly;
     bool IsSimpleTrainingMode =>
         _resolvedTrainingMode == JackTrainingMode.WoodOnly
@@ -347,8 +357,10 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     [SerializeField] private bool zombieDiesInTwoDoHits = true;
     [Tooltip("Фиксированный урон по зомби при DO (используется если zombieDiesInTwoDoHits = false).")]
     [SerializeField] private int zombieDamageToZombieOnDo = 1;
-    [Tooltip("Награда Джеку за успешный удар DO по зомби.")]
-    [SerializeField] private float rewardOnZombieHitDo = 1.0f;
+    [Tooltip("Награда за попадание DO по зомби без убийства (опция зомби).")]
+    [SerializeField] private float rewardOnZombieHitDo = 0f;
+    [Tooltip("Награда за убийство зомби при активной опции зомби.")]
+    [SerializeField] private float rewardOnZombieKillDo = 10f;
     [Tooltip("Зомби за спиной не бьются DO. dot(forward, к зомби): 0 = полусфера впереди, 0.5 ≈ 60°, 1 = строго вперёд.")]
     [SerializeField] [Range(0f, 1f)] private float zombieDoMinForwardDot = 0.5f;
 
@@ -388,9 +400,11 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
 
     private void Awake()
     {
-        // Нужно выставить до HudHpBars.Bootstrap (AfterSceneLoad), чтобы HUD вообще не создавался.
-        HudHpBars.SetGlobalEnabled(showHudHpTopLeft);
+        // Только presentation-Jack управляет HUD; копии Env (1)… не должны его гасить.
+        if (TrainingEnvSpace.IsPresentationTransform(transform))
+            HudHpBars.SetGlobalEnabled(showHudHpTopLeft);
         EnsureCampfireAudio();
+        EnsureCampfireLocalBinding();
     }
 
     void CacheTrainingConfig()
@@ -419,6 +433,10 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     {
         if (IsFullTrainingMode && survivalGoalSeconds > 0f)
             MaxStep = 0;
+        else if (IsZombieTrainingMode)
+            MaxStep = _trainingConfig != null ? _trainingConfig.ZombieMaxSteps : 3000;
+        else if (IsWoodFoodSwitchMode)
+            MaxStep = _trainingConfig != null ? _trainingConfig.SimpleMaxSteps : 400;
         else if (IsSimpleTrainingMode)
             MaxStep = _trainingConfig != null ? _trainingConfig.SimpleMaxSteps : 400;
         else if (survivalGoalSeconds > 0f)
@@ -432,6 +450,46 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
 
         if (fireVfx.GetComponent<CampfireLoopAudio>() == null)
             fireVfx.AddComponent<CampfireLoopAudio>();
+    }
+
+    /// <summary>Костёр живёт в локальных координатах Env, привязан к HomeSpot.</summary>
+    public void EnsureCampfireLocalBinding()
+    {
+        if (fireVfx == null || houseTarget == null || TwitchEphemeralEffects.IsTwitchClone(this))
+            return;
+
+        var envRoot = TrainingEnvSpace.FindRoot(transform);
+        if (envRoot == null)
+            return;
+
+        TrainingEnvSpace.EnsureDescendantOfEnv(fireVfx.transform, transform);
+
+        var fireTransform = fireVfx.transform;
+        fireTransform.localPosition = TrainingEnvSpace.AnchorLocalPosition(envRoot, houseTarget, fireVfxHomeOffset);
+        fireTransform.localRotation = Quaternion.identity;
+    }
+
+    void SetCampfireVisible(bool visible)
+    {
+        if (!ControlsSharedCampfire)
+            return;
+
+        if (visible)
+        {
+            EnsureCampfireLocalBinding();
+            fireVfx.SetActive(true);
+            fireVfxOffTimer = fireVfxOffDelaySeconds;
+            foreach (var renderer in fireVfx.GetComponentsInChildren<Renderer>(true))
+                renderer.enabled = true;
+            foreach (var ps in fireVfx.GetComponentsInChildren<ParticleSystem>(true))
+            {
+                if (ps != null && !ps.isPlaying)
+                    ps.Play(true);
+            }
+            return;
+        }
+
+        fireVfx.SetActive(false);
     }
 
     bool ShouldShowOptionTaskIcon() =>
@@ -673,11 +731,8 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         fireVfxOffTimer = 0f;
         _freezeTimer = 0f;
         _hungerTimer = 0f;
-        if (fireVfx != null)
-        {
-            fireVfx.transform.position = TrainingEnvSpace.LocalToWorld(transform, fireVfxWorldPosition);
-            fireVfx.SetActive(false);
-        }
+        if (ControlsSharedCampfire)
+            SetCampfireVisible(false);
         GameSfx.StopFireLoop(transform);
 
         prevTreeDist = 0f;
@@ -695,7 +750,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         {
             currentOptionTrain = OptionZombie;
             currentOption = OptionZombie;
-            StartZombieSpawnerForEpisode();
+            StartZombieSpawnerForEpisode(ShouldIncludeSecondaryZombieSpawner());
         }
         else
         {
@@ -747,7 +802,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
             var envRoot = TrainingEnvSpace.FindRoot(transform);
             PresentationWorldReset.ResetSpawners(envRoot);
             if (IsZombieTrainingMode)
-                StartZombieSpawnerForEpisode();
+                StartZombieSpawnerForEpisode(ShouldIncludeSecondaryZombieSpawner());
         }
     }
 
@@ -1010,7 +1065,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         if (IsZombieTrainingMode)
             return;
 
-        if (HasZombieInActivationRadius())
+        if (IsFullTrainingMode && HasZombieInActivationRadius())
         {
             if (currentOptionTrain != OptionZombie)
             {
@@ -1023,7 +1078,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
             return;
         }
 
-        if (currentOptionTrain == OptionZombie)
+        if (IsFullTrainingMode && currentOptionTrain == OptionZombie)
         {
             currentOptionTrain = _lastNonZombieOption;
             currentOption = _lastNonZombieOption;
@@ -1031,7 +1086,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
             UpdateOptionIconVisual();
         }
 
-        if (!IsFullTrainingMode)
+        if (!IsOptionSwitchTrainingMode)
             return;
 
         if (IsWoodGatherGoalReached)
@@ -1232,11 +1287,11 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
             return;
 
         // Utility sampling: пересэмпливаем каждые 20 шагов (если включено)
-        if (IsFullTrainingMode && useUtilitySoftmaxSampling && !_heuristicOptionLocked
+        if (IsOptionSwitchTrainingMode && useUtilitySoftmaxSampling && !_heuristicOptionLocked
             && !IsZombieTrainingMode
             && stepCount > 0 && (stepCount % 20) == 0)
         {
-            if (!IsWoodGatherGoalReached && !HasZombieInActivationRadius())
+            if (!IsWoodGatherGoalReached && (!IsFullTrainingMode || !HasZombieInActivationRadius()))
             {
                 int sampled = SampleOptionUtilitySoftmax(currentOptionTrain);
                 currentOptionTrain = sampled;
@@ -1324,6 +1379,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
 
         bool hitZombieOnDo = false;
         bool zombieKilledOnDo = false;
+        int woodBeforeChop = wood;
         if (doReady)
         {
             if (damageOnDoIfZombieNearby && zombieDamageOnDo > 0 && IsZombieNearbyForDo())
@@ -1332,7 +1388,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
             if (knockbackZombieOnDo)
                 hitZombieOnDo = KnockbackNearbyZombiesOnDo(out zombieKilledOnDo);
 
-            int woodBeforeChop = wood;
+            woodBeforeChop = wood;
             choppedTree = TryChopTree(out gainedWoodFromChop);
             ateSheep = TryEatSheep();
 
@@ -1341,7 +1397,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
             if (emptyDoActionPenalty < 0f)
             {
                 bool usefulDo = (hitZombieOnDo && currentOptionSnapshot == OptionZombie)
-                    || (gainedWoodFromChop && currentOptionSnapshot == OptionWood && woodBeforeChop < maxWood)
+                    || (gainedWoodFromChop && currentOptionSnapshot == OptionWood)
                     || (ateSheep && currentOptionSnapshot == OptionFood);
                 if (!usefulDo)
                 {
@@ -1356,7 +1412,8 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         if (choppedTree)
             GameSfx.PlayWood(source: transform);
 
-        if (choppedTree && gainedWoodFromChop && currentOptionSnapshot == OptionWood && wood - 1 < maxWood)
+        // +10 за рубку только пока не набран порог maxWood; дальше — награда за путь к дому.
+        if (choppedTree && gainedWoodFromChop && currentOptionSnapshot == OptionWood && woodBeforeChop < maxWood)
         {
             float reward = 10.0f;
             AddReward(reward);
@@ -1379,19 +1436,28 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
             lastRewardForOption1 = accumulatedRewardForOption1;
         }
 
-        if (hitZombieOnDo && currentOptionSnapshot == OptionZombie && rewardOnZombieHitDo != 0f)
+        if (hitZombieOnDo && currentOptionSnapshot == OptionZombie)
         {
-            AddReward(rewardOnZombieHitDo);
-            currentStepReward += rewardOnZombieHitDo;
-            accumulatedRewardForOption2 += rewardOnZombieHitDo;
-            lastRewardForOption2 = accumulatedRewardForOption2;
-            if (zombieKilledOnDo)
-                FloatingRewardPopup.ShowZombieKill(transform, rewardOnZombieHitDo);
+            if (zombieKilledOnDo && rewardOnZombieKillDo != 0f)
+            {
+                AddReward(rewardOnZombieKillDo);
+                currentStepReward += rewardOnZombieKillDo;
+                accumulatedRewardForOption2 += rewardOnZombieKillDo;
+                lastRewardForOption2 = accumulatedRewardForOption2;
+                FloatingRewardPopup.ShowZombieKill(transform, rewardOnZombieKillDo);
+            }
+            else if (rewardOnZombieHitDo != 0f)
+            {
+                AddReward(rewardOnZombieHitDo);
+                currentStepReward += rewardOnZombieHitDo;
+                accumulatedRewardForOption2 += rewardOnZombieHitDo;
+                lastRewardForOption2 = accumulatedRewardForOption2;
+            }
         }
 
         if (currentOptionTrain == OptionWood)
         {
-            // Достигли цели по дровам — награда за движение к дому/огню.
+            // Набрали порог дров — ведём к дому/костру (wood может расти без лимита).
             if (wood >= maxWood)
             {
                 float reward = prevDist - currDist;
@@ -1481,14 +1547,17 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
             return;
         }
 
-        if (!_deathSequenceStarted && survivalGoalSeconds > 0f
+        if (IsWoodFoodSwitchMode)
+            ApplyWoodFoodSwitchStepPenalty();
+
+        if (!_deathSequenceStarted && !IsWoodFoodSwitchMode && survivalGoalSeconds > 0f
             && SurvivalElapsedSeconds >= SurvivalTotalSeconds)
         {
             EndEpisode();
             return;
         }
 
-        if (!_deathSequenceStarted && _survivalPhase == 1 && survivalGoalSeconds > 0f
+        if (!_deathSequenceStarted && !IsWoodFoodSwitchMode && _survivalPhase == 1 && survivalGoalSeconds > 0f
             && SurvivalElapsedSeconds >= survivalGoalSeconds)
         {
             EnterSurvivalPhase2();
@@ -1513,14 +1582,9 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
 
         bool onHouse = Vector3.Distance(transform.position, houseTarget.position) <= HouseReach;
 
-        if (onHouse && wood > 0)
+        if (ControlsSharedCampfire && onHouse && wood > 0)
         {
-            if (fireVfx != null)
-            {
-                fireVfx.transform.position = TrainingEnvSpace.LocalToWorld(transform, fireVfxWorldPosition);
-                fireVfx.SetActive(true);
-                fireVfxOffTimer = fireVfxOffDelaySeconds;
-            }
+            SetCampfireVisible(true);
 
             burnTimer += Time.deltaTime;
 
@@ -1551,7 +1615,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
             burnTimer = 0f;
         }
 
-        if (fireVfx != null && !(onHouse && wood > 0) && fireVfx.activeSelf)
+        if (ControlsSharedCampfire && !(onHouse && wood > 0) && fireVfx.activeSelf)
         {
             // Stop effect after a delay once we stopped burning.
             if (fireVfxOffTimer <= 0f)
@@ -1559,12 +1623,32 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
 
             fireVfxOffTimer -= Time.deltaTime;
             if (fireVfxOffTimer <= 0f)
-                fireVfx.SetActive(false);
+                SetCampfireVisible(false);
         }
 
         // Лимит эпизода: фаза 1 = survivalGoalSeconds, далее фаза 2 до смерти; или Max Step если survivalGoalSeconds = 0.
 
         _lastChopActionForAnim = chopAction;
+    }
+
+    void ApplyWoodFoodSwitchStepPenalty()
+    {
+        if (_trainingConfig == null || _trainingConfig.StepPenalty == 0f)
+            return;
+
+        float penalty = _trainingConfig.StepPenalty;
+        AddReward(penalty);
+        currentStepReward += penalty;
+        if (currentOptionTrain == OptionWood)
+        {
+            accumulatedRewardForOption0 += penalty;
+            lastRewardForOption0 = accumulatedRewardForOption0;
+        }
+        else if (currentOptionTrain == OptionFood)
+        {
+            accumulatedRewardForOption1 += penalty;
+            lastRewardForOption1 = accumulatedRewardForOption1;
+        }
     }
 
     void TryEndSimpleTrainingEpisode(bool choppedTree, bool gainedWoodFromChop, bool ateSheep, bool zombieKilledOnDo)
@@ -1623,7 +1707,10 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
 
             if (_resolvedTrainingMode == JackTrainingMode.ZombieOnly && zombieKilledOnDo)
             {
-                float bonus = _trainingConfig.SuccessReward;
+                if (_trainingConfig != null && !_trainingConfig.ZombieEndOnKill)
+                    return;
+
+                float bonus = _trainingConfig != null ? _trainingConfig.SuccessReward : 5f;
                 if (bonus != 0f)
                 {
                     AddReward(bonus);
@@ -1637,61 +1724,151 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         }
 
         if (_trainingConfig != null
-            && _trainingConfig.SimpleEpisodeTimeoutSeconds > 0f
-            && SurvivalElapsedSeconds >= _trainingConfig.SimpleEpisodeTimeoutSeconds)
+            && GetSimpleEpisodeTimeoutSeconds() > 0f
+            && SurvivalElapsedSeconds >= GetSimpleEpisodeTimeoutSeconds())
         {
             EndEpisode();
         }
     }
 
-    void EnsureZombieSpawner()
+    float GetSimpleEpisodeTimeoutSeconds()
     {
-        if (zombieSpawner != null)
-            return;
+        if (_trainingConfig == null)
+            return 0f;
+        if (_resolvedTrainingMode == JackTrainingMode.ZombieOnly)
+            return _trainingConfig.ZombieEpisodeTimeoutSeconds;
+        return _trainingConfig.SimpleEpisodeTimeoutSeconds;
+    }
 
+    void EnsureZombieSpawners()
+    {
         var envRoot = TrainingEnvSpace.FindRoot(transform);
         if (envRoot != null)
         {
-            var spawners = envRoot.GetComponentsInChildren<ZombieSpawner>(true);
-            for (int i = 0; i < spawners.Length; i++)
+            if (zombieSpawner == null)
+                zombieSpawner = FindZombieSpawnerInEnv(envRoot, PrimaryZombieSpawnerName);
+            if (zombieSpawnerSecondary == null)
+                zombieSpawnerSecondary = FindSecondaryZombieSpawnerInEnv(envRoot);
+            var envConfig = envRoot.GetComponent<JackEnvTrainingConfig>();
+            if (envConfig != null
+                && envConfig.ResolveMode() == JackTrainingMode.ZombieOnly
+                && zombieSpawnerSecondary == null)
             {
-                var spawner = spawners[i];
-                if (spawner != null && spawner.gameObject.name == "ZombieSpawner")
-                {
-                    zombieSpawner = spawner;
-                    return;
-                }
+                Debug.LogWarning(
+                    $"[{envRoot.name}] ZombieSpawner_2 не найден внутри Env — положи объект с таким именем в корень среды.");
             }
-
-            if (spawners.Length > 0)
-            {
-                zombieSpawner = spawners[0];
-                return;
-            }
+            return;
         }
 
         if (TrainingEnvSpace.IsPresentationTransform(transform))
-            zombieSpawner = ZombieSpawner.FindPresentationZombieSpawner();
+        {
+            if (zombieSpawner == null)
+                zombieSpawner = ZombieSpawner.FindPresentationZombieSpawner();
+        }
+    }
+
+    static ZombieSpawner FindZombieSpawnerInEnv(Transform envRoot, string objectName)
+    {
+        if (envRoot == null || string.IsNullOrEmpty(objectName))
+            return null;
+
+        var spawners = envRoot.GetComponentsInChildren<ZombieSpawner>(true);
+        for (int i = 0; i < spawners.Length; i++)
+        {
+            var spawner = spawners[i];
+            if (spawner != null
+                && string.Equals(spawner.gameObject.name, objectName, System.StringComparison.OrdinalIgnoreCase))
+                return spawner;
+        }
+
+        return null;
+    }
+
+    static ZombieSpawner FindSecondaryZombieSpawnerInEnv(Transform envRoot)
+    {
+        if (envRoot == null)
+            return null;
+
+        var spawners = envRoot.GetComponentsInChildren<ZombieSpawner>(true);
+        ZombieSpawner fallback = null;
+        for (int i = 0; i < spawners.Length; i++)
+        {
+            var spawner = spawners[i];
+            if (spawner == null)
+                continue;
+
+            string name = spawner.gameObject.name;
+            if (string.Equals(name, PrimaryZombieSpawnerName, System.StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            for (int n = 0; n < SecondaryZombieSpawnerNames.Length; n++)
+            {
+                if (string.Equals(name, SecondaryZombieSpawnerNames[n], System.StringComparison.OrdinalIgnoreCase))
+                    return spawner;
+            }
+
+            if (fallback == null
+                && (name.IndexOf("Spawner_2", System.StringComparison.OrdinalIgnoreCase) >= 0
+                    || name.EndsWith("_2", System.StringComparison.OrdinalIgnoreCase)))
+            {
+                fallback = spawner;
+            }
+        }
+
+        return fallback;
+    }
+
+    static void DeactivateZombieSpawner(ZombieSpawner spawner)
+    {
+        if (spawner == null)
+            return;
+
+        spawner.ClearZombies();
+        spawner.gameObject.SetActive(false);
+    }
+
+    static void ActivateZombieSpawner(ZombieSpawner spawner, bool trainingBurst, int immediateSpawnCount)
+    {
+        if (spawner == null)
+            return;
+
+        spawner.ClearZombies();
+        if (!spawner.gameObject.activeSelf)
+            spawner.gameObject.SetActive(true);
+
+        if (trainingBurst)
+            spawner.StartTrainingEpisode(immediateSpawnCount);
+        else
+            spawner.ResetForNewEpisode();
     }
 
     void StopZombieSpawnerForEpisode()
     {
-        EnsureZombieSpawner();
-        if (zombieSpawner == null)
-            return;
-
-        zombieSpawner.ClearZombies();
-        zombieSpawner.gameObject.SetActive(false);
+        EnsureZombieSpawners();
+        DeactivateZombieSpawner(zombieSpawner);
+        DeactivateZombieSpawner(zombieSpawnerSecondary);
     }
 
-    void StartZombieSpawnerForEpisode()
+    bool ShouldIncludeSecondaryZombieSpawner()
     {
-        EnsureZombieSpawner();
-        if (zombieSpawner == null)
-            return;
+        if (!IsZombieTrainingMode)
+            return false;
 
-        zombieSpawner.ClearZombies();
-        zombieSpawner.gameObject.SetActive(true);
+        EnsureZombieSpawners();
+        return zombieSpawnerSecondary != null;
+    }
+
+    void StartZombieSpawnerForEpisode(bool includeSecondarySpawner)
+    {
+        EnsureZombieSpawners();
+        int immediate = _trainingConfig != null ? _trainingConfig.ZombieImmediateSpawnCount : 2;
+        bool trainingBurst = IsZombieTrainingMode;
+
+        ActivateZombieSpawner(zombieSpawner, trainingBurst, immediate);
+        if (includeSecondarySpawner)
+            ActivateZombieSpawner(zombieSpawnerSecondary, trainingBurst, immediate);
+        else
+            DeactivateZombieSpawner(zombieSpawnerSecondary);
     }
 
     void EnterSurvivalPhase2()
@@ -1711,7 +1888,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
             lastRewardForOption1 = accumulatedRewardForOption1;
         }
 
-        StartZombieSpawnerForEpisode();
+        StartZombieSpawnerForEpisode(includeSecondarySpawner: false);
     }
 
     void UpdateFreezing()
@@ -1987,6 +2164,15 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     public override void Heuristic(in ActionBuffers actionsOut)
     {
         ActionSegment<int> discreteActions = actionsOut.DiscreteActions;
+
+        // Клоны не читают клавиатуру — иначе повторяют каждое действие оригинала.
+        if (TwitchEphemeralEffects.IsTwitchClone(this))
+        {
+            discreteActions[0] = 2;
+            discreteActions[1] = 2;
+            discreteActions[2] = 0;
+            return;
+        }
 
         // --- Движение только W / S (не стрелки) ---
         int moveAction = 2; // стоять
