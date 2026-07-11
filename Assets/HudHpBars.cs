@@ -26,8 +26,8 @@ public sealed class HudHpBars : MonoBehaviour
     }
 
     [Header("Layout")]
-    [SerializeField] private Vector2 padding = new Vector2(16f, 16f);
-    [SerializeField] private float topOffset = 36f;
+    [SerializeField] private Vector2 padding = new Vector2(16f, 10f);
+    [SerializeField] private float topOffset = 14f;
     [SerializeField] private float barWidth = 140f;
     [SerializeField] private float barHeight = 18f;
     [SerializeField] private float rowSpacing = 10f;
@@ -36,9 +36,11 @@ public sealed class HudHpBars : MonoBehaviour
     [SerializeField] private Color backgroundColor = new Color(0f, 0f, 0f, 0.55f);
     [SerializeField] private Color jackFill = new Color(0.2f, 0.75f, 1.0f, 0.95f);
     [SerializeField] private Color lilyFill = new Color(1.0f, 0.35f, 0.75f, 0.95f);
+    [SerializeField] private Color georgeFill = new Color(0.45f, 0.95f, 0.55f, 0.95f);
 
     private IHasHp _jack;
     private IHasHp _lily;
+    private IHasHp _george;
 
     private Image _jackFillImg;
     private RectTransform _jackFillRt;
@@ -46,11 +48,15 @@ public sealed class HudHpBars : MonoBehaviour
     private Image _lilyFillImg;
     private RectTransform _lilyFillRt;
     private TextMeshProUGUI _lilyText;
+    private Image _georgeFillImg;
+    private RectTransform _georgeFillRt;
+    private TextMeshProUGUI _georgeText;
 
     private Canvas _canvas;
     private RectTransform _topLeftRoot;
     private RectTransform _jackRow;
     private RectTransform _lilyRow;
+    private RectTransform _georgeRow;
 
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
     private static void Bootstrap()
@@ -94,18 +100,29 @@ public sealed class HudHpBars : MonoBehaviour
         if (_canvas == null)
             CreateCanvasAndBars();
 
+        if (_georgeRow == null && _topLeftRoot != null)
+            _georgeRow = CreateRow(_topLeftRoot, 2, "Гера", georgeFill, out _, out _georgeFillRt, out _georgeText);
+
         _jack = FindActiveJack();
         _lily = FindActiveLily();
+        _george = FindActiveGeorge();
 
         if (_lilyRow != null)
             _lilyRow.gameObject.SetActive(_lily != null);
+        if (_georgeRow != null)
+            _georgeRow.gameObject.SetActive(_george != null);
 
         LayoutRoot();
 
         UpdateBar(_jack, _jackFillRt, _jackText, "Джек");
         if (_lily != null)
-            UpdateBar(_lily, _lilyFillRt, _lilyText, "Lily");
+            UpdateBar(_lily, _lilyFillRt, _lilyText, "Лили");
+        if (_george != null)
+            UpdateBar(_george, _georgeFillRt, _georgeText, "Гера");
     }
+
+    static IHasHp FindActiveGeorge() =>
+        TrainingEnvSpace.FindPresentationGeorge();
 
     static AgentGoToHouseDiscrete FindActiveJack() =>
         TrainingEnvSpace.FindPresentationJack();
@@ -123,7 +140,11 @@ public sealed class HudHpBars : MonoBehaviour
         if (_topLeftRoot == null)
             return;
 
-        int rows = 1 + (_lilyRow != null && _lilyRow.gameObject.activeSelf ? 1 : 0);
+        int rows = 1;
+        if (_lilyRow != null && _lilyRow.gameObject.activeSelf)
+            rows++;
+        if (_georgeRow != null && _georgeRow.gameObject.activeSelf)
+            rows++;
         _topLeftRoot.sizeDelta = new Vector2(barWidth + 110f, (barHeight + rowSpacing) * rows + 10f);
     }
 
@@ -171,9 +192,11 @@ public sealed class HudHpBars : MonoBehaviour
 
         _topLeftRoot = root;
 
-        _jackRow = CreateRow(root, 0, "Джек", jackFill, out _jackFillImg, out _jackFillRt, out _jackText);
-        _lilyRow = CreateRow(root, 1, "Lily", lilyFill, out _lilyFillImg, out _lilyFillRt, out _lilyText);
+        _jackRow = CreateRow(root, 0, "Джек", jackFill, out _, out _jackFillRt, out _jackText);
+        _lilyRow = CreateRow(root, 1, "Лили", lilyFill, out _, out _lilyFillRt, out _lilyText);
+        _georgeRow = CreateRow(root, 2, "Гера", georgeFill, out _, out _georgeFillRt, out _georgeText);
         _lilyRow.gameObject.SetActive(FindActiveLily() != null);
+        _georgeRow.gameObject.SetActive(FindActiveGeorge() != null);
         LayoutRoot();
     }
 

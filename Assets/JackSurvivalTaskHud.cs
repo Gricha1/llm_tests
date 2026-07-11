@@ -12,11 +12,12 @@ public sealed class JackSurvivalTaskHud : MonoBehaviour
     [SerializeField] private bool showHud = true;
 
     [SerializeField] private Vector2 bottomPadding = new Vector2(0f, 28f);
-    [SerializeField] private float panelWidth = 620f;
+    [SerializeField] private float panelWidth = 920f;
     [SerializeField] private float labelHeight = 28f;
-    [SerializeField] private float barHeight = 16f;
-    [SerializeField] private float barSpacing = 8f;
-    [SerializeField] private float markerHeight = 28f;
+    [SerializeField] private float barHeight = 22f;
+    [SerializeField] private float barSpacing = 10f;
+    [SerializeField] private float markerHeight = 22f;
+    [SerializeField] private float markerRowSpacing = 6f;
 
     [SerializeField] private Color panelColor = new Color(0f, 0f, 0f, 0.55f);
     [SerializeField] private Color barBackgroundColor = new Color(1f, 1f, 1f, 0.12f);
@@ -73,10 +74,13 @@ public sealed class JackSurvivalTaskHud : MonoBehaviour
         runtimeGo.AddComponent<JackSurvivalTaskHud>();
     }
 
+    const int LayoutVersion = 2;
+    int _layoutVersionApplied;
+
     void Awake()
     {
         if (GlobalEnabled && showHud)
-            CreateUi();
+            EnsureUi();
     }
 
     void Update()
@@ -85,11 +89,10 @@ public sealed class JackSurvivalTaskHud : MonoBehaviour
         if (!GlobalEnabled || !showHud)
             return;
 
-        if (_canvas == null)
-            CreateUi();
+        EnsureUi();
 
         if (_jack == null)
-            _jack = TrainingEnvSpace.FindInPresentation<AgentGoToHouseDiscrete>();
+            _jack = TrainingEnvSpace.FindPresentationJack();
 
         if (_jack == null || _greenFillRt == null || _label == null)
             return;
@@ -130,19 +133,26 @@ public sealed class JackSurvivalTaskHud : MonoBehaviour
         {
             _purpleFillRt.gameObject.SetActive(false);
         }
-
-        SetMarkerPosition(_phase1MarkerRt, 0f);
-        SetMarkerPosition(_phase2MarkerRt, phase1Width);
-        SetMarkerPosition(_phase3MarkerRt, phase1Width + phase2Width);
     }
 
-    static void SetMarkerPosition(RectTransform rt, float x)
+    void EnsureUi()
     {
-        if (rt == null)
+        if (_canvas != null && _layoutVersionApplied == LayoutVersion)
             return;
-        var pos = rt.anchoredPosition;
-        pos.x = x;
-        rt.anchoredPosition = pos;
+
+        if (_canvas != null)
+            Destroy(_canvas.gameObject);
+
+        _canvas = null;
+        _greenFillRt = null;
+        _redFillRt = null;
+        _purpleFillRt = null;
+        _phase1MarkerRt = null;
+        _phase2MarkerRt = null;
+        _phase3MarkerRt = null;
+        _label = null;
+        _layoutVersionApplied = LayoutVersion;
+        CreateUi();
     }
 
     void ApplyVisibility()
@@ -175,7 +185,7 @@ public sealed class JackSurvivalTaskHud : MonoBehaviour
         root.anchorMax = new Vector2(0.5f, 0f);
         root.pivot = new Vector2(0.5f, 0f);
         root.anchoredPosition = bottomPadding;
-        root.sizeDelta = new Vector2(panelWidth, labelHeight + barSpacing + barHeight + markerHeight + 14f);
+        root.sizeDelta = new Vector2(panelWidth, labelHeight + barSpacing + barHeight + markerRowSpacing + markerHeight + 16f);
 
         var panelBg = root.gameObject.AddComponent<Image>();
         panelBg.color = panelColor;
@@ -196,12 +206,24 @@ public sealed class JackSurvivalTaskHud : MonoBehaviour
         if (TMP_Settings.defaultFontAsset != null)
             _label.font = TMP_Settings.defaultFontAsset;
 
+        var markersRow = new GameObject("MarkersRow").AddComponent<RectTransform>();
+        markersRow.SetParent(root, false);
+        markersRow.anchorMin = new Vector2(0f, 0f);
+        markersRow.anchorMax = new Vector2(1f, 0f);
+        markersRow.pivot = new Vector2(0.5f, 0f);
+        markersRow.anchoredPosition = new Vector2(0f, 8f);
+        markersRow.sizeDelta = new Vector2(-24f, markerHeight);
+
+        _phase1MarkerRt = CreatePhaseLabel(markersRow, phase1MarkerText, 0f, phase1MarkerColor);
+        _phase2MarkerRt = CreatePhaseLabel(markersRow, phase2MarkerText, 0.5f, phase2MarkerColor);
+        _phase3MarkerRt = CreatePhaseLabel(markersRow, phase3MarkerText, 1f, phase3MarkerColor);
+
         var barBg = new GameObject("BarBg").AddComponent<RectTransform>();
         barBg.SetParent(root, false);
         barBg.anchorMin = new Vector2(0f, 0f);
         barBg.anchorMax = new Vector2(1f, 0f);
         barBg.pivot = new Vector2(0.5f, 0f);
-        barBg.anchoredPosition = new Vector2(0f, 8f);
+        barBg.anchoredPosition = new Vector2(0f, 8f + markerHeight + markerRowSpacing);
         barBg.sizeDelta = new Vector2(-24f, barHeight);
 
         _barInnerWidth = panelWidth - 24f;
@@ -214,12 +236,33 @@ public sealed class JackSurvivalTaskHud : MonoBehaviour
         _purpleFillRt = CreateBarFill(barBg, "PurpleFill", phase3FillColor);
         _redFillRt.gameObject.SetActive(false);
         _purpleFillRt.gameObject.SetActive(false);
+    }
 
-        _phase1MarkerRt = CreateBarMarker(barBg, phase1MarkerText, 16f, phase1MarkerColor, barHeight + 4f);
-        _phase2MarkerRt = CreateBarMarker(barBg, phase2MarkerText, 16f, phase2MarkerColor, barHeight + 4f);
-        _phase3MarkerRt = CreateBarMarker(barBg, phase3MarkerText, 16f, phase3MarkerColor, barHeight + 4f);
-        SetMarkerPosition(_phase2MarkerRt, _barInnerWidth * (1f / 3f));
-        SetMarkerPosition(_phase3MarkerRt, _barInnerWidth * (2f / 3f));
+    static RectTransform CreatePhaseLabel(RectTransform parent, string text, float anchorX, Color color)
+    {
+        var rt = new GameObject(text + "Label").AddComponent<RectTransform>();
+        rt.SetParent(parent, false);
+        rt.anchorMin = new Vector2(anchorX, 0f);
+        rt.anchorMax = new Vector2(anchorX, 1f);
+        rt.pivot = new Vector2(anchorX, 0.5f);
+        rt.anchoredPosition = Vector2.zero;
+        rt.sizeDelta = new Vector2(280f, 0f);
+
+        var tmp = rt.gameObject.AddComponent<TextMeshProUGUI>();
+        tmp.text = text;
+        tmp.fontSize = 14f;
+        tmp.fontStyle = FontStyles.Bold;
+        tmp.color = color;
+        tmp.alignment = anchorX <= 0.01f
+            ? TextAlignmentOptions.BottomLeft
+            : anchorX >= 0.99f
+                ? TextAlignmentOptions.BottomRight
+                : TextAlignmentOptions.Bottom;
+        tmp.enableWordWrapping = false;
+        if (TMP_Settings.defaultFontAsset != null)
+            tmp.font = TMP_Settings.defaultFontAsset;
+
+        return rt;
     }
 
     static RectTransform CreateBarFill(RectTransform barBg, string name, Color color)
@@ -235,28 +278,5 @@ public sealed class JackSurvivalTaskHud : MonoBehaviour
         var img = fill.gameObject.AddComponent<Image>();
         img.color = color;
         return fill;
-    }
-
-    static RectTransform CreateBarMarker(RectTransform barBg, string text, float fontSize, Color color, float y)
-    {
-        var rt = new GameObject(text + "Marker").AddComponent<RectTransform>();
-        rt.SetParent(barBg, false);
-        rt.anchorMin = new Vector2(0f, 0f);
-        rt.anchorMax = new Vector2(0f, 0f);
-        rt.pivot = new Vector2(0f, 0f);
-        rt.anchoredPosition = new Vector2(0f, y);
-        rt.sizeDelta = new Vector2(280f, 26f);
-
-        var tmp = rt.gameObject.AddComponent<TextMeshProUGUI>();
-        tmp.text = text;
-        tmp.fontSize = fontSize;
-        tmp.fontStyle = FontStyles.Bold;
-        tmp.color = color;
-        tmp.alignment = TextAlignmentOptions.BottomLeft;
-        tmp.enableWordWrapping = false;
-        if (TMP_Settings.defaultFontAsset != null)
-            tmp.font = TMP_Settings.defaultFontAsset;
-
-        return rt;
     }
 }

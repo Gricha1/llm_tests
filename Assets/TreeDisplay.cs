@@ -19,7 +19,14 @@ public class TreeDisplay : MonoBehaviour
 
     void Update()
     {
-        if (text == null || agent == null) return;
+        if (text == null)
+            return;
+
+        if (agent == null || !agent.gameObject.activeInHierarchy)
+            agent = TrainingEnvSpace.FindPresentationJack();
+
+        if (agent == null)
+            return;
 
         if (spriteAsset != null && text.spriteAsset != spriteAsset)
             text.spriteAsset = spriteAsset;

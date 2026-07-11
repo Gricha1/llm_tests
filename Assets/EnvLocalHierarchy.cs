@@ -17,6 +17,13 @@ public sealed class EnvLocalHierarchy : MonoBehaviour
 
         ValidateHierarchy();
         BindCampfires();
+        EnsureWaterGoalPath();
+    }
+
+    void EnsureWaterGoalPath()
+    {
+        if (GetComponent<WaterGoalPath>() == null)
+            gameObject.AddComponent<WaterGoalPath>();
     }
 
     void ValidateHierarchy()

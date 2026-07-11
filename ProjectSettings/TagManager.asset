@@ -14,6 +14,9 @@ TagManager:
   - Flower
   - Jack
   - Zombie
+  - Lily
+  - Water
+  - George
   layers:
   - Default
   - TransparentFX
@@ -27,9 +30,9 @@ TagManager:
   - Jack
   - Zombie
   - BossArena
-  - 
-  - 
-  - 
+  - Lily
+  - Water
+  - George
   - 
   - 
   - 

@@ -1,13 +1,21 @@
 using UnityEngine;
 using Unity.MLAgents;
 using Unity.MLAgents.Actuators;
+using Unity.MLAgents.Policies;
 using Unity.MLAgents.Sensors;
 
 [RequireComponent(typeof(CharacterController))]
 [RequireComponent(typeof(Animator))]
 public class LilyScript : Agent, IHasHp
 {
-    /// <summary>0 = цветы, 1 = поцелуй Джека.</summary>
+    /// <summary>0 = цветы, 1 = поцелуй, 2 = вода, 3 = еда, 4 = тепло (костёр у дома).</summary>
+    public const int OptionFlower = 0;
+    public const int OptionKiss = 1;
+    public const int OptionWater = 2;
+    public const int OptionFood = 3;
+    public const int OptionHeat = 4;
+    public const int OptionCount = 5;
+
     private int currentOption;
 
     [Header("Option Sampling (Flowers/Kiss)")]
@@ -26,9 +34,15 @@ public class LilyScript : Agent, IHasHp
     [SerializeField] private SpriteRenderer optionIconRenderer;
     [SerializeField] private Sprite optionFlowerSprite;
     [SerializeField] private Sprite optionKissSprite;
+    [SerializeField] private Sprite optionWaterSprite;
+    [SerializeField] private Sprite optionFoodSprite;
+    [SerializeField] private Sprite optionHeatSprite;
     [SerializeField] private Vector3 optionIconOffset = new Vector3(0f, 2.2f, 0f);
     [SerializeField] private float optionFlowerIconScale = 0.45f;
     [SerializeField] private float optionKissIconScale = 0.45f;
+    [SerializeField] private float optionWaterIconScale = 0.45f;
+    [SerializeField] private float optionFoodIconScale = 0.45f;
+    [SerializeField] private float optionHeatIconScale = 0.45f;
     [SerializeField] private int optionIconSortingOrder = 100;
     [SerializeField] private bool optionIconFaceCamera = true;
     [Tooltip("Если задано — иконка разворачивается к этой камере; иначе MainCamera или камера с максимальным depth.")]
@@ -37,6 +51,14 @@ public class LilyScript : Agent, IHasHp
     [SerializeField] private bool showOptionTaskIcon = true;
 
     private bool _lastShowOptionTaskIcon = true;
+
+    [Header("Heat / House (опция «тепло»)")]
+    [SerializeField] private Transform houseTarget;
+    [SerializeField] private float houseRadius = 1.2f;
+    [SerializeField] private float moveTowardsHouseWhenColdRewardScale = 1f;
+    [SerializeField] private float warmthRewardAtCampfire = 5f;
+    [SerializeField] private float warmthGainInterval = 0.5f;
+    private float _warmthGainTimer;
 
     [Header("Jack (опция «поцелуй»)")]
     [SerializeField] private Transform jackTarget;
@@ -54,6 +76,44 @@ public class LilyScript : Agent, IHasHp
     [Header("Collect")]
     [SerializeField] private float collectDistance = 1.8f;
     [SerializeField] private float collectReward = 10f;
+    [SerializeField] private SheepSpawner sheepSpawner;
+    [SerializeField] private LayerMask sheepLayer;
+    [SerializeField] private float eatDistance = 1.2f;
+    [SerializeField] private float waterCollectDistance = 2.5f;
+    [SerializeField] private float waterCollectReward = 8f;
+    [SerializeField] private int waterPerCollect = 1;
+    public int WaterCount { get; private set; }
+    [SerializeField] private float waterDecayInterval = 5f;
+    private float waterDecayTimer;
+
+    [Header("Hunger / Satiety")]
+    [SerializeField] private int maxSatiety = 20;
+    public int Satiety { get; private set; }
+    [SerializeField] private float satietyDecayInterval = 5f;
+    private float satietyTimer;
+
+    [Header("Starving (satiety = 0)")]
+    [SerializeField] private float hungerDamageInterval = 0.25f;
+    [SerializeField] private int hungerDamageAmount = 1;
+    private float _hungerTimer;
+
+    [Header("Heat")]
+    [SerializeField] private int startHeat = 20;
+    [Tooltip("Только для наблюдений ML: Heat / scale, не лимит инвентаря.")]
+    [SerializeField] private int heatObservationScale = 20;
+    public int Heat { get; private set; }
+    [SerializeField] private float heatDecayInterval = 5f;
+    private float heatTimer;
+
+    [Header("Freezing (heat = 0)")]
+    [SerializeField] private float freezeDamageInterval = 0.25f;
+    [SerializeField] private int freezeDamageAmount = 1;
+    private float _freezeTimer;
+
+    [Header("Dehydrated (water = 0)")]
+    [SerializeField] private float thirstDamageInterval = 0.25f;
+    [SerializeField] private int thirstDamageAmount = 1;
+    private float _thirstTimer;
 
     [Header("Animation (DO — сбор / поцелуй)")]
     [Tooltip("Trigger в Animator Lily (как у Jack).")]
@@ -72,6 +132,7 @@ public class LilyScript : Agent, IHasHp
 
     [Header("Rewards")]
     [SerializeField] private float moveTowardsFlowerRewardScale = 0.3f;
+    [SerializeField] private float moveTowardsSheepRewardScale = 0.3f;
     [SerializeField] private float stepPenalty = -0.001f;
     [Tooltip("Плотная награда за то, что Lily смотрит в сторону Jack (dot(forward, dirToJack)). 0 = выключено.")]
     [SerializeField] private float lookAtJackRewardScale = 0.10f;
@@ -119,7 +180,7 @@ public class LilyScript : Agent, IHasHp
     [Header("Spawn")]
     [Tooltip("Если true — Lily спавнится в фиксированной позиции (не случайно).")]
     [SerializeField] private bool spawnAtFixedPosition = false;
-    [SerializeField] private Vector3 fixedSpawnPosition = new Vector3(25.2299995f, 0.920000017f, -38.25f);
+    [SerializeField] private Vector3 fixedSpawnPosition = new Vector3(14.63f, -5.3f, 13f);
 
     [Header("Path (cinematic)")]
     [Tooltip("Если true — Lily игнорирует действия и идёт по точкам внутри pathRoot (FirstPoint, SecondPoint...).")]
@@ -140,6 +201,10 @@ public class LilyScript : Agent, IHasHp
     [SerializeField] private float gravity = -9.81f;
     private float prevFlowerDist = -1f;
     private float prevJackDist = -1f;
+    private float prevWaterDist = -1f;
+    private float prevSheepDist = -1f;
+    private float prevHouseDist = -1f;
+    private Vector3 prevPosition;
     private int stepCount;
     private float flowerDecayTimer;
     private float loveDecayTimer;
@@ -180,9 +245,10 @@ public class LilyScript : Agent, IHasHp
 
     public void SetOption(int option)
     {
-        if (option < 0 || option > 1)
+        if (option != OptionFlower && option != OptionKiss && option != OptionWater && option != OptionFood && option != OptionHeat)
             return;
         currentOption = option;
+        EnsureOptionIconRenderer();
         UpdateOptionIconVisual();
     }
 
@@ -196,6 +262,8 @@ public class LilyScript : Agent, IHasHp
         EnsureOptionIconRenderer();
         UpdateOptionIconVisual();
         AgentFootsteps.EnsureOn(gameObject);
+        ResolveSheepSpawner();
+        ResolveHouseTarget();
 
         // Как у Jack: не снимаем HP с агента за его же DO (старые значения в сцене).
         damageOnDoIfZombieNearby = false;
@@ -216,7 +284,7 @@ public class LilyScript : Agent, IHasHp
     {
         if (!ShouldShowOptionTaskIcon()) return;
         if (optionIconRenderer != null) return;
-        if (optionFlowerSprite == null && optionKissSprite == null) return;
+        if (optionFlowerSprite == null && optionKissSprite == null && optionWaterSprite == null && optionFoodSprite == null && optionHeatSprite == null) return;
 
         var existing = transform.Find("LilyOptionIcon");
         if (existing != null)
@@ -242,11 +310,27 @@ public class LilyScript : Agent, IHasHp
         if (optionIconRenderer == null) return;
         float s = currentOption switch
         {
-            0 => Mathf.Max(0.01f, optionFlowerIconScale),
-            1 => Mathf.Max(0.01f, optionKissIconScale),
+            OptionFlower => Mathf.Max(0.01f, optionFlowerIconScale),
+            OptionKiss => Mathf.Max(0.01f, optionKissIconScale),
+            OptionWater => ResolveMatchedIconScale(optionWaterSprite, optionWaterIconScale),
+            OptionFood => ResolveMatchedIconScale(optionFoodSprite, optionFoodIconScale),
+            OptionHeat => ResolveMatchedIconScale(optionHeatSprite, optionHeatIconScale),
             _ => 0.35f
         };
         optionIconRenderer.transform.localScale = Vector3.one * s;
+    }
+
+    float ResolveMatchedIconScale(Sprite sprite, float baseScale)
+    {
+        if (optionFlowerSprite == null || sprite == null)
+            return Mathf.Max(0.01f, baseScale);
+
+        float refSize = Mathf.Max(optionFlowerSprite.bounds.size.x, optionFlowerSprite.bounds.size.y);
+        float size = Mathf.Max(sprite.bounds.size.x, sprite.bounds.size.y);
+        if (size < 1e-4f)
+            return Mathf.Max(0.01f, baseScale);
+
+        return Mathf.Max(0.01f, baseScale) * (refSize / size);
     }
 
     private void LateUpdate()
@@ -301,13 +385,25 @@ public class LilyScript : Agent, IHasHp
 
         switch (currentOption)
         {
-            case 0:
+            case OptionFlower:
                 optionIconRenderer.sprite = optionFlowerSprite;
                 optionIconRenderer.enabled = optionFlowerSprite != null;
                 break;
-            case 1:
+            case OptionKiss:
                 optionIconRenderer.sprite = optionKissSprite;
                 optionIconRenderer.enabled = optionKissSprite != null;
+                break;
+            case OptionWater:
+                optionIconRenderer.sprite = optionWaterSprite;
+                optionIconRenderer.enabled = optionWaterSprite != null;
+                break;
+            case OptionFood:
+                optionIconRenderer.sprite = optionFoodSprite;
+                optionIconRenderer.enabled = optionFoodSprite != null;
+                break;
+            case OptionHeat:
+                optionIconRenderer.sprite = optionHeatSprite;
+                optionIconRenderer.enabled = optionHeatSprite != null;
                 break;
             default:
                 optionIconRenderer.enabled = false;
@@ -317,10 +413,23 @@ public class LilyScript : Agent, IHasHp
         ApplyOptionIconLocalScale();
     }
 
+    private void Awake()
+    {
+        ConfigurePresentationControl();
+    }
+
     private void Update()
     {
         if (_doCooldownRemaining > 0f)
             _doCooldownRemaining -= Time.deltaTime;
+
+        UpdateDehydration();
+        UpdateWaterDecay();
+        UpdateSatietyDecay();
+        UpdateStarving();
+        UpdateHeatDecay();
+        UpdateFreezing();
+        UpdateWarmthAtCampfire();
 
         if (showOptionTaskIcon != _lastShowOptionTaskIcon)
         {
@@ -328,9 +437,47 @@ public class LilyScript : Agent, IHasHp
             UpdateOptionIconVisual();
         }
 
+        ProcessManualOptionKeys();
+    }
+
+    void UpdateWaterDecay()
+    {
+        if (_deathSequenceStarted)
+            return;
+
+        waterDecayTimer += Time.deltaTime;
+        if (waterDecayTimer < waterDecayInterval)
+            return;
+
+        waterDecayTimer = 0f;
+        if (WaterCount > 0)
+            WaterCount--;
+    }
+
+    void ProcessManualOptionKeys()
+    {
+        if (!IsManualControlActive(transform))
+            return;
+
+        if (Input.GetKeyDown(KeyCode.Alpha0))
+            SetOption(OptionWater);
+
+        if (Input.GetKeyDown(KeyCode.Alpha1))
+            SetOption(OptionFood);
+
+        if (Input.GetKeyDown(KeyCode.Alpha2))
+            SetOption(OptionHeat);
+
         if (Input.GetKeyDown(KeyCode.T))
         {
-            int next = (currentOption + 1) % 2;
+            int next = currentOption switch
+            {
+                OptionFlower => OptionKiss,
+                OptionKiss => OptionWater,
+                OptionWater => OptionFood,
+                OptionFood => OptionHeat,
+                _ => OptionFlower
+            };
             SetOption(next);
         }
     }
@@ -363,10 +510,21 @@ public class LilyScript : Agent, IHasHp
         }
 
         stepCount = 0;
+        prevPosition = transform.position;
         prevFlowerDist = -1f;
         prevJackDist = -1f;
+        prevWaterDist = -1f;
+        prevSheepDist = -1f;
         FlowerCount = 0;
         Love = 0;
+        WaterCount = 6;
+        waterDecayTimer = 0f;
+        Satiety = maxSatiety / 2;
+        satietyTimer = 0f;
+        _hungerTimer = 0f;
+        Heat = startHeat;
+        heatTimer = 0f;
+        _freezeTimer = 0f;
         flowerDecayTimer = 0f;
         loveDecayTimer = 0f;
         hp = maxHp;
@@ -374,35 +532,45 @@ public class LilyScript : Agent, IHasHp
         _doCooldownRemaining = 0f;
         _pathIndex = 0;
         _pathWaitLeft = 0f;
+        _thirstTimer = 0f;
+        _warmthGainTimer = 0f;
+        prevHouseDist = -1f;
+        WaterGoalPath.Get(transform)?.ResetAgent(transform);
+
+        ConfigurePresentationControl();
 
         // Опция: либо utility+softmax, либо случайно
         if (useUtilitySoftmaxSampling)
             currentOption = SampleOptionUtilitySoftmax(currentOption);
         else
-            currentOption = Random.Range(0, 2);
+            currentOption = Random.Range(0, OptionCount);
 
-        // Те же координаты спавна, что у JackScript
-        float minX = -20.78f;
-        float maxX = -12.88f;
-        float minZ = -7.30f;
-        float maxZ = -0.01f;
-        float y = 0.42f;
+        // Локальные координаты относительно корня Env (рядом с домом, как у Jack).
+        const float groundY = -5.228786f;
+        float minX = -2f;
+        float maxX = 14f;
+        float minZ = 10f;
+        float maxZ = 17f;
 
-        float randX = Random.Range(minX, maxX);
-        float randZ = Random.Range(minZ, maxZ);
+        bool skipTeleport = !spawnAtFixedPosition && !followPath && !TrainingEnvSpace.HasMultipleTrainingEnvs();
 
-        controller.enabled = false;
-        if (spawnAtFixedPosition)
+        if (!skipTeleport)
         {
-            transform.position = TrainingEnvSpace.LocalToWorld(transform, fixedSpawnPosition);
-            transform.rotation = TrainingEnvSpace.LocalToWorldRotation(transform, Vector3.zero);
+            controller.enabled = false;
+            if (spawnAtFixedPosition)
+            {
+                transform.position = TrainingEnvSpace.LocalToWorld(transform, fixedSpawnPosition);
+                transform.rotation = TrainingEnvSpace.LocalToWorldRotation(transform, Vector3.zero);
+            }
+            else
+            {
+                float randX = Random.Range(minX, maxX);
+                float randZ = Random.Range(minZ, maxZ);
+                transform.position = TrainingEnvSpace.LocalToWorld(transform, new Vector3(randX, groundY, randZ));
+                transform.rotation = TrainingEnvSpace.LocalToWorldRotation(transform, new Vector3(0f, Random.Range(0f, 360f), 0f));
+            }
+            controller.enabled = true;
         }
-        else
-        {
-            transform.position = TrainingEnvSpace.LocalToWorld(transform, new Vector3(randX, y, randZ));
-            transform.rotation = TrainingEnvSpace.LocalToWorldRotation(transform, new Vector3(0f, Random.Range(0f, 360f), 0f));
-        }
-        controller.enabled = true;
 
         if (followPath && pathRoot != null && pathRoot.childCount > 0)
         {
@@ -420,6 +588,52 @@ public class LilyScript : Agent, IHasHp
             flowerSpawner.ResetFlowers();
 
         UpdateOptionIconVisual();
+    }
+
+    void ConfigurePresentationControl()
+    {
+        if (!TrainingEnvSpace.IsPresentationTransform(transform))
+            return;
+
+        var bp = GetComponent<BehaviorParameters>();
+        if (bp == null)
+            return;
+
+        bool training = Academy.IsInitialized && Academy.Instance.IsCommunicatorOn;
+        bp.BehaviorType = training ? BehaviorType.Default : BehaviorType.HeuristicOnly;
+
+        var decisionRequester = GetComponent<DecisionRequester>();
+        if (decisionRequester != null)
+            decisionRequester.DecisionPeriod = training ? 5 : 1;
+    }
+
+    static bool IsManualControlActive(Transform t)
+    {
+        if (!TrainingEnvSpace.IsPresentationTransform(t))
+            return false;
+
+        var bp = t.GetComponent<BehaviorParameters>();
+        if (bp != null && bp.BehaviorType == BehaviorType.HeuristicOnly)
+            return true;
+
+        return !Academy.IsInitialized || !Academy.Instance.IsCommunicatorOn;
+    }
+
+    void UpdateDehydration()
+    {
+        if (_deathSequenceStarted || WaterCount > 0)
+        {
+            _thirstTimer = 0f;
+            return;
+        }
+
+        _thirstTimer += Time.deltaTime;
+        if (_thirstTimer < thirstDamageInterval)
+            return;
+
+        _thirstTimer = 0f;
+        if (thirstDamageAmount > 0)
+            TakeDamage(thirstDamageAmount);
     }
 
     private bool GetNearestFlower(out GameObject nearestFlower, out float distance)
@@ -633,13 +847,17 @@ public class LilyScript : Agent, IHasHp
         sensor.AddObservation(transform.position);
         sensor.AddObservation(transform.forward);
 
-        // One-hot опции: 0 = цветы, 1 = поцелуй Джека
-        sensor.AddObservation(currentOption == 0 ? 1f : 0f);
-        sensor.AddObservation(currentOption == 1 ? 1f : 0f);
+        // Опции: 3 бита (до 8 значений), сейчас 0..4.
+        sensor.AddObservation(GetOptionObservationBit0(currentOption));
+        sensor.AddObservation(GetOptionObservationBit1(currentOption));
+        sensor.AddObservation(GetOptionObservationBit2(currentOption));
 
         // Счётчики (нормализованные [0,1])
         sensor.AddObservation(maxFlowerCount > 0 ? (float)FlowerCount / maxFlowerCount : 0f);
         sensor.AddObservation(maxLove > 0 ? (float)Love / maxLove : 0f);
+        sensor.AddObservation(Mathf.Clamp01((float)Heat / Mathf.Max(1, heatObservationScale)));
+        sensor.AddObservation(IsOnHouse() ? 1f : 0f);
+        sensor.AddObservation(IsCampfireBurningInEnv() ? 1f : 0f);
 
         // Цветы: без дистанции и направления к цветку — только флаг «в радиусе сбора»
         if (GetNearestFlower(out _, out float dist))
@@ -686,20 +904,38 @@ public class LilyScript : Agent, IHasHp
         int collectAction = actions.DiscreteActions[2];
 
         bool collectJustPressed = collectAction == 1 && _lastCollectAction != 1;
-        // DO актуален для обеих опций: 0 (цветы), 1 (поцелуй)
-        bool collectDoRelevant = currentOption == 0 || currentOption == 1;
+        bool collectDoRelevant = currentOption == OptionFlower
+            || currentOption == OptionKiss
+            || currentOption == OptionWater
+            || currentOption == OptionFood
+            || currentOption == OptionHeat;
         bool collectReady = collectJustPressed && _doCooldownRemaining <= 0f && collectDoRelevant;
 
         if (collectReady && animator != null && doActionAnimTrigger.Length > 0)
             animator.SetTrigger(doActionAnimTrigger);
 
-        // DO по зомби: как у Jack — на фронте DO, независимо от того, собрали ли цветок / поцеловали ли.
         if (collectReady)
         {
             if (damageOnDoIfZombieNearby && zombieDamageOnDo > 0 && IsZombieNearbyForDo())
                 TakeDamage(zombieDamageOnDo);
             if (knockbackZombieOnDo)
                 KnockbackNearbyZombiesOnLilyDo();
+
+            if (TryCollectWater())
+            {
+                if (waterCollectReward != 0f)
+                {
+                    AddReward(waterCollectReward);
+                    FloatingRewardPopup.ShowGotWater(transform, waterCollectReward);
+                }
+                GameSfx.PlayFood(source: transform);
+            }
+
+            if (TryEatSheep())
+            {
+                GameSfx.PlayFood(source: transform);
+                FloatingRewardPopup.ShowGotFood(transform, 10f);
+            }
         }
 
         // Дискретные действия как у Jack: ветка0 — 1 вперёд, 3 назад, 2 стой; ветка1 — 1/3 поворот, 2 не крутить
@@ -764,7 +1000,7 @@ public class LilyScript : Agent, IHasHp
             if (Love > 0) Love--;
         }
 
-        if (currentOption == 0)
+        if (currentOption == OptionFlower)
         {
             // Опция: собирать цветы — один раз на фронте DO + кулдаун
             bool collected = false;
@@ -787,8 +1023,11 @@ public class LilyScript : Agent, IHasHp
             else
                 prevFlowerDist = -1f;
             prevJackDist = -1f;
+            prevWaterDist = -1f;
+            prevSheepDist = -1f;
+            prevHouseDist = -1f;
         }
-        else if (currentOption == 1)
+        else if (currentOption == OptionKiss)
         {
             // Опция: поцелуй — один раз на фронте DO + кулдаун, в радиусе поцелуя
             float currJackDist = GetDistanceToJack(out _);
@@ -808,11 +1047,77 @@ public class LilyScript : Agent, IHasHp
             else
                 prevJackDist = -1f;
             prevFlowerDist = -1f;
+            prevWaterDist = -1f;
+            prevSheepDist = -1f;
+            prevHouseDist = -1f;
+        }
+        else if (currentOption == OptionWater)
+        {
+            var waterPath = WaterGoalPath.Get(transform);
+            if (waterPath != null)
+            {
+                waterPath.ProcessStep(transform, AddReward);
+                prevWaterDist = -1f;
+            }
+            else
+            {
+                var envRoot = TrainingEnvSpace.FindRoot(transform);
+                if (WaterSource.TryFindNearestDistance(transform, envRoot, out float currWaterDist))
+                {
+                    if (prevWaterDist > 0f)
+                        AddReward((prevWaterDist - currWaterDist) * 0.3f);
+                    prevWaterDist = currWaterDist;
+                }
+                else
+                    prevWaterDist = -1f;
+            }
+
+            prevFlowerDist = -1f;
+            prevJackDist = -1f;
+            prevSheepDist = -1f;
+            prevHouseDist = -1f;
+        }
+        else if (currentOption == OptionFood)
+        {
+            if (GetNearestSheep(out _, out float currSheepDist))
+            {
+                if (prevSheepDist > 0f)
+                    AddReward((prevSheepDist - currSheepDist) * moveTowardsSheepRewardScale);
+                prevSheepDist = currSheepDist;
+            }
+            else
+                prevSheepDist = -1f;
+
+            prevFlowerDist = -1f;
+            prevJackDist = -1f;
+            prevWaterDist = -1f;
+            prevHouseDist = -1f;
+        }
+        else if (currentOption == OptionHeat)
+        {
+            ResolveHouseTarget();
+            if (houseTarget != null)
+            {
+                float prevDist = Vector3.Distance(prevPosition, houseTarget.position);
+                float currDist = Vector3.Distance(transform.position, houseTarget.position);
+                float reward = (prevDist - currDist) * moveTowardsHouseWhenColdRewardScale;
+                AddReward(reward);
+                prevHouseDist = currDist;
+            }
+            else
+                prevHouseDist = -1f;
+
+            prevFlowerDist = -1f;
+            prevJackDist = -1f;
+            prevWaterDist = -1f;
+            prevSheepDist = -1f;
         }
         if (collectReady)
             _doCooldownRemaining = Mathf.Max(0f, collectActionCooldownSeconds);
 
         _lastCollectAction = collectAction;
+
+        prevPosition = transform.position;
 
         stepCount++;
         if (MaxStep > 0 && stepCount >= MaxStep)
@@ -914,19 +1219,307 @@ public class LilyScript : Agent, IHasHp
         return true;
     }
 
+    bool GetNearestSheep(out GameObject nearestSheep, out float distance)
+    {
+        nearestSheep = null;
+        distance = float.MaxValue;
+
+        if (sheepLayer.value == 0)
+            ResolveSheepSpawner();
+
+        Collider[] hits = Physics.OverlapSphere(transform.position, eatDistance * 3f, sheepLayer);
+        foreach (var hit in hits)
+        {
+            if (hit == null || !hit.gameObject.activeInHierarchy)
+                continue;
+
+            float d = HarvestReachDistance(transform.position, hit);
+            if (d >= distance)
+                continue;
+
+            distance = d;
+            nearestSheep = GetSheepInstanceRoot(hit);
+        }
+
+        return nearestSheep != null;
+    }
+
+    void ResolveSheepSpawner()
+    {
+        if (sheepSpawner != null)
+            return;
+
+        var envRoot = TrainingEnvSpace.FindRoot(transform);
+        if (envRoot != null)
+            sheepSpawner = envRoot.GetComponentInChildren<SheepSpawner>(true);
+
+        if (sheepLayer.value == 0)
+        {
+            int sheepLayerId = LayerMask.NameToLayer("Sheep");
+            if (sheepLayerId >= 0)
+                sheepLayer = 1 << sheepLayerId;
+        }
+    }
+
+    void ResolveHouseTarget()
+    {
+        if (houseTarget != null)
+            return;
+
+        var jack = FindJackInEnv();
+        if (jack != null && jack.houseTargetPublic != null)
+        {
+            houseTarget = jack.houseTargetPublic;
+            return;
+        }
+
+        var envRoot = TrainingEnvSpace.FindRoot(transform);
+        if (envRoot == null)
+            return;
+
+        var home = envRoot.Find("HomeSpot");
+        if (home != null)
+            houseTarget = home;
+    }
+
+    AgentGoToHouseDiscrete FindJackInEnv()
+    {
+        var envRoot = TrainingEnvSpace.FindRoot(transform);
+        if (envRoot == null)
+            return null;
+
+        if (jackTarget != null)
+        {
+            var jackFromTarget = jackTarget.GetComponentInParent<AgentGoToHouseDiscrete>();
+            if (jackFromTarget != null && TrainingEnvSpace.IsDescendantOf(jackFromTarget.transform, envRoot))
+                return jackFromTarget;
+        }
+
+        var jacks = envRoot.GetComponentsInChildren<AgentGoToHouseDiscrete>(true);
+        for (int i = 0; i < jacks.Length; i++)
+        {
+            if (jacks[i] != null)
+                return jacks[i];
+        }
+
+        return null;
+    }
+
+    void UpdateWarmthAtCampfire()
+    {
+        if (_deathSequenceStarted)
+        {
+            _warmthGainTimer = 0f;
+            return;
+        }
+
+        if (!IsNearBurningCampfire())
+        {
+            _warmthGainTimer = 0f;
+            return;
+        }
+
+        TryGainWarmthAtCampfire();
+    }
+
+    bool IsNearBurningCampfire()
+    {
+        var jack = FindJackInEnv();
+        if (jack == null || jack.CampfireBurnSecondsRemaining <= 0f)
+            return false;
+
+        ResolveHouseTarget();
+        if (houseTarget == null)
+            return false;
+
+        return Vector3.Distance(transform.position, houseTarget.position) <= houseRadius;
+    }
+
+    bool IsOnHouse()
+    {
+        ResolveHouseTarget();
+        if (houseTarget == null)
+            return false;
+
+        return Vector3.Distance(transform.position, houseTarget.position) <= houseRadius;
+    }
+
+    float GetDistanceToHouse(out Transform target)
+    {
+        ResolveHouseTarget();
+        target = houseTarget;
+        if (houseTarget == null)
+            return float.MaxValue;
+
+        return Vector3.Distance(transform.position, houseTarget.position);
+    }
+
+    bool IsCampfireBurningInEnv()
+    {
+        var jack = FindJackInEnv();
+        return jack != null && jack.CampfireBurnSecondsRemaining > 0f;
+    }
+
+    void TryGainWarmthAtCampfire()
+    {
+        _warmthGainTimer += Time.deltaTime;
+        if (_warmthGainTimer < warmthGainInterval)
+            return;
+
+        _warmthGainTimer = 0f;
+        Heat++;
+        if (warmthRewardAtCampfire != 0f && currentOption == OptionHeat)
+        {
+            AddReward(warmthRewardAtCampfire);
+            FloatingRewardPopup.ShowWarmedUp(transform, warmthRewardAtCampfire);
+        }
+    }
+
+    static float GetOptionObservationBit0(int option) => (option & 1) != 0 ? 1f : 0f;
+    static float GetOptionObservationBit1(int option) => (option & 2) != 0 ? 1f : 0f;
+    static float GetOptionObservationBit2(int option) => (option & 4) != 0 ? 1f : 0f;
+
+    GameObject GetSheepInstanceRoot(Collider hit)
+    {
+        var wander = hit.GetComponentInParent<SheepWander>();
+        if (wander != null)
+            return wander.gameObject;
+
+        Transform t = hit.transform;
+        if (sheepSpawner != null)
+        {
+            Transform sp = sheepSpawner.transform;
+            for (; t != null; t = t.parent)
+            {
+                if (t.parent == sp)
+                    return t.gameObject;
+            }
+        }
+
+        return hit.gameObject;
+    }
+
+    bool TryEatSheep()
+    {
+        if (sheepLayer.value == 0)
+            ResolveSheepSpawner();
+
+        Vector3 origin = transform.position;
+        Collider[] hits = Physics.OverlapSphere(origin, eatDistance, sheepLayer);
+
+        GameObject bestRoot = null;
+        float bestDist = float.MaxValue;
+        foreach (var c in hits)
+        {
+            if (c == null) continue;
+            float d = HarvestReachDistance(origin, c);
+            if (d > eatDistance) continue;
+            GameObject root = GetSheepInstanceRoot(c);
+            if (d < bestDist)
+            {
+                bestDist = d;
+                bestRoot = root;
+            }
+        }
+
+        if (bestRoot == null)
+            return false;
+
+        Satiety = Mathf.Min(maxSatiety, Satiety + 2);
+        Destroy(bestRoot);
+        sheepSpawner?.NotifySheepEaten();
+        return true;
+    }
+
+    void UpdateSatietyDecay()
+    {
+        if (_deathSequenceStarted)
+            return;
+
+        satietyTimer += Time.deltaTime;
+        if (satietyTimer < satietyDecayInterval)
+            return;
+
+        satietyTimer = 0f;
+        if (Satiety > 0)
+            Satiety--;
+    }
+
+    void UpdateStarving()
+    {
+        if (_deathSequenceStarted || Satiety > 0)
+        {
+            _hungerTimer = 0f;
+            return;
+        }
+
+        _hungerTimer += Time.deltaTime;
+        if (_hungerTimer < hungerDamageInterval)
+            return;
+
+        _hungerTimer = 0f;
+        if (hungerDamageAmount > 0)
+            TakeDamage(hungerDamageAmount);
+    }
+
+    void UpdateHeatDecay()
+    {
+        if (_deathSequenceStarted)
+            return;
+
+        heatTimer += Time.deltaTime;
+        if (heatTimer < heatDecayInterval)
+            return;
+
+        heatTimer = 0f;
+        if (Heat > 0)
+            Heat--;
+    }
+
+    void UpdateFreezing()
+    {
+        if (_deathSequenceStarted || Heat > 0)
+        {
+            _freezeTimer = 0f;
+            return;
+        }
+
+        _freezeTimer += Time.deltaTime;
+        if (_freezeTimer < freezeDamageInterval)
+            return;
+
+        _freezeTimer = 0f;
+        if (freezeDamageAmount > 0)
+            TakeDamage(freezeDamageAmount);
+    }
+
+    bool TryCollectWater()
+    {
+        var envRoot = TrainingEnvSpace.FindRoot(transform);
+        if (!WaterSource.TryCollect(transform, waterCollectDistance, envRoot, out int amount))
+            return false;
+
+        WaterCount += Mathf.Max(1, waterPerCollect > 0 ? waterPerCollect : amount);
+        return true;
+    }
+
     public override void Heuristic(in ActionBuffers actionsOut)
     {
         var d = actionsOut.DiscreteActions;
-        // Как у Jack: move 1/3/2, rotate 1/3/2; стрелки = W/S и A/D по смыслу
+
         int moveAction = 2;
-        if (Input.GetKey(KeyCode.UpArrow) || Input.GetKey(KeyCode.W)) moveAction = 1;
-        else if (Input.GetKey(KeyCode.DownArrow) || Input.GetKey(KeyCode.S)) moveAction = 3;
+        if (Input.GetKey(KeyCode.UpArrow))
+            moveAction = 1;
+        else if (Input.GetKey(KeyCode.DownArrow))
+            moveAction = 3;
 
         int rotateAction = 2;
-        if (Input.GetKey(KeyCode.RightArrow) || Input.GetKey(KeyCode.D)) rotateAction = 1;
-        else if (Input.GetKey(KeyCode.LeftArrow) || Input.GetKey(KeyCode.A)) rotateAction = 3;
+        if (Input.GetKey(KeyCode.RightArrow))
+            rotateAction = 1;
+        else if (Input.GetKey(KeyCode.LeftArrow))
+            rotateAction = 3;
 
-        int collectAction = Input.GetMouseButton(1) ? 1 : 0;  // ПКМ — DO (собрать/поцеловать)
+        int collectAction = Input.GetMouseButton(1) ? 1 : 0;
 
         d[0] = moveAction;
         d[1] = rotateAction;

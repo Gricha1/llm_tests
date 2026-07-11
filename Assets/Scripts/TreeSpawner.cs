@@ -82,6 +82,12 @@ public class TreeSpawner : MonoBehaviour
         trees.RemoveAll(t => !IsAlive(t));
     }
 
+    public void NotifyTreeChopped(GameObject tree)
+    {
+        if (tree != null)
+            trees.Remove(tree);
+    }
+
     private void SpawnOneTree()
     {
         for (int attempt = 0; attempt < 100; attempt++)

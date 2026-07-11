@@ -46,7 +46,7 @@ public class ZombieAttack : MonoBehaviour
             return;
 
         var target = other.GetComponentInParent<IHasHp>();
-        if (target == null) return;
+        if (target == null || !IsJackAttackTarget(target)) return;
         if (Time.time - lastHitTime < hitCooldown * _hitCooldownMultiplier) return;
 
         lastHitTime = Time.time;
@@ -67,6 +67,7 @@ public class ZombieAttack : MonoBehaviour
         pendingHitRoutine = null;
 
         if (target == null) yield break;
+        if (!IsJackAttackTarget(target)) yield break;
         if (chase != null && chase.IsStunned) yield break;
 
         // Проверяем, что цель всё ещё рядом.
@@ -85,6 +86,14 @@ public class ZombieAttack : MonoBehaviour
         int damage = Mathf.Max(1, Mathf.RoundToInt(target.MaxHp / 5f * _damageMultiplier));
         target.TakeDamage(damage);
         GameSfx.PlayZombieHitAgent(source: targetTr);
+    }
+
+    static bool IsJackAttackTarget(IHasHp target)
+    {
+        if (target == null || target is ZombieHealth)
+            return false;
+
+        return target is AgentGoToHouseDiscrete;
     }
 
     private void TryPlayAttackAnim()

@@ -8,7 +8,8 @@ public class RewardDisplay : MonoBehaviour
     {
         Auto,
         Jack,
-        Lily
+        Lily,
+        George
     }
 
     [SerializeField] private Agent agent;
@@ -23,7 +24,10 @@ public class RewardDisplay : MonoBehaviour
         for (int i = 0; i < displays.Length; i++)
         {
             if (displays[i] != null)
+            {
                 displays[i].EnsureHudVisible();
+                displays[i].ApplyLayout();
+            }
         }
     }
 
@@ -32,6 +36,42 @@ public class RewardDisplay : MonoBehaviour
         _text = GetComponent<TMP_Text>();
         ResolveLabel();
         EnsureHudVisible();
+        ApplyReadableStyle();
+        ApplyLayout();
+    }
+
+    void ApplyLayout()
+    {
+        var rt = GetComponent<RectTransform>();
+        if (rt == null || _text == null)
+            return;
+
+        bool lily = IsLilyDisplay();
+        bool george = IsGeorgeDisplay();
+        rt.anchorMin = new Vector2(0.5f, 1f);
+        rt.anchorMax = new Vector2(0.5f, 1f);
+        rt.pivot = new Vector2(0f, 1f);
+        rt.sizeDelta = new Vector2(280f, 50f);
+        if (george)
+            rt.anchoredPosition = new Vector2(1010f, -235f);
+        else if (lily)
+            rt.anchoredPosition = new Vector2(820f, -165f);
+        else
+            rt.anchoredPosition = new Vector2(630f, -95f);
+
+        _text.enableWordWrapping = false;
+        _text.overflowMode = TextOverflowModes.Overflow;
+        _text.horizontalAlignment = HorizontalAlignmentOptions.Left;
+    }
+
+    void ApplyReadableStyle()
+    {
+        if (_text == null)
+            return;
+
+        _text.color = Color.white;
+        _text.outlineWidth = 0.25f;
+        _text.outlineColor = Color.black;
     }
 
     void EnsureHudVisible()
@@ -48,19 +88,51 @@ public class RewardDisplay : MonoBehaviour
             gameObject.SetActive(true);
     }
 
+    public void ConfigureForGeorge()
+    {
+        agentKind = AgentKind.George;
+        label = "R гера";
+        ResolveLabel();
+        ApplyLayout();
+    }
+
     void ResolveLabel()
     {
         if (!string.IsNullOrEmpty(label))
             return;
 
-        if (IsLilyDisplay())
-            label = "Награда Лили";
+        if (IsGeorgeDisplay())
+            label = "R гера";
+        else if (IsLilyDisplay())
+            label = "R лили";
         else
-            label = "Награда Джека";
+            label = "R джек";
+    }
+
+    bool IsGeorgeDisplay()
+    {
+        if (agentKind == AgentKind.George)
+            return true;
+        if (agentKind == AgentKind.Jack || agentKind == AgentKind.Lily)
+            return false;
+
+        if (agent != null)
+        {
+            if (agent is GeorgeScript)
+                return true;
+            if (agent is AgentGoToHouseDiscrete jackAgent && TrainingEnvSpace.IsGeorgeAgent(jackAgent))
+                return true;
+            if (agent.GetComponent<GeorgeScript>() != null)
+                return true;
+        }
+
+        return gameObject.name.IndexOf("George", System.StringComparison.OrdinalIgnoreCase) >= 0;
     }
 
     bool IsLilyDisplay()
     {
+        if (IsGeorgeDisplay())
+            return false;
         if (agentKind == AgentKind.Lily)
             return true;
         if (agentKind == AgentKind.Jack)
@@ -79,7 +151,10 @@ public class RewardDisplay : MonoBehaviour
 
     void Update()
     {
-        agent = IsLilyDisplay() ? FindActiveLily() : FindActiveJack();
+        if (IsGeorgeDisplay())
+            agent = FindActiveGeorge();
+        else
+            agent = IsLilyDisplay() ? FindActiveLily() : FindActiveJack();
         if (_text == null)
             return;
 
@@ -92,8 +167,11 @@ public class RewardDisplay : MonoBehaviour
         if (!_text.gameObject.activeSelf)
             _text.gameObject.SetActive(true);
 
-        _text.text = $"{label}: {agent.GetCumulativeReward():F2}";
+        _text.text = $"{label} {agent.GetCumulativeReward():F2}";
     }
+
+    static AgentGoToHouseDiscrete FindActiveGeorge() =>
+        TrainingEnvSpace.FindPresentationGeorge();
 
     static AgentGoToHouseDiscrete FindActiveJack() =>
         TrainingEnvSpace.FindPresentationJack();

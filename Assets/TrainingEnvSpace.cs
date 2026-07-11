@@ -148,6 +148,20 @@ public static class TrainingEnvSpace
         return root.GetComponentInChildren<T>(true);
     }
 
+    public static bool IsGeorgeAgent(AgentGoToHouseDiscrete agent)
+    {
+        if (agent == null)
+            return false;
+        if (agent is GeorgeScript)
+            return true;
+
+        var go = agent.gameObject;
+        if (go.CompareTag("George"))
+            return true;
+
+        return go.name.IndexOf("George", System.StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
     /// <summary>Живой Jack для HUD и Twitch: оригинал, иначе клон с HP &gt; 0.</summary>
     public static AgentGoToHouseDiscrete FindPresentationJack()
     {
@@ -162,7 +176,7 @@ public static class TrainingEnvSpace
         for (int i = 0; i < jacks.Length; i++)
         {
             var jack = jacks[i];
-            if (jack == null)
+            if (jack == null || IsGeorgeAgent(jack))
                 continue;
 
             if (TwitchEphemeralEffects.IsTwitchClone(jack))
@@ -180,7 +194,20 @@ public static class TrainingEnvSpace
             return primary;
         if (livingClone != null)
             return livingClone;
-        return primary != null ? primary : (jacks.Length > 0 ? jacks[0] : null);
+        return primary != null ? primary : FindFirstJackAgent(jacks);
+    }
+
+    static AgentGoToHouseDiscrete FindFirstJackAgent(AgentGoToHouseDiscrete[] agents)
+    {
+        if (agents == null)
+            return null;
+        for (int i = 0; i < agents.Length; i++)
+        {
+            if (agents[i] != null && !IsGeorgeAgent(agents[i]))
+                return agents[i];
+        }
+
+        return null;
     }
 
     /// <summary>Оригинальный Jack (не Twitch-клон) в presentation Env.</summary>
@@ -192,21 +219,38 @@ public static class TrainingEnvSpace
             var all = Object.FindObjectsOfType<AgentGoToHouseDiscrete>();
             for (int i = 0; i < all.Length; i++)
             {
-                if (!TwitchEphemeralEffects.IsTwitchClone(all[i]))
+                if (all[i] != null && !TwitchEphemeralEffects.IsTwitchClone(all[i]) && !IsGeorgeAgent(all[i]))
                     return all[i];
             }
 
-            return all.Length > 0 ? all[0] : null;
+            return FindFirstJackAgent(all);
         }
 
         var jacks = root.GetComponentsInChildren<AgentGoToHouseDiscrete>(false);
         for (int i = 0; i < jacks.Length; i++)
         {
-            if (jacks[i] != null && !TwitchEphemeralEffects.IsTwitchClone(jacks[i]))
+            if (jacks[i] != null && !TwitchEphemeralEffects.IsTwitchClone(jacks[i]) && !IsGeorgeAgent(jacks[i]))
                 return jacks[i];
         }
 
-        return jacks.Length > 0 ? jacks[0] : null;
+        return FindFirstJackAgent(jacks);
+    }
+
+    public static AgentGoToHouseDiscrete FindPresentationGeorge()
+    {
+        var root = PresentationRoot;
+        AgentGoToHouseDiscrete[] agents = root != null
+            ? root.GetComponentsInChildren<AgentGoToHouseDiscrete>(false)
+            : Object.FindObjectsOfType<AgentGoToHouseDiscrete>();
+
+        for (int i = 0; i < agents.Length; i++)
+        {
+            var agent = agents[i];
+            if (agent != null && IsGeorgeAgent(agent))
+                return agent;
+        }
+
+        return null;
     }
 
     public static Transform FindRoot(Transform from)

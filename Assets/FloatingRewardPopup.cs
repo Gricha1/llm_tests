@@ -71,6 +71,9 @@ public sealed class FloatingRewardPopup : MonoBehaviour
     public static void ShowGotFood(Transform agent, float rewardAmount) =>
         ShowCustom(agent, WithReward("дobыл еды", rewardAmount), TaskColor);
 
+    public static void ShowGotWater(Transform agent, float rewardAmount) =>
+        ShowCustom(agent, WithReward("набрал воды", rewardAmount), FreezeColor);
+
     public static void ShowWarmedUp(Transform agent, float rewardAmount) =>
         ShowCustom(agent, WithReward("согрелся", rewardAmount), TaskColor);
 

@@ -5,6 +5,7 @@ public class SatietyDisplay : MonoBehaviour
 {
     [SerializeField] private AgentGoToHouseDiscrete agent;
     [SerializeField] private TMP_SpriteAsset spriteAsset;
+    public TMP_SpriteAsset FoodSpriteAsset => spriteAsset;
     [SerializeField] private float pulseSpeed = 5f;
     [SerializeField] private float pulseMinSizePercent = 85f;
     [SerializeField] private float pulseMaxSizePercent = 135f;
@@ -24,7 +25,7 @@ public class SatietyDisplay : MonoBehaviour
             return;
 
         if (agent == null || !agent.gameObject.activeInHierarchy)
-            agent = TrainingEnvSpace.FindInPresentation<AgentGoToHouseDiscrete>();
+            agent = TrainingEnvSpace.FindPresentationJack();
 
         if (agent == null)
             return;
