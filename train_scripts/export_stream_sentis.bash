@@ -6,13 +6,16 @@
 #   bash train_scripts/export_stream_sentis.bash
 #
 # Переменные:
-#   UNITY_EDITOR=/path/to/Unity   (или Unity в PATH)
+#   UNITY_EDITOR=/path/to/Unity   (Linux: ~/Unity/Hub/Editor/6000.0.26f1/Editor/Unity)
 
 set -eu
 set -o pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
 cd "${ROOT}"
+
+# shellcheck source=lib/resolve_unity_editor.bash
+source "${ROOT}/train_scripts/lib/resolve_unity_editor.bash"
 
 ONNX_DIR="${FOREST_STREAM_ONNX_DIR:-}"
 SENTIS_DIR="${FOREST_STREAM_SENTIS_DIR:-}"
@@ -22,19 +25,24 @@ if [ -z "${ONNX_DIR}" ] || [ -z "${SENTIS_DIR}" ]; then
   exit 1
 fi
 
-UNITY_BIN="${UNITY_EDITOR:-}"
-if [ -z "${UNITY_BIN}" ] && command -v Unity >/dev/null 2>&1; then
-  UNITY_BIN="Unity"
-fi
-if [ -z "${UNITY_BIN}" ] || ! command -v "${UNITY_BIN}" >/dev/null 2>&1; then
-  echo "[export_stream_sentis] skip: UNITY_EDITOR не задан (нет конвертации onnx→sentis)" >&2
+UNITY_BIN="$(resolve_unity_editor || true)"
+if [ -z "${UNITY_BIN}" ]; then
+  echo "[export_stream_sentis] ERROR: Unity Editor не найден." >&2
+  echo "  Задай UNITY_EDITOR, например:" >&2
+  echo "  export UNITY_EDITOR=\"\$HOME/Unity/Hub/Editor/6000.0.26f1/Editor/Unity\"" >&2
+  echo "  Или установи Editor через: bash train_scripts/lab_comp/install_unity_gui.bash" >&2
+  if [ "${FOREST_STREAM_SENTIS_REQUIRED:-0}" = "1" ]; then
+    exit 1
+  fi
   exit 0
 fi
 
 export FOREST_STREAM_ONNX_DIR="${ONNX_DIR}"
 export FOREST_STREAM_SENTIS_DIR="${SENTIS_DIR}"
 
+echo "[export_stream_sentis] Unity=${UNITY_BIN}"
 echo "[export_stream_sentis] onnx=${ONNX_DIR} -> sentis=${SENTIS_DIR}"
+
 "${UNITY_BIN}" \
   -batchmode \
   -nographics \
