@@ -51,6 +51,20 @@ public sealed class EnvTrainingConfig : MonoBehaviour
     [SerializeField] private int zombieImmediateSpawnCount = 2;
 
     int _lastSetupFrame = -1;
+    static int _forcedCopyIndex = -1;
+
+    bool _heroCacheReady;
+    EnvTrainingTask _visibilityTaskApplied = (EnvTrainingTask)(-1);
+    Transform _jackHero;
+    Transform _lilyHero;
+    Transform _georgeHero;
+    Transform _legacyJack;
+    Transform _legacyLily;
+    Transform _legacyGeorge;
+    bool _initialSetupDone;
+
+    public static void SetForcedCopyIndex(int copyIndex) => _forcedCopyIndex = copyIndex;
+    public static void ClearForcedCopyIndex() => _forcedCopyIndex = -1;
 
     public EnvTrainingTask Task => task;
     public int SimpleMaxSteps => simpleMaxSteps;
@@ -66,6 +80,9 @@ public sealed class EnvTrainingConfig : MonoBehaviour
 
     public EnvTrainingTask ResolveTask()
     {
+        if (_forcedCopyIndex >= 0)
+            return ResolveAutoTaskForCopyIndex(_forcedCopyIndex);
+
         if (task != EnvTrainingTask.Auto)
             return task;
 
@@ -192,8 +209,180 @@ public sealed class EnvTrainingConfig : MonoBehaviour
         _lastSetupFrame = Time.frameCount;
 
         var resolved = ResolveTask();
-        ApplyAgentRoles(resolved);
         ApplyTrainingCampfire(resolved);
+        ApplyAgentVisibility(resolved);
+        ApplyAgentRoles(resolved);
+    }
+
+    public void ApplyInitialSetup()
+    {
+        if (_initialSetupDone)
+            return;
+
+        _initialSetupDone = true;
+        var resolved = ResolveTask();
+        ApplyTrainingCampfire(resolved);
+        ApplyAgentVisibility(resolved);
+        if (TrainingEnvSpace.IsMlAgentsTrainingActive())
+            ApplyAgentRoles(resolved);
+    }
+
+    void EnsureHeroCache()
+    {
+        if (_heroCacheReady)
+            return;
+
+        _heroCacheReady = true;
+        var all = GetComponentsInChildren<Transform>(true);
+        for (int i = 0; i < all.Length; i++)
+        {
+            var t = all[i];
+            if (t == null)
+                continue;
+
+            switch (t.name)
+            {
+                case "JackHero": _jackHero = t; break;
+                case "LilyHero": _lilyHero = t; break;
+                case "GeorgeHero": _georgeHero = t; break;
+                case "Jack": _legacyJack = t; break;
+                case "Lily": _legacyLily = t; break;
+                case "George": _legacyGeorge = t; break;
+            }
+        }
+    }
+
+    void ApplyAgentVisibility(EnvTrainingTask resolved)
+    {
+        if (_visibilityTaskApplied == resolved)
+            return;
+
+        _visibilityTaskApplied = resolved;
+        EnsureHeroCache();
+        HideLegacyHeroShells();
+
+        bool showAll = resolved == EnvTrainingTask.PresentationFull;
+        SetRoleVisible(EnvTrainingAgentRole.Jack,
+            showAll || ShouldAgentTrain(resolved, EnvTrainingAgentRole.Jack));
+        SetRoleVisible(EnvTrainingAgentRole.Lily,
+            showAll || ShouldAgentTrain(resolved, EnvTrainingAgentRole.Lily));
+        SetRoleVisible(EnvTrainingAgentRole.George,
+            showAll || ShouldAgentTrain(resolved, EnvTrainingAgentRole.George));
+    }
+
+    /// <summary>После миграции Jack→JackHero старый Chuby-меш «Jack» часто остаётся включённым в сцене.</summary>
+    void HideLegacyHeroShells()
+    {
+        DisableLegacyIfHeroExists("Jack", "JackHero");
+        DisableLegacyIfHeroExists("Lily", "LilyHero");
+        DisableLegacyIfHeroExists("George", "GeorgeHero");
+    }
+
+    void DisableLegacyIfHeroExists(string legacyName, string heroName)
+    {
+        Transform hero = heroName switch
+        {
+            "JackHero" => _jackHero,
+            "LilyHero" => _lilyHero,
+            "GeorgeHero" => _georgeHero,
+            _ => FindChildByName(heroName),
+        };
+        if (hero == null)
+            return;
+
+        Transform legacy = legacyName switch
+        {
+            "Jack" => _legacyJack,
+            "Lily" => _legacyLily,
+            "George" => _legacyGeorge,
+            _ => FindChildByName(legacyName),
+        };
+        if (legacy == null || legacy == hero)
+            return;
+
+        if (legacy.gameObject.activeSelf)
+            legacy.gameObject.SetActive(false);
+    }
+
+    Transform FindChildByName(string objectName)
+    {
+        var transforms = GetComponentsInChildren<Transform>(true);
+        for (int i = 0; i < transforms.Length; i++)
+        {
+            if (transforms[i].name == objectName)
+                return transforms[i];
+        }
+
+        return null;
+    }
+
+    Transform FindRoleHero(EnvTrainingAgentRole role)
+    {
+        EnsureHeroCache();
+        return role switch
+        {
+            EnvTrainingAgentRole.Jack => _jackHero,
+            EnvTrainingAgentRole.Lily => _lilyHero,
+            EnvTrainingAgentRole.George => _georgeHero,
+            _ => null,
+        };
+    }
+
+    void SetRoleVisible(EnvTrainingAgentRole role, bool visible)
+    {
+        var hero = FindRoleHero(role);
+        if (hero != null)
+        {
+            if (hero.gameObject.activeSelf != visible)
+                hero.gameObject.SetActive(visible);
+            return;
+        }
+
+        if (role == EnvTrainingAgentRole.Jack)
+        {
+            var agents = GetComponentsInChildren<AgentGoToHouseDiscrete>(true);
+            for (int i = 0; i < agents.Length; i++)
+            {
+                var agent = agents[i];
+                if (agent == null || TrainingEnvSpace.IsGeorgeAgent(agent)
+                    || TwitchEphemeralEffects.IsTwitchClone(agent)
+                    || agent.gameObject.name == "Jack")
+                    continue;
+
+                if (agent.gameObject.activeSelf != visible)
+                    agent.gameObject.SetActive(visible);
+            }
+            return;
+        }
+
+        if (role == EnvTrainingAgentRole.Lily)
+        {
+            var lilies = GetComponentsInChildren<LilyScript>(true);
+            for (int i = 0; i < lilies.Length; i++)
+            {
+                var lily = lilies[i];
+                if (lily == null || TwitchEphemeralEffects.IsTwitchClone(lily)
+                    || lily.gameObject.name == "Lily")
+                    continue;
+
+                if (lily.gameObject.activeSelf != visible)
+                    lily.gameObject.SetActive(visible);
+            }
+            return;
+        }
+
+        var georges = GetComponentsInChildren<AgentGoToHouseDiscrete>(true);
+        for (int i = 0; i < georges.Length; i++)
+        {
+            var george = georges[i];
+            if (george == null || !TrainingEnvSpace.IsGeorgeAgent(george)
+                || TwitchEphemeralEffects.IsTwitchClone(george)
+                || george.gameObject.name == "George")
+                continue;
+
+            if (george.gameObject.activeSelf != visible)
+                george.gameObject.SetActive(visible);
+        }
     }
 
     void ApplyAgentRoles(EnvTrainingTask resolved)
@@ -205,12 +394,15 @@ public sealed class EnvTrainingConfig : MonoBehaviour
         for (int i = 0; i < agents.Length; i++)
         {
             var agent = agents[i];
-            if (agent == null || TwitchEphemeralEffects.IsTwitchClone(agent))
+            if (agent == null || !agent.gameObject.activeInHierarchy
+                || TwitchEphemeralEffects.IsTwitchClone(agent))
                 continue;
 
             var role = TrainingEnvSpace.IsGeorgeAgent(agent)
                 ? EnvTrainingAgentRole.George
                 : EnvTrainingAgentRole.Jack;
+            if (agent.gameObject.name == "Jack" || agent.gameObject.name == "George")
+                continue;
             SetAgentTrainingEnabled(agent, ShouldAgentTrain(resolved, role));
         }
 
@@ -218,7 +410,9 @@ public sealed class EnvTrainingConfig : MonoBehaviour
         for (int i = 0; i < lilies.Length; i++)
         {
             var lily = lilies[i];
-            if (lily == null || TwitchEphemeralEffects.IsTwitchClone(lily))
+            if (lily == null || !lily.gameObject.activeInHierarchy
+                || TwitchEphemeralEffects.IsTwitchClone(lily)
+                || lily.gameObject.name == "Lily")
                 continue;
 
             SetAgentTrainingEnabled(lily, ShouldAgentTrain(resolved, EnvTrainingAgentRole.Lily));
