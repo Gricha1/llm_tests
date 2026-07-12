@@ -9,8 +9,12 @@ public static class TrainingEnvSpace
 {
     static Transform _presentationRoot;
     static bool _parallelEnvsVisible;
+    static bool _streamOnlyMode;
+    static string _streamWeightsDirectory;
 
     public static bool ParallelEnvsVisible => _parallelEnvsVisible;
+    public static bool IsStreamOnlyMode => _streamOnlyMode;
+    public static string StreamWeightsDirectory => _streamWeightsDirectory;
 
     /// <summary>Показать рендер копий Env (1)… для отладки в Play. Env var FOREST_SHOW_PARALLEL_ENVS=1 или -forestShowParallelEnvs.</summary>
     public static bool IsShowParallelEnvsRequested()
@@ -52,10 +56,71 @@ public static class TrainingEnvSpace
         return Unity.MLAgents.Academy.Instance.IsCommunicatorOn;
     }
 
+    static bool IsTruthyEnv(string value) =>
+        value == "1" || string.Equals(value, "true", System.StringComparison.OrdinalIgnoreCase);
+
+    static void InitStreamSettings()
+    {
+        _streamOnlyMode = IsTruthyEnv(System.Environment.GetEnvironmentVariable("FOREST_STREAM_ONLY"));
+        if (!_streamOnlyMode)
+        {
+            foreach (var arg in System.Environment.GetCommandLineArgs())
+            {
+                if (arg == "-forestStreamOnly" || arg == "--forest-stream-only")
+                {
+                    _streamOnlyMode = true;
+                    break;
+                }
+            }
+        }
+
+        _streamWeightsDirectory = _streamOnlyMode
+            ? ReadForestStreamWeightsDirFromArgs()
+            : null;
+    }
+
+    static string ReadForestStreamWeightsDirFromArgs()
+    {
+        var env = System.Environment.GetEnvironmentVariable("FOREST_STREAM_WEIGHTS_DIR");
+        if (!string.IsNullOrWhiteSpace(env))
+            return env.Trim();
+
+        var args = System.Environment.GetCommandLineArgs();
+        for (int i = 0; i < args.Length; i++)
+        {
+            if ((args[i] == "-forestStreamWeightsDir" || args[i] == "--forest-stream-weights-dir")
+                && i + 1 < args.Length)
+                return args[i + 1].Trim();
+        }
+
+        return null;
+    }
+
+    static void ApplyStreamOnlyEnvFilter()
+    {
+        _presentationRoot = null;
+        var presentation = PresentationRoot;
+
+        foreach (var envRoot in FindAllEnvRoots())
+        {
+            if (envRoot == null)
+                continue;
+
+            bool keep = presentation != null && envRoot == presentation;
+            if (envRoot.gameObject.activeSelf != keep)
+                envRoot.gameObject.SetActive(keep);
+        }
+
+        _presentationRoot = null;
+    }
+
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
     static void ConfigureParallelEnvPresentation()
     {
         _presentationRoot = null;
+        InitStreamSettings();
+        if (_streamOnlyMode)
+            ApplyStreamOnlyEnvFilter();
         _parallelEnvsVisible = IsShowParallelEnvsRequested();
         ApplyParallelEnvPresentation();
         EnsureTrainingConfigs();
@@ -65,16 +130,29 @@ public static class TrainingEnvSpace
     static void ApplyParallelEnvPresentation()
     {
         var presentation = PresentationRoot;
-        if (presentation == null)
-            return;
 
         foreach (var envRoot in FindAllEnvRoots())
         {
+            if (envRoot == null || !envRoot.gameObject.activeInHierarchy)
+                continue;
+
+            if (_streamOnlyMode)
+            {
+                if (envRoot == presentation)
+                    UnmuteEnvPresentation(envRoot, enableCameraAndAudio: true);
+                else
+                    MuteEnvPresentation(envRoot);
+                continue;
+            }
+
+            if (presentation == null)
+                return;
+
             if (envRoot == presentation)
                 continue;
 
             if (_parallelEnvsVisible)
-                UnmuteEnvPresentation(envRoot);
+                UnmuteEnvPresentation(envRoot, enableCameraAndAudio: false);
             else
                 MuteEnvPresentation(envRoot);
         }
@@ -476,7 +554,7 @@ public static class TrainingEnvSpace
             renderer.enabled = false;
     }
 
-    static void UnmuteEnvPresentation(Transform envRoot)
+    static void UnmuteEnvPresentation(Transform envRoot, bool enableCameraAndAudio = false)
     {
         foreach (var canvas in envRoot.GetComponentsInChildren<Canvas>(true))
             canvas.enabled = true;
@@ -485,10 +563,10 @@ public static class TrainingEnvSpace
             audio.mute = false;
 
         foreach (var cam in envRoot.GetComponentsInChildren<Camera>(true))
-            cam.enabled = false;
+            cam.enabled = enableCameraAndAudio;
 
         foreach (var listener in envRoot.GetComponentsInChildren<AudioListener>(true))
-            listener.enabled = false;
+            listener.enabled = enableCameraAndAudio;
 
         foreach (var light in envRoot.GetComponentsInChildren<Light>(true))
             light.enabled = true;
