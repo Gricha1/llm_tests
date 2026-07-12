@@ -23,5 +23,9 @@ rsync -avz --progress -e "${RSYNC_SSH}" \
   train_scripts/ "${REMOTE}:${REMOTE_DIR}/train_scripts/"
 rsync -avz --progress -e "${RSYNC_SSH}" \
   custom_configs/ "${REMOTE}:${REMOTE_DIR}/custom_configs/"
+rsync -avz --progress -e "${RSYNC_SSH}" \
+  stream_inference_watch.bash \
+  train_headless_jack_lily_george.bash \
+  "${REMOTE}:${REMOTE_DIR}/"
 
 echo "[sync] done"

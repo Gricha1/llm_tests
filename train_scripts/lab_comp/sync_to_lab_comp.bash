@@ -44,7 +44,4 @@ rsync -avz --progress -e "${RSYNC_SSH}" "${RSYNC_EXCLUDES[@]}" \
 echo "[sync] готово. На сервере:"
 echo "  ssh -i ${SSH_KEY} ${REMOTE}"
 echo "  cd ${REMOTE_DIR}"
-echo "  bash train_scripts/lab_comp/train_jack_lily_george.bash"
-echo ""
-echo "Или с Windows одной командой:"
-echo "  wsl bash train_scripts/lab_comp/deploy_jack_lily_george.bash --start"
+echo "  bash train_jack_lily_george.bash"

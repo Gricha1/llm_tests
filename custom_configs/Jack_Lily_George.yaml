@@ -3,8 +3,7 @@
 #   JackLowLevelAgent, LilyLowLevelAgent, GeorgeLowLevelAgent (Behavior Type = Default).
 #
 # Запуск:
-#   bash train_scripts/train_jack_lily_george.bash
-#   bash train_scripts/train_jack_lily_george.bash <build_folder> 20
+#   bash train_jack_lily_george.bash
 
 default_settings: null
 behaviors:
@@ -22,7 +21,7 @@ behaviors:
       learning_rate_schedule: linear
       beta_schedule: linear
       epsilon_schedule: linear
-    checkpoint_interval: 50000
+    checkpoint_interval: 5000
     network_settings:
       normalize: false
       hidden_units: 256
@@ -67,7 +66,7 @@ behaviors:
       learning_rate_schedule: linear
       beta_schedule: linear
       epsilon_schedule: linear
-    checkpoint_interval: 50000
+    checkpoint_interval: 5000
     network_settings:
       normalize: false
       hidden_units: 256
@@ -112,7 +111,7 @@ behaviors:
       learning_rate_schedule: linear
       beta_schedule: linear
       epsilon_schedule: linear
-    checkpoint_interval: 50000
+    checkpoint_interval: 5000
     network_settings:
       normalize: false
       hidden_units: 256
