@@ -67,7 +67,10 @@ public class LilyBullet : MonoBehaviour
         if (hitJack)
         {
             if (jackAgent != null)
+            {
                 jackAgent.TakeDamage(damage);
+                HeroDamageFeedback.Play(jackAgent.transform);
+            }
             Destroy(gameObject);
         }
     }

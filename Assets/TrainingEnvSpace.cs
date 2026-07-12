@@ -107,8 +107,8 @@ public static class TrainingEnvSpace
     {
         foreach (var envRoot in FindAllEnvRoots())
         {
-            if (envRoot.GetComponent<JackEnvTrainingConfig>() == null)
-                envRoot.gameObject.AddComponent<JackEnvTrainingConfig>();
+            if (envRoot.GetComponent<EnvTrainingConfig>() == null)
+                envRoot.gameObject.AddComponent<EnvTrainingConfig>();
         }
     }
 
@@ -145,7 +145,42 @@ public static class TrainingEnvSpace
         var root = PresentationRoot;
         if (root == null)
             return Object.FindObjectOfType<T>();
-        return root.GetComponentInChildren<T>(true);
+
+        T inactiveFallback = null;
+        foreach (var c in root.GetComponentsInChildren<T>(true))
+        {
+            if (c == null)
+                continue;
+            if (c.gameObject.activeInHierarchy)
+                return c;
+            if (inactiveFallback == null)
+                inactiveFallback = c;
+        }
+
+        return inactiveFallback;
+    }
+
+    public static LilyScript FindPresentationLily()
+    {
+        var root = PresentationRoot;
+        if (root == null)
+            return Object.FindObjectOfType<LilyScript>();
+
+        LilyScript hero = null;
+        LilyScript anyActive = null;
+        foreach (var lily in root.GetComponentsInChildren<LilyScript>(true))
+        {
+            if (lily == null || !lily.isActiveAndEnabled)
+                continue;
+
+            anyActive ??= lily;
+            if (lily.gameObject.name.IndexOf("Hero", System.StringComparison.OrdinalIgnoreCase) >= 0)
+                hero = lily;
+        }
+
+        if (hero != null)
+            return hero;
+        return anyActive;
     }
 
     public static bool IsGeorgeAgent(AgentGoToHouseDiscrete agent)
@@ -243,14 +278,26 @@ public static class TrainingEnvSpace
             ? root.GetComponentsInChildren<AgentGoToHouseDiscrete>(false)
             : Object.FindObjectsOfType<AgentGoToHouseDiscrete>();
 
+        AgentGoToHouseDiscrete hero = null;
+        AgentGoToHouseDiscrete primary = null;
+
         for (int i = 0; i < agents.Length; i++)
         {
             var agent = agents[i];
-            if (agent != null && IsGeorgeAgent(agent))
-                return agent;
+            if (agent == null || !IsGeorgeAgent(agent))
+                continue;
+
+            if (agent.gameObject.name == "GeorgeHero" && agent.gameObject.activeInHierarchy)
+                hero = agent;
+            else if (agent.gameObject.name == "George")
+                primary = agent;
+            else if (primary == null)
+                primary = agent;
         }
 
-        return null;
+        if (hero != null)
+            return hero;
+        return primary;
     }
 
     public static Transform FindRoot(Transform from)

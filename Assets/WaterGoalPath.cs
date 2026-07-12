@@ -131,6 +131,16 @@ public sealed class WaterGoalPath : MonoBehaviour
         return true;
     }
 
+    public bool HasCompletedPath(Transform agent)
+    {
+        if (agent == null || !HasAnyGoal())
+            return false;
+
+        AgentProgress progress = GetProgress(agent);
+        AdvancePastMissingGoals(progress);
+        return progress.CurrentIndex >= _goals.Length;
+    }
+
     void Initialize()
     {
         if (_initialized)

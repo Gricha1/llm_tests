@@ -127,13 +127,7 @@ public sealed class HudHpBars : MonoBehaviour
     static AgentGoToHouseDiscrete FindActiveJack() =>
         TrainingEnvSpace.FindPresentationJack();
 
-    static LilyScript FindActiveLily()
-    {
-        var root = TrainingEnvSpace.PresentationRoot;
-        if (root != null)
-            return root.GetComponentInChildren<LilyScript>(false);
-        return FindObjectOfType<LilyScript>();
-    }
+    static LilyScript FindActiveLily() => TrainingEnvSpace.FindPresentationLily();
 
     void LayoutRoot()
     {

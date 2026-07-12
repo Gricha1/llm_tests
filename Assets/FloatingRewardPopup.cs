@@ -89,6 +89,9 @@ public sealed class FloatingRewardPopup : MonoBehaviour
     public static void ShowKissedJack(Transform agent, float rewardAmount) =>
         ShowCustom(agent, WithReward("пoцеловала джека", rewardAmount), TaskColor);
 
+    public static void ShowKissedGeorge(Transform agent, float rewardAmount) =>
+        ShowCustom(agent, WithReward("пoцеловала геру", rewardAmount), TaskColor);
+
     public static void ShowZombieKill(Transform agent, float rewardAmount) =>
         ShowCustom(agent, WithReward("убил зомби", rewardAmount), KillColor);
 

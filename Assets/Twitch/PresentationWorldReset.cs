@@ -28,8 +28,8 @@ public static class PresentationWorldReset
         treeSpawner?.ResetTrees();
         sheepSpawner?.ResetSheep();
 
-        var envConfig = envRoot.GetComponent<JackEnvTrainingConfig>();
-        if (envConfig == null || envConfig.ResolveMode() != JackTrainingMode.ZombieOnly)
+        var envConfig = envRoot.GetComponent<EnvTrainingConfig>();
+        if (envConfig == null || envConfig.ResolveJackMode() != JackTrainingMode.ZombieOnly)
         {
             foreach (var zombieSpawner in envRoot.GetComponentsInChildren<ZombieSpawner>(true))
             {

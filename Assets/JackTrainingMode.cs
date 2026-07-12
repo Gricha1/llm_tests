@@ -3,7 +3,7 @@
 /// </summary>
 public enum JackTrainingMode
 {
-  /// <summary>Presentation Env — стрим. Копии: Env→wood, Env (1)→food, Env (2)→wood, Env (3)→wood+food, Env (4)→zombie.</summary>
+  /// <summary>Presentation Env — стрим. Auto: Env (1) wood … Env (11) George heat.</summary>
   Auto,
   /// <summary>Survival, utility, зомби — для стрима.</summary>
   Full,
@@ -11,7 +11,9 @@ public enum JackTrainingMode
   WoodOnly,
   /// <summary>Только еда (овцы), короткий эпизод.</summary>
   FoodOnly,
-  /// <summary>Дерево + еда с переключением utility (без зомби). Env (3).</summary>
+  /// <summary>Только вода (GoalWater + источник), короткий эпизод.</summary>
+  WaterOnly,
+  /// <summary>Дерево + еда с переключением utility (без зомби).</summary>
   WoodFoodSwitch,
   /// <summary>Только драка с зомби, спавнер зомби всегда активен.</summary>
   ZombieOnly

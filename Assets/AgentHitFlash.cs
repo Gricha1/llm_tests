@@ -3,13 +3,13 @@ using System.Collections.Generic;
 using UnityEngine;
 
 /// <summary>
-/// Краткое покраснение модели при получении урона (≈0.5 с).
+/// Краткое покраснение модели при получении урона.
 /// </summary>
 public sealed class AgentHitFlash : MonoBehaviour
 {
-    [SerializeField] private float flashDuration = 0.5f;
-    [SerializeField] private Color hitTint = new Color(1f, 0.22f, 0.22f, 1f);
-    [SerializeField] [Range(0.1f, 1f)] private float redBlend = 0.65f;
+    [SerializeField] private float flashDuration = 0.35f;
+    [SerializeField] private Color hitTint = new Color(1f, 0.15f, 0.15f, 1f);
+    [SerializeField] [Range(0.1f, 1f)] private float redBlend = 0.85f;
 
     struct SlotState
     {
@@ -21,6 +21,7 @@ public sealed class AgentHitFlash : MonoBehaviour
 
     static readonly int BaseColorId = Shader.PropertyToID("_BaseColor");
     static readonly int ColorId = Shader.PropertyToID("_Color");
+    static readonly int MainColorId = Shader.PropertyToID("_MainColor");
 
     SlotState[] _slots;
     MaterialPropertyBlock _mpb;
@@ -40,6 +41,19 @@ public sealed class AgentHitFlash : MonoBehaviour
         CacheRenderers();
     }
 
+    static int ResolveColorPropId(Material mat)
+    {
+        if (mat == null)
+            return -1;
+        if (mat.HasProperty(BaseColorId))
+            return BaseColorId;
+        if (mat.HasProperty(ColorId))
+            return ColorId;
+        if (mat.HasProperty(MainColorId))
+            return MainColorId;
+        return -1;
+    }
+
     void CacheRenderers()
     {
         var list = new List<SlotState>();
@@ -55,14 +69,7 @@ public sealed class AgentHitFlash : MonoBehaviour
             for (int i = 0; i < mats.Length; i++)
             {
                 var mat = mats[i];
-                if (mat == null)
-                    continue;
-
-                int propId = mat.HasProperty(BaseColorId)
-                    ? BaseColorId
-                    : mat.HasProperty(ColorId)
-                        ? ColorId
-                        : -1;
+                int propId = ResolveColorPropId(mat);
                 if (propId < 0)
                     continue;
 
@@ -93,19 +100,14 @@ public sealed class AgentHitFlash : MonoBehaviour
 
     IEnumerator FlashRoutine()
     {
-        float half = flashDuration * 0.5f;
         float t = 0f;
+        ApplyBlend(redBlend);
 
         while (t < flashDuration)
         {
-            t += Time.deltaTime;
-            float blend;
-            if (t <= half)
-                blend = (half > 0f ? t / half : 1f) * redBlend;
-            else
-                blend = (half > 0f ? 1f - (t - half) / half : 0f) * redBlend;
-
-            ApplyBlend(blend);
+            t += Time.unscaledDeltaTime;
+            float k = flashDuration > 1e-4f ? t / flashDuration : 1f;
+            ApplyBlend(redBlend * (1f - k * k));
             yield return null;
         }
 
@@ -115,6 +117,10 @@ public sealed class AgentHitFlash : MonoBehaviour
 
     void ApplyBlend(float blend)
     {
+        if (_slots == null)
+            return;
+
+        blend = Mathf.Clamp01(blend);
         for (int i = 0; i < _slots.Length; i++)
         {
             var slot = _slots[i];
@@ -130,6 +136,9 @@ public sealed class AgentHitFlash : MonoBehaviour
 
     void ClearTint()
     {
+        if (_slots == null)
+            return;
+
         for (int i = 0; i < _slots.Length; i++)
         {
             var slot = _slots[i];

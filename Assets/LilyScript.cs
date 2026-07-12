@@ -18,6 +18,12 @@ public class LilyScript : Agent, IHasHp
 
     private int currentOption;
 
+    EnvTrainingConfig _trainingConfig;
+    EnvTrainingTask _resolvedLilyTask = EnvTrainingTask.PresentationFull;
+
+    bool IsLilySimpleTraining =>
+        _trainingConfig != null && _trainingConfig.IsLilySimpleTask();
+
     [Header("Option Sampling (Flowers/Kiss)")]
     [Tooltip("Если true, опция (цветы/поцелуй) выбирается по utility+softmax sampling каждые 20 шагов.")]
     [SerializeField] private bool useUtilitySoftmaxSampling = false;
@@ -68,6 +74,8 @@ public class LilyScript : Agent, IHasHp
     [SerializeField] [Range(0f, 1f)] private float kissMinForwardDot = 0.5f; // ~60°
     [SerializeField] private float kissReward = 10f;
     [SerializeField] private float moveTowardsJackRewardScale = 0.3f;
+    [Tooltip("На сколько секунд замирает Jack/George после поцелуя Lily.")]
+    [SerializeField] private float kissVictimStunSeconds = 1f;
 
     [Header("Flower Spawner")]
     [SerializeField] private FlowerSpawner flowerSpawner;
@@ -247,9 +255,20 @@ public class LilyScript : Agent, IHasHp
     {
         if (option != OptionFlower && option != OptionKiss && option != OptionWater && option != OptionFood && option != OptionHeat)
             return;
+
+        int prevOption = currentOption;
+        if (option == OptionWater && prevOption != OptionWater)
+            WaterGoalPath.Get(transform)?.ResetAgent(transform);
+
         currentOption = option;
         EnsureOptionIconRenderer();
         UpdateOptionIconVisual();
+    }
+
+    static void ResetWaterPathIfEntered(int prevOption, int newOption, Transform agent)
+    {
+        if (newOption == OptionWater && prevOption != OptionWater)
+            WaterGoalPath.Get(agent)?.ResetAgent(agent);
     }
 
     public override void Initialize()
@@ -421,7 +440,10 @@ public class LilyScript : Agent, IHasHp
     private void Update()
     {
         if (_doCooldownRemaining > 0f)
-            _doCooldownRemaining -= Time.deltaTime;
+            _doCooldownRemaining -= Time.unscaledDeltaTime;
+
+        if (!TrainingEnvSpace.IsPresentationTransform(transform))
+            return;
 
         UpdateDehydration();
         UpdateWaterDecay();
@@ -445,7 +467,7 @@ public class LilyScript : Agent, IHasHp
         if (_deathSequenceStarted)
             return;
 
-        waterDecayTimer += Time.deltaTime;
+        waterDecayTimer += Time.unscaledDeltaTime;
         if (waterDecayTimer < waterDecayInterval)
             return;
 
@@ -484,18 +506,32 @@ public class LilyScript : Agent, IHasHp
 
     private bool _deathSequenceStarted;
 
+    public void ApplyFriendlyKnockbackFrom(Vector3 attackerWorldPos, float distance, float up)
+    {
+        Vector3 dir = transform.position - attackerWorldPos;
+        dir.y = 0f;
+        if (dir.sqrMagnitude < 1e-4f)
+            dir = transform.forward;
+        dir.Normalize();
+
+        Vector3 delta = dir * distance + Vector3.up * up;
+        if (controller != null && controller.enabled)
+            controller.Move(delta);
+        else
+            transform.position += delta;
+    }
+
     public void TakeDamage(int amount)
     {
         if (amount <= 0 || _deathSequenceStarted) return;
         hp = Mathf.Max(0, hp - amount);
-        AgentHitFlash.GetOrCreate(gameObject).Flash();
         if (hpLossPenaltyPerHit != 0f)
             AddReward(-hpLossPenaltyPerHit);
         if (hp <= 0)
         {
             _deathSequenceStarted = true;
             EvalEpisodeTracker.NotifyEpisodeEnded();
-            AgentDeathOverlay.ShowAndEndEpisode(this, "Лили погибла");
+            AgentDeathOverlay.ShowAndEndEpisode(this, AgentDeathOverlay.GetDeathMessageFor(this));
         }
     }
 
@@ -510,6 +546,7 @@ public class LilyScript : Agent, IHasHp
         }
 
         stepCount = 0;
+        _episodeStartTime = Time.unscaledTime;
         prevPosition = transform.position;
         prevFlowerDist = -1f;
         prevJackDist = -1f;
@@ -537,10 +574,26 @@ public class LilyScript : Agent, IHasHp
         prevHouseDist = -1f;
         WaterGoalPath.Get(transform)?.ResetAgent(transform);
 
-        ConfigurePresentationControl();
+        ConfigureTrainingControl();
 
-        // Опция: либо utility+softmax, либо случайно
-        if (useUtilitySoftmaxSampling)
+        _trainingConfig = EnvTrainingConfig.Get(transform);
+        _resolvedLilyTask = _trainingConfig != null
+            ? _trainingConfig.ResolveTask()
+            : EnvTrainingTask.PresentationFull;
+        _trainingConfig?.ApplyForEpisodeBegin();
+
+        if (IsLilySimpleTraining)
+        {
+            currentOption = _trainingConfig.ResolveFixedLilyOption();
+            MaxStep = _trainingConfig.SimpleMaxSteps;
+            if (_trainingConfig.FreezeNeeds)
+            {
+                Satiety = maxSatiety / 2;
+                Heat = startHeat;
+                WaterCount = 6;
+            }
+        }
+        else if (useUtilitySoftmaxSampling)
             currentOption = SampleOptionUtilitySoftmax(currentOption);
         else
             currentOption = Random.Range(0, OptionCount);
@@ -587,24 +640,43 @@ public class LilyScript : Agent, IHasHp
         if (flowerSpawner != null)
             flowerSpawner.ResetFlowers();
 
+        if (IsLilySimpleTraining)
+        {
+            var envRoot = TrainingEnvSpace.FindRoot(transform);
+            PresentationWorldReset.ResetSpawners(envRoot);
+        }
+
         UpdateOptionIconVisual();
     }
 
-    void ConfigurePresentationControl()
+    void ConfigureTrainingControl()
     {
-        if (!TrainingEnvSpace.IsPresentationTransform(transform))
-            return;
-
         var bp = GetComponent<BehaviorParameters>();
         if (bp == null)
             return;
 
-        bool training = Academy.IsInitialized && Academy.Instance.IsCommunicatorOn;
-        bp.BehaviorType = training ? BehaviorType.Default : BehaviorType.HeuristicOnly;
+        bool mlTraining = Academy.IsInitialized && Academy.Instance.IsCommunicatorOn;
+        var config = EnvTrainingConfig.Get(transform);
+        var task = config != null ? config.ResolveTask() : EnvTrainingTask.PresentationFull;
+        bool trainThisAgent = !mlTraining
+            ? TrainingEnvSpace.IsPresentationTransform(transform)
+            : EnvTrainingConfig.ShouldAgentTrain(task, EnvTrainingAgentRole.Lily);
+
+        bp.BehaviorType = trainThisAgent && mlTraining
+            ? BehaviorType.Default
+            : BehaviorType.HeuristicOnly;
 
         var decisionRequester = GetComponent<DecisionRequester>();
         if (decisionRequester != null)
-            decisionRequester.DecisionPeriod = training ? 5 : 1;
+        {
+            decisionRequester.enabled = trainThisAgent && mlTraining;
+            decisionRequester.DecisionPeriod = mlTraining ? 5 : 1;
+        }
+    }
+
+    void ConfigurePresentationControl()
+    {
+        ConfigureTrainingControl();
     }
 
     static bool IsManualControlActive(Transform t)
@@ -627,7 +699,7 @@ public class LilyScript : Agent, IHasHp
             return;
         }
 
-        _thirstTimer += Time.deltaTime;
+        _thirstTimer += Time.unscaledDeltaTime;
         if (_thirstTimer < thirstDamageInterval)
             return;
 
@@ -658,36 +730,126 @@ public class LilyScript : Agent, IHasHp
     private float GetDistanceToJack(out Vector3 dirToJack)
     {
         dirToJack = Vector3.zero;
-        if (jackTarget == null) return float.MaxValue;
-        Vector3 delta = jackTarget.position - transform.position;
+        Transform target = ResolveJackKissTransform();
+        if (target == null) return float.MaxValue;
+        Vector3 delta = target.position - transform.position;
         delta.y = 0f;
         float d = delta.magnitude;
         if (d > 0.001f) dirToJack = delta.normalized;
         return d;
     }
 
-    private bool IsJackInKissRange()
+    Transform ResolveJackKissTransform()
     {
-        if (jackTarget == null) return false;
+        var jack = FindJackInEnv();
+        if (jack != null)
+            return jack.transform;
+        if (jackTarget != null && jackTarget.gameObject.activeInHierarchy)
+            return jackTarget;
+        return jackTarget;
+    }
+
+    private bool IsJackInKissRange() => IsKissPartnerInRange(FindJackInEnv());
+
+    private bool IsAnyKissTargetInRange()
+    {
+        if (IsKissPartnerInRange(FindJackInEnv()))
+            return true;
+        return IsKissPartnerInRange(FindGeorgeInEnv());
+    }
+
+    private bool IsKissPartnerInRange(AgentGoToHouseDiscrete partner)
+    {
+        if (partner == null)
+            return false;
+        return IsTargetInKissRange(partner.transform);
+    }
+
+    private bool IsTargetInKissRange(Transform target)
+    {
+        if (target == null) return false;
         Vector3 p = transform.position;
-        Vector3 j = jackTarget.position;
+        Vector3 j = target.position;
         p.y = 0f;
         j.y = 0f;
         Vector3 delta = j - p;
         float d = delta.magnitude;
         if (d <= 0.0001f) return true;
-        Vector3 toJack = delta / d;
+        Vector3 toTarget = delta / d;
         Vector3 fwd = transform.forward;
         fwd.y = 0f;
         if (fwd.sqrMagnitude > 1e-6f) fwd.Normalize();
-        float dot = Vector3.Dot(fwd, toJack);
+        float dot = Vector3.Dot(fwd, toTarget);
         if (kissMinForwardDot > 0f && dot < kissMinForwardDot) return false;
         if (d <= kissDistance) return true;
+        if (jackLayer.value == 0) return false;
         Collider[] hits = Physics.OverlapSphere(transform.position, kissDistance, jackLayer);
         foreach (var h in hits)
-            if (h != null && (h.transform == jackTarget || h.transform.IsChildOf(jackTarget)))
+            if (h != null && (h.transform == target || h.transform.IsChildOf(target)))
                 return true;
         return false;
+    }
+
+    private bool TryPerformKiss(out bool kissedGeorge)
+    {
+        kissedGeorge = false;
+        var jack = FindJackInEnv();
+        var george = FindGeorgeInEnv();
+        Transform jackTransform = jack != null ? jack.transform : ResolveJackKissTransform();
+        bool jackInRange = jackTransform != null && IsTargetInKissRange(jackTransform);
+        bool georgeInRange = george != null && IsTargetInKissRange(george.transform);
+        if (!jackInRange && !georgeInRange)
+            return false;
+
+        Transform kissTarget;
+        if (jackInRange && georgeInRange)
+        {
+            float jackDist = GetDistanceToTransform(jackTransform, out _);
+            float georgeDist = GetDistanceToTransform(george.transform, out _);
+            if (georgeDist < jackDist)
+            {
+                kissTarget = george.transform;
+                kissedGeorge = true;
+            }
+            else
+            {
+                kissTarget = jackTransform;
+            }
+        }
+        else if (georgeInRange)
+        {
+            kissTarget = george.transform;
+            kissedGeorge = true;
+        }
+        else
+        {
+            kissTarget = jackTransform;
+        }
+
+        Love = Mathf.Min(maxLove, Love + 1);
+        AddReward(kissReward);
+        GameSfx.PlayLilyKiss(source: transform);
+        if (kissedGeorge)
+            FloatingRewardPopup.ShowKissedGeorge(transform, kissReward);
+        else
+            FloatingRewardPopup.ShowKissedJack(transform, kissReward);
+
+        var stunned = kissTarget.GetComponentInParent<AgentGoToHouseDiscrete>();
+        if (stunned != null)
+            stunned.StunForSeconds(kissVictimStunSeconds);
+
+        return true;
+    }
+
+    private float GetDistanceToTransform(Transform target, out Vector3 dirToTarget)
+    {
+        dirToTarget = Vector3.zero;
+        if (target == null) return float.MaxValue;
+        Vector3 delta = target.position - transform.position;
+        delta.y = 0f;
+        float d = delta.magnitude;
+        if (d > 0.001f) dirToTarget = delta.normalized;
+        return d;
     }
 
     private bool GetNearestZombie(out GameObject nearestZombie, out float distance)
@@ -869,8 +1031,8 @@ public class LilyScript : Agent, IHasHp
             sensor.AddObservation(0f);
         }
 
-        // Джек в радиусе поцелуя (как IsJackInKissRange / kissDistance + jackLayer)
-        sensor.AddObservation(IsJackInKissRange() ? 1f : 0f);
+        // Цель поцелуя (Jack или George) в радиусе
+        sensor.AddObservation(IsAnyKissTargetInRange() ? 1f : 0f);
 
         // Зомби — только через лидар (компонент на агенте)
     }
@@ -893,9 +1055,11 @@ public class LilyScript : Agent, IHasHp
         }
 
         // Utility sampling: пересэмпливаем каждые 20 шагов (если включено)
-        if (useUtilitySoftmaxSampling && stepCount > 0 && (stepCount % 20) == 0)
+        if (!IsLilySimpleTraining && useUtilitySoftmaxSampling && stepCount > 0 && (stepCount % 20) == 0)
         {
+            int prevOption = currentOption;
             currentOption = SampleOptionUtilitySoftmax(currentOption);
+            ResetWaterPathIfEntered(prevOption, currentOption, transform);
             UpdateOptionIconVisual();
         }
 
@@ -914,15 +1078,23 @@ public class LilyScript : Agent, IHasHp
         if (collectReady && animator != null && doActionAnimTrigger.Length > 0)
             animator.SetTrigger(doActionAnimTrigger);
 
+        bool collectedWaterThisStep = false;
+        bool ateSheepThisStep = false;
+        bool collectedFlowerThisStep = false;
+
         if (collectReady)
         {
             if (damageOnDoIfZombieNearby && zombieDamageOnDo > 0 && IsZombieNearbyForDo())
+            {
                 TakeDamage(zombieDamageOnDo);
+                HeroDamageFeedback.Play(transform);
+            }
             if (knockbackZombieOnDo)
                 KnockbackNearbyZombiesOnLilyDo();
 
             if (TryCollectWater())
             {
+                collectedWaterThisStep = true;
                 if (waterCollectReward != 0f)
                 {
                     AddReward(waterCollectReward);
@@ -933,6 +1105,7 @@ public class LilyScript : Agent, IHasHp
 
             if (TryEatSheep())
             {
+                ateSheepThisStep = true;
                 GameSfx.PlayFood(source: transform);
                 FloatingRewardPopup.ShowGotFood(transform, 10f);
             }
@@ -966,9 +1139,12 @@ public class LilyScript : Agent, IHasHp
         AddReward(stepPenalty);
         
         // Reward for facing Jack (dense shaping): only for option "kiss" (1) and when Jack is known.
-        if (currentOption == 1 && lookAtJackRewardScale != 0f && jackTarget != null)
+        if (currentOption == 1 && lookAtJackRewardScale != 0f)
         {
-            Vector3 toJack = jackTarget.position - transform.position;
+            Transform lookTarget = ResolveJackKissTransform();
+            if (lookTarget != null)
+            {
+            Vector3 toJack = lookTarget.position - transform.position;
             toJack.y = 0f;
             if (toJack.sqrMagnitude > 1e-6f)
             {
@@ -983,6 +1159,7 @@ public class LilyScript : Agent, IHasHp
                     float t = (dot - lookAtJackMinDot) / Mathf.Max(1e-6f, 1f - lookAtJackMinDot);
                     AddReward(lookAtJackRewardScale * Mathf.Clamp01(t));
                 }
+            }
             }
         }
 
@@ -1009,6 +1186,7 @@ public class LilyScript : Agent, IHasHp
 
             if (collected)
             {
+                collectedFlowerThisStep = true;
                 FlowerCount = Mathf.Min(maxFlowerCount, FlowerCount + 1);
                 AddReward(collectReward);
                 FloatingRewardPopup.ShowCollectedFlower(transform, collectReward);
@@ -1031,14 +1209,11 @@ public class LilyScript : Agent, IHasHp
         {
             // Опция: поцелуй — один раз на фронте DO + кулдаун, в радиусе поцелуя
             float currJackDist = GetDistanceToJack(out _);
-            if (collectReady && IsJackInKissRange())
+            if (collectReady && TryPerformKiss(out _))
             {
-                Love = Mathf.Min(maxLove, Love + 1);
-                AddReward(kissReward);
-                FloatingRewardPopup.ShowKissedJack(transform, kissReward);
                 prevJackDist = -1f;
             }
-            else if (jackTarget != null)
+            else if (ResolveJackKissTransform() != null)
             {
                 if (prevJackDist > 0f)
                     AddReward((prevJackDist - currJackDist) * moveTowardsJackRewardScale);
@@ -1120,11 +1295,58 @@ public class LilyScript : Agent, IHasHp
         prevPosition = transform.position;
 
         stepCount++;
-        if (MaxStep > 0 && stepCount >= MaxStep)
+        if (IsLilySimpleTraining)
+        {
+            TryEndLilySimpleTrainingEpisode(
+                collectedFlowerThisStep,
+                collectedWaterThisStep,
+                ateSheepThisStep);
+        }
+        else if (MaxStep > 0 && stepCount >= MaxStep)
         {
             EvalEpisodeTracker.NotifyEpisodeEnded();
             EndEpisode();
         }
+    }
+
+    private float _episodeStartTime;
+
+    void TryEndLilySimpleTrainingEpisode(bool collectedFlower, bool collectedWater, bool ateSheep)
+    {
+        if (_trainingConfig == null)
+            return;
+
+        if (_trainingConfig.StepPenalty != 0f)
+            AddReward(_trainingConfig.StepPenalty);
+
+        if (_trainingConfig.EndOnSuccess)
+        {
+            switch (_trainingConfig.ResolveTask())
+            {
+                case EnvTrainingTask.LilyFlower when collectedFlower:
+                case EnvTrainingTask.LilyFood when ateSheep:
+                case EnvTrainingTask.LilyWater when collectedWater || IsLilyWaterPathComplete():
+                case EnvTrainingTask.LilyHeat when IsOnHouse() && IsCampfireBurningInEnv():
+                    if (_trainingConfig.SuccessReward != 0f)
+                        AddReward(_trainingConfig.SuccessReward);
+                    EvalEpisodeTracker.NotifyEpisodeEnded();
+                    EndEpisode();
+                    return;
+            }
+        }
+
+        if (_trainingConfig.SimpleEpisodeTimeoutSeconds > 0f
+            && Time.unscaledTime - _episodeStartTime >= _trainingConfig.SimpleEpisodeTimeoutSeconds)
+        {
+            EvalEpisodeTracker.NotifyEpisodeEnded();
+            EndEpisode();
+        }
+    }
+
+    bool IsLilyWaterPathComplete()
+    {
+        var path = WaterGoalPath.Get(transform);
+        return path != null && path.HasCompletedPath(transform);
     }
 
     private int SampleOptionUtilitySoftmax(int currentOpt)
@@ -1288,21 +1510,67 @@ public class LilyScript : Agent, IHasHp
         if (envRoot == null)
             return null;
 
-        if (jackTarget != null)
-        {
-            var jackFromTarget = jackTarget.GetComponentInParent<AgentGoToHouseDiscrete>();
-            if (jackFromTarget != null && TrainingEnvSpace.IsDescendantOf(jackFromTarget.transform, envRoot))
-                return jackFromTarget;
-        }
+        AgentGoToHouseDiscrete hero = null;
+        AgentGoToHouseDiscrete active = null;
+        AgentGoToHouseDiscrete fallback = null;
 
         var jacks = envRoot.GetComponentsInChildren<AgentGoToHouseDiscrete>(true);
         for (int i = 0; i < jacks.Length; i++)
         {
-            if (jacks[i] != null)
-                return jacks[i];
+            var jack = jacks[i];
+            if (jack == null || TrainingEnvSpace.IsGeorgeAgent(jack))
+                continue;
+
+            if (jack.gameObject.name == "JackHero" && jack.gameObject.activeInHierarchy)
+                hero = jack;
+            else if (jack.gameObject.activeInHierarchy && active == null)
+                active = jack;
+            else if (fallback == null)
+                fallback = jack;
         }
 
-        return null;
+        if (hero != null)
+            return hero;
+        if (active != null)
+            return active;
+        return fallback;
+    }
+
+    AgentGoToHouseDiscrete FindGeorgeInEnv()
+    {
+        var envRoot = TrainingEnvSpace.FindRoot(transform);
+        if (envRoot == null)
+            return null;
+
+        AgentGoToHouseDiscrete hero = null;
+        AgentGoToHouseDiscrete named = null;
+        AgentGoToHouseDiscrete active = null;
+        AgentGoToHouseDiscrete fallback = null;
+
+        var agents = envRoot.GetComponentsInChildren<AgentGoToHouseDiscrete>(true);
+        for (int i = 0; i < agents.Length; i++)
+        {
+            var agent = agents[i];
+            if (agent == null || !TrainingEnvSpace.IsGeorgeAgent(agent))
+                continue;
+
+            if (agent.gameObject.name == "GeorgeHero" && agent.gameObject.activeInHierarchy)
+                hero = agent;
+            else if (agent.gameObject.name == "George")
+                named = agent;
+            else if (agent.gameObject.activeInHierarchy && active == null)
+                active = agent;
+            else if (fallback == null)
+                fallback = agent;
+        }
+
+        if (hero != null)
+            return hero;
+        if (named != null && named.gameObject.activeInHierarchy)
+            return named;
+        if (active != null)
+            return active;
+        return fallback;
     }
 
     void UpdateWarmthAtCampfire()
@@ -1436,7 +1704,7 @@ public class LilyScript : Agent, IHasHp
         if (_deathSequenceStarted)
             return;
 
-        satietyTimer += Time.deltaTime;
+        satietyTimer += Time.unscaledDeltaTime;
         if (satietyTimer < satietyDecayInterval)
             return;
 
@@ -1453,7 +1721,7 @@ public class LilyScript : Agent, IHasHp
             return;
         }
 
-        _hungerTimer += Time.deltaTime;
+        _hungerTimer += Time.unscaledDeltaTime;
         if (_hungerTimer < hungerDamageInterval)
             return;
 
@@ -1467,7 +1735,7 @@ public class LilyScript : Agent, IHasHp
         if (_deathSequenceStarted)
             return;
 
-        heatTimer += Time.deltaTime;
+        heatTimer += Time.unscaledDeltaTime;
         if (heatTimer < heatDecayInterval)
             return;
 
@@ -1484,7 +1752,7 @@ public class LilyScript : Agent, IHasHp
             return;
         }
 
-        _freezeTimer += Time.deltaTime;
+        _freezeTimer += Time.unscaledDeltaTime;
         if (_freezeTimer < freezeDamageInterval)
             return;
 

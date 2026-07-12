@@ -1,7 +1,7 @@
 using UnityEngine;
 
 /// <summary>
-/// George — те же опции и логика, что у Jack (дерево/еда/зомби/вода), отдельный агент для обучения.
+/// George — вода, еда, огонь (без дерева и зомби).
 /// </summary>
 [RequireComponent(typeof(CharacterController))]
 [RequireComponent(typeof(Animator))]

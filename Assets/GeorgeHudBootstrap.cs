@@ -19,8 +19,12 @@ public static class GeorgeHudBootstrap
             if (d != null) { EnsureHudVisible(d); d.ApplyLayoutPosition(); }
         foreach (var d in Resources.FindObjectsOfTypeAll<GeorgeHeatDisplay>())
             if (d != null) { EnsureHudVisible(d); d.ApplyLayoutPosition(); }
+
         foreach (var d in Resources.FindObjectsOfTypeAll<GeorgeWoodDisplay>())
-            if (d != null) { EnsureHudVisible(d); d.ApplyLayoutPosition(); }
+        {
+            if (d != null && d.gameObject != null)
+                Object.Destroy(d.gameObject);
+        }
 
         if (HasLoadedDisplay<GeorgeWaterDisplay>() && TrainingEnvSpace.FindPresentationGeorge() == null)
             return;
@@ -34,7 +38,6 @@ public static class GeorgeHudBootstrap
             CreateSticker<GeorgeSatietyDisplay>("GeorgeSatietyText", new Vector2(-70f, -180f));
             CreateSticker<GeorgeWaterDisplay>("GeorgeWaterText", new Vector2(130f, -180f));
             CreateSticker<GeorgeHeatDisplay>("GeorgeHeatText", new Vector2(330f, -180f));
-            CreateSticker<GeorgeWoodDisplay>("GeorgeWoodText", new Vector2(530f, -180f));
         }
 
         if (TrainingEnvSpace.FindPresentationGeorge() != null)
@@ -93,10 +96,10 @@ public static class GeorgeHudBootstrap
         var go = new GameObject("GeorgeRewardText");
         var rt = go.AddComponent<RectTransform>();
         rt.SetParent(parent, false);
-        rt.anchorMin = new Vector2(0.5f, 1f);
-        rt.anchorMax = new Vector2(0.5f, 1f);
-        rt.pivot = new Vector2(0f, 1f);
-        rt.anchoredPosition = new Vector2(1010f, -235f);
+        rt.anchorMin = new Vector2(1f, 0.5f);
+        rt.anchorMax = new Vector2(1f, 0.5f);
+        rt.pivot = new Vector2(1f, 0.5f);
+        rt.anchoredPosition = new Vector2(-24f, -70f);
         rt.sizeDelta = new Vector2(280f, 50f);
 
         go.AddComponent<CanvasRenderer>();

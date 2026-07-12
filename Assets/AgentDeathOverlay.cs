@@ -5,7 +5,7 @@ using TMPro;
 using Unity.MLAgents;
 
 /// <summary>
-/// Показывает «Джек погиб» / «Лили погибла» по центру экрана, затем вызывает EndEpisode().
+/// Показывает «Джек погиб» / «Лили погибла» / «Гера погиб» по центру экрана, затем вызывает EndEpisode().
 /// </summary>
 public sealed class AgentDeathOverlay : MonoBehaviour
 {
@@ -73,10 +73,22 @@ public sealed class AgentDeathOverlay : MonoBehaviour
         Hide();
     }
 
+    public static string GetDeathMessageFor(Agent agent)
+    {
+        if (agent is LilyScript)
+            return "Лили погибла";
+        if (agent is AgentGoToHouseDiscrete hero && TrainingEnvSpace.IsGeorgeAgent(hero))
+            return "Гера погиб";
+        return "Джек погиб";
+    }
+
     public static void ShowAndEndEpisode(Agent agent, string message, float? delaySeconds = null)
     {
         if (agent == null)
             return;
+
+        if (string.IsNullOrEmpty(message))
+            message = GetDeathMessageFor(agent);
 
         if (!Enabled)
         {

@@ -7,7 +7,7 @@ ROOT="/mnt/c/Grisha/unity_projects/forest_survival"
 KEY="${HOME}/.ssh/lab_comp_key"
 REMOTE="reedgern@192.168.194.7"
 DEST="~/lab_work_space/forest_survival/build_versions"
-BUILD="${BUILD:-stream_forest_survival_1_06_07_2026}"
+BUILD="${BUILD:-stream_forest_survival_2_12_07_2026}"
 BUILD="${BUILD%.x86_64}"
 
 mkdir -p "${HOME}/.ssh"

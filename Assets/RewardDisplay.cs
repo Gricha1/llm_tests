@@ -48,16 +48,16 @@ public class RewardDisplay : MonoBehaviour
 
         bool lily = IsLilyDisplay();
         bool george = IsGeorgeDisplay();
-        rt.anchorMin = new Vector2(0.5f, 1f);
-        rt.anchorMax = new Vector2(0.5f, 1f);
-        rt.pivot = new Vector2(0f, 1f);
+        rt.anchorMin = new Vector2(1f, 0.5f);
+        rt.anchorMax = new Vector2(1f, 0.5f);
+        rt.pivot = new Vector2(1f, 0.5f);
         rt.sizeDelta = new Vector2(280f, 50f);
         if (george)
-            rt.anchoredPosition = new Vector2(1010f, -235f);
+            rt.anchoredPosition = new Vector2(-24f, -70f);
         else if (lily)
-            rt.anchoredPosition = new Vector2(820f, -165f);
+            rt.anchoredPosition = new Vector2(-24f, 0f);
         else
-            rt.anchoredPosition = new Vector2(630f, -95f);
+            rt.anchoredPosition = new Vector2(-24f, 70f);
 
         _text.enableWordWrapping = false;
         _text.overflowMode = TextOverflowModes.Overflow;
@@ -176,11 +176,5 @@ public class RewardDisplay : MonoBehaviour
     static AgentGoToHouseDiscrete FindActiveJack() =>
         TrainingEnvSpace.FindPresentationJack();
 
-    static LilyScript FindActiveLily()
-    {
-        var root = TrainingEnvSpace.PresentationRoot;
-        if (root != null)
-            return root.GetComponentInChildren<LilyScript>(false);
-        return FindObjectOfType<LilyScript>();
-    }
+    static LilyScript FindActiveLily() => TrainingEnvSpace.FindPresentationLily();
 }

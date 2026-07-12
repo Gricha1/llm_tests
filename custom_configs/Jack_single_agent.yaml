@@ -39,9 +39,9 @@ behaviors:
     keep_checkpoints: 0
     even_checkpoints: false
     max_steps: 20000000
-    time_horizon: 256
+    time_horizon: 64
     summary_freq: 50000
-    threaded: true
+    threaded: false
     self_play: null
     behavioral_cloning: null
 env_settings:

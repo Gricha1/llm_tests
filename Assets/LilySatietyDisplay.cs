@@ -129,8 +129,8 @@ public class LilySatietyDisplay : MonoBehaviour
         if (_text == null)
             return;
 
-        if (lily == null || !lily.gameObject.activeInHierarchy)
-            lily = TrainingEnvSpace.FindInPresentation<LilyScript>();
+        if (lily == null || !lily.isActiveAndEnabled)
+            lily = TrainingEnvSpace.FindPresentationLily();
 
         if (lily == null)
             return;

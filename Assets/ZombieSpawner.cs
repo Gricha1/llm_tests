@@ -7,6 +7,12 @@ using UnityEngine;
 /// </summary>
 public class ZombieSpawner : MonoBehaviour
 {
+    const float DefaultSpawnScale = 1f;
+    const float EnvGroundLocalY = -5.228786f;
+    const float PrefabCharacterControllerHeight = 2f;
+    const float PrefabCharacterControllerRadius = 0.5f;
+    static readonly Vector3 PrefabCharacterControllerCenter = new Vector3(0f, 1f, 0f);
+
     [Header("Prefab")]
     [SerializeField] private GameObject zombiePrefab;
 
@@ -19,6 +25,10 @@ public class ZombieSpawner : MonoBehaviour
     [SerializeField] private float spawnInterval = 5f;
     [Tooltip("Максимум зомби на сцене")]
     [SerializeField] private int maxZombies = 15;
+    [Tooltip("Множитель размера заспawnенного зомби (1 = как в префабе).")]
+    [SerializeField] private float spawnScaleMultiplier = 1f;
+    [Tooltip("Доп. смещение по Y поверх уровня земли Env (тонкая подстройка).")]
+    [SerializeField] private float spawnHeightOffset = 0f;
     [Tooltip("Точка появления зомби")]
     [SerializeField] private Vector3 spawnPosition = new Vector3(3.25f, -0.03f, -5.93f);
 
@@ -35,6 +45,7 @@ public class ZombieSpawner : MonoBehaviour
     private float nextRespawnTime;
     Transform _spawnProxy;
     GameObject _resolvedZombiePrefab;
+    Vector3 _prefabRootScale = Vector3.one;
     float _spawnMoveSpeedMultiplier = 1f;
 
     static bool IsAlive(GameObject go) => go != null;
@@ -185,20 +196,59 @@ public class ZombieSpawner : MonoBehaviour
         if (prefab == null)
             return;
 
+        worldPos = SnapSpawnToEnvGround(worldPos);
         GameObject zombie = Instantiate(prefab, worldPos, Quaternion.Euler(0f, Random.Range(0f, 360f), 0f));
         FinalizeSpawnedZombie(zombie);
         zombies.Add(zombie);
     }
 
-    void FinalizeSpawnedZombie(GameObject zombie)
+    Vector3 SnapSpawnToEnvGround(Vector3 worldPos)
+    {
+        var envRoot = TrainingEnvSpace.FindRoot(transform);
+        if (envRoot != null)
+        {
+            Vector3 local = envRoot.InverseTransformPoint(worldPos);
+            local.y = EnvGroundLocalY + spawnHeightOffset;
+            return envRoot.TransformPoint(local);
+        }
+
+        return worldPos + Vector3.up * spawnHeightOffset;
+    }
+
+    float ResolveSpawnScale()
+    {
+        // В старых сценах поле могло не сериализоваться → 0 и зомби становились крошечными (0.1x).
+        return spawnScaleMultiplier > 0.01f ? spawnScaleMultiplier : DefaultSpawnScale;
+    }
+
+    void ApplySpawnScale(GameObject zombie, float extraMultiplier = 1f)
+    {
+        if (zombie == null)
+            return;
+
+        float scaleMult = ResolveSpawnScale() * Mathf.Max(0.1f, extraMultiplier);
+        zombie.transform.localScale = _prefabRootScale * scaleMult;
+
+        // Модель крупная, но коллайдер — как у человека (не умножаем на scale).
+        var cc = zombie.GetComponentInChildren<CharacterController>();
+        if (cc != null)
+        {
+            cc.height = PrefabCharacterControllerHeight;
+            cc.radius = PrefabCharacterControllerRadius;
+            cc.center = PrefabCharacterControllerCenter;
+        }
+    }
+
+    void FinalizeSpawnedZombie(GameObject zombie, float scaleExtra = 1f)
     {
         if (zombie == null)
             return;
 
         zombie.SetActive(true);
+        ApplySpawnScale(zombie, scaleExtra);
+
         var envRoot = TrainingEnvSpace.FindRoot(transform);
         zombie.transform.SetParent(envRoot != null ? envRoot : transform, true);
-
         SetZombieLayer(zombie);
         EnsureZombieComponents(zombie);
 
@@ -228,13 +278,10 @@ public class ZombieSpawner : MonoBehaviour
             return null;
 
         RemoveDestroyed();
-        Vector3 pos = GetSpawnCenterWorld();
+        Vector3 pos = SnapSpawnToEnvGround(GetSpawnCenterWorld());
         GameObject zombie = Instantiate(ResolveZombiePrefab(), pos, Quaternion.Euler(0f, Random.Range(0f, 360f), 0f));
-        FinalizeSpawnedZombie(zombie);
+        FinalizeSpawnedZombie(zombie, scaleMultiplier);
         zombies.Add(zombie);
-
-        float scale = Mathf.Max(0.1f, scaleMultiplier);
-        zombie.transform.localScale = zombie.transform.localScale * scale;
 
         var health = zombie.GetComponentInChildren<ZombieHealth>();
         if (health != null)
@@ -265,15 +312,16 @@ public class ZombieSpawner : MonoBehaviour
 
         if (envRoot != null)
         {
-            var jacks = envRoot.GetComponentsInChildren<AgentGoToHouseDiscrete>(false);
-            for (int i = 0; i < jacks.Length; i++)
+            var agents = envRoot.GetComponentsInChildren<AgentGoToHouseDiscrete>(false);
+            for (int i = 0; i < agents.Length; i++)
             {
-                var candidate = jacks[i];
-                if (candidate != null && !TwitchEphemeralEffects.IsTwitchClone(candidate))
-                {
-                    jack = candidate.transform;
-                    break;
-                }
+                var candidate = agents[i];
+                if (candidate == null || TwitchEphemeralEffects.IsTwitchClone(candidate))
+                    continue;
+                if (TrainingEnvSpace.IsGeorgeAgent(candidate))
+                    continue;
+                jack = candidate.transform;
+                break;
             }
 
             var lilyScript = envRoot.GetComponentInChildren<LilyScript>(false);
@@ -305,6 +353,7 @@ public class ZombieSpawner : MonoBehaviour
         if (zombiePrefab != null && !zombiePrefab.scene.IsValid())
         {
             _resolvedZombiePrefab = zombiePrefab;
+            _prefabRootScale = _resolvedZombiePrefab.transform.localScale;
             return _resolvedZombiePrefab;
         }
 
@@ -315,17 +364,39 @@ public class ZombieSpawner : MonoBehaviour
             if (source != null)
             {
                 _resolvedZombiePrefab = source;
+                _prefabRootScale = _resolvedZombiePrefab.transform.localScale;
                 return _resolvedZombiePrefab;
             }
         }
 
         _resolvedZombiePrefab = UnityEditor.AssetDatabase.LoadAssetAtPath<GameObject>(
+            "Assets/Prefabs/FatZombie.prefab");
+        if (_resolvedZombiePrefab != null)
+        {
+            _prefabRootScale = _resolvedZombiePrefab.transform.localScale;
+            return _resolvedZombiePrefab;
+        }
+
+        _resolvedZombiePrefab = UnityEditor.AssetDatabase.LoadAssetAtPath<GameObject>(
+            "Assets/Prefabs/ZombieGoblin.prefab");
+        if (_resolvedZombiePrefab != null)
+        {
+            _prefabRootScale = _resolvedZombiePrefab.transform.localScale;
+            return _resolvedZombiePrefab;
+        }
+
+        _resolvedZombiePrefab = UnityEditor.AssetDatabase.LoadAssetAtPath<GameObject>(
             "Assets/3D Characters Zombie City Streets Lowpoly Pack - Lite/Prefabs/(P) Characters_Zombie_SuitMan_1.prefab");
         if (_resolvedZombiePrefab != null)
+        {
+            _prefabRootScale = _resolvedZombiePrefab.transform.localScale;
             return _resolvedZombiePrefab;
+        }
 #endif
 
         _resolvedZombiePrefab = zombiePrefab;
+        if (_resolvedZombiePrefab != null)
+            _prefabRootScale = _resolvedZombiePrefab.transform.localScale;
         return _resolvedZombiePrefab;
     }
 

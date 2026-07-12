@@ -17,6 +17,8 @@ public static class GameSfx
     static AudioClip _foodShort;
     static AudioClip _heroDied;
     static AudioClip _wood;
+    static AudioClip _lilyKiss;
+    static AudioClip _lilyKissShort;
     static float _lastHeroDiedTime = -999f;
 
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
@@ -67,6 +69,8 @@ public static class GameSfx
     static AudioClip FoodShort => _foodShort ??= CreatePortionClip(Food, 0.5f);
     static AudioClip HeroDied => _heroDied ??= Load("hero_died");
     static AudioClip Wood => _wood ??= Load("wood");
+    static AudioClip LilyKiss => _lilyKiss ??= Load("lily_kiss");
+    static AudioClip LilyKissShort => _lilyKissShort ??= CreateDurationClip(LilyKiss, 1f);
 
     public static void PlayStepGrass(float volume = 0.4f, float pitchMin = 0.95f, float pitchMax = 1.05f, Transform source = null)
     {
@@ -83,7 +87,7 @@ public static class GameSfx
         Play(clip, volume, Random.Range(0.96f, 1.04f));
     }
 
-    /// <summary>Зомби ударил Джека или Лили.</summary>
+    /// <summary>Зомби или friendly fire ударил Jack, Lily или George.</summary>
     public static void PlayZombieHitAgent(float volume = 0.75f, Transform source = null)
     {
         if (!TrainingEnvSpace.ShouldPlayFeedback(source))
@@ -103,6 +107,13 @@ public static class GameSfx
         if (!TrainingEnvSpace.ShouldPlayFeedback(source))
             return;
         Play(Wood, volume, Random.Range(0.97f, 1.03f));
+    }
+
+    public static void PlayLilyKiss(float volume = 0.85f, Transform source = null)
+    {
+        if (!TrainingEnvSpace.ShouldPlayFeedback(source))
+            return;
+        Play(LilyKissShort != null ? LilyKissShort : LilyKiss, volume, Random.Range(0.98f, 1.02f));
     }
 
     public static void StopFireLoop()
@@ -142,6 +153,18 @@ public static class GameSfx
         Ensure();
         _source.pitch = pitch;
         _source.PlayOneShot(clip, volume);
+    }
+
+    static AudioClip CreateDurationClip(AudioClip source, float durationSeconds)
+    {
+        if (source == null)
+            return null;
+
+        durationSeconds = Mathf.Max(0.05f, durationSeconds);
+        float portion = source.length > durationSeconds
+            ? durationSeconds / source.length
+            : 1f;
+        return CreatePortionClip(source, portion);
     }
 
     static AudioClip CreatePortionClip(AudioClip source, float portion)

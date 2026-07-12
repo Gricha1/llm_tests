@@ -19,6 +19,8 @@ public static class PolytopeHeroAnimatorSetup
         "Assets/Polytope Studio/Lowpoly_Characters/Sources/Modular_NPC/Meshes/Peasants_Citizens/PT_Male_Modular_Free_Pack.fbx";
     const string FemaleAvatarModelPath =
         "Assets/Polytope Studio/Lowpoly_Characters/Sources/Modular_NPC/Meshes/Peasants_Citizens/PT_Female_Modular_Free_Pack.fbx";
+    const string BoyAvatarModelPath =
+        "Assets/Polytope Studio/Lowpoly_Characters/Sources/Modular_NPC/Meshes/Peasants_Citizens/PT_Boy_Modular_Free_Pack.fbx";
 
     const string MaleHumanoidSourcePath =
         "Assets/Polytope Studio/Lowpoly_Characters/Sources/Modular_NPC/Meshes/Peasants_Citizens/Separate_Parts/PT_Male_Peasant_01_upper.fbx";
@@ -41,13 +43,13 @@ public static class PolytopeHeroAnimatorSetup
         Debug.Log("PolytopeHeroAnimatorSetup: Humanoid mapping скопирован на Set FBX. Перезапусти назначение анимаций.");
     }
 
-    [MenuItem("Forest Survival/Hero: анимации JackHero/LilyHero (открытые сцены)")]
+    [MenuItem("Forest Survival/Hero Animator only (JackHero + LilyHero + GeorgeHero)")]
     public static void ApplyWithoutSave()
     {
         ApplyInternal(false);
     }
 
-    [MenuItem("Forest Survival/Hero: анимации JackHero/LilyHero и сохранить сцены")]
+    [MenuItem("Forest Survival/Hero Animator only — save scenes")]
     public static void ApplyAndSave()
     {
         ApplyInternal(true);
@@ -66,11 +68,12 @@ public static class PolytopeHeroAnimatorSetup
         int updated = 0;
         updated += ApplyHero("JackHero", jackController, MaleAvatarModelPath);
         updated += ApplyHero("LilyHero", lilyController, FemaleAvatarModelPath);
+        updated += ApplyHero("GeorgeHero", jackController, BoyAvatarModelPath);
 
         if (updated == 0)
         {
             Debug.LogWarning(
-                "PolytopeHeroAnimatorSetup: не найдено JackHero или LilyHero на открытых сценах. " +
+                "PolytopeHeroAnimatorSetup: не найдено JackHero, LilyHero или GeorgeHero на открытых сценах. " +
                 "Добавь модели, сохрани сцену и повтори.");
             return;
         }

@@ -45,11 +45,13 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     [SerializeField] private Sprite optionFoodSprite;
     [SerializeField] private Sprite optionZombieSprite;
     [SerializeField] private Sprite optionWaterSprite;
+    [SerializeField] private Sprite optionHeatSprite;
     [SerializeField] private Vector3 optionIconOffset = new Vector3(0f, 2.2f, 0f);
     [SerializeField] private float optionWoodIconScale = 0.55f;
     [SerializeField] private float optionFoodIconScale = 0.35f;
     [SerializeField] private float optionZombieIconScale = 0.8f;
     [SerializeField] private float optionWaterIconScale = 0.35f;
+    [SerializeField] private float optionHeatIconScale = 0.45f;
     [Tooltip("Доп. множитель размера иконки, когда камера захвата/просмотра = CamOnJack.")]
     [SerializeField] private float optionIconScaleMultiplierCamOnJack = 0.55f;
     [SerializeField] private int optionIconSortingOrder = 100;
@@ -68,19 +70,25 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     private float prevSheepDist;
     private float prevZombieDist;
     private float prevWaterDist;
+    private float prevHouseDist;
 
-    /// <summary>0=дерево, 1=еда, 2=зомби, 3=вода. В наблюдениях — 3 бита (как у Lily).</summary>
+    /// <summary>0=дерево, 1=еда, 2=зомби, 3=вода, 4=огонь (только George).</summary>
     public const int OptionWood = 0;
     public const int OptionFood = 1;
     public const int OptionZombie = 2;
     public const int OptionWater = 3;
-    public const int OptionCount = 4;
+    public const int OptionHeat = 4;
+    public const int OptionCount = 5;
+    public const string GeorgeBehaviorName = "GeorgeLowLevelAgent";
 
     protected virtual string OptionIconObjectName => "JackOptionIcon";
 
 
     [Header("Fire / House")]
     [SerializeField] private float houseRadius = 1.2f;
+    [SerializeField] private float moveTowardsHouseWhenColdRewardScale = 1f;
+    [SerializeField] private float warmthGainInterval = 0.5f;
+    [SerializeField] private float warmthRewardAtCampfire = 5f;
     [Tooltip("Сколько секунд горит один заряд дров (одна единица wood) у дома. Больше — дольше сжигание.")]
     [SerializeField] private float burnInterval = 0.35f;
     [Tooltip("Множитель длительности горения (таймер на костре). 5 = в 5 раз дольше.")]
@@ -89,6 +97,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
 
     private float burnTimer;
     private float _campfireBurnSecondsRemaining;
+    private float _warmthGainTimer;
     public float CampfireBurnSecondsRemaining => _campfireBurnSecondsRemaining;
 
     [Header("Fire VFX")]
@@ -150,6 +159,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     [Header("Training")]
     [Tooltip("If true, Jack is frozen in place (no movement/rotation). Useful for training setups.")]
     [SerializeField] private bool frozen_jack = false;
+    float _movementStunUntilTime;
 
     [Header("Reward")]
     [SerializeField] private float reachDistance = 1.2f;
@@ -262,6 +272,15 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     float ZombieDoReach => zombieNearbyRadiusOnDo * _twitchReachMultiplier;
     float ZombieKnockbackReach => zombieKnockbackRadiusOnDo * _twitchReachMultiplier;
 
+    bool UsesGeorgeSurvivalOptions => TrainingEnvSpace.IsGeorgeAgent(this);
+
+    bool IsAllowedOption(int option)
+    {
+        if (UsesGeorgeSurvivalOptions)
+            return option == OptionFood || option == OptionWater || option == OptionHeat;
+        return option == OptionWood || option == OptionFood || option == OptionZombie || option == OptionWater;
+    }
+
     bool ControlsSharedCampfire =>
         fireVfx != null
         && !TwitchEphemeralEffects.IsTwitchClone(this)
@@ -314,7 +333,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     private int _survivalPhase = 1;
     private float _nextNightmareBossSpawnTime = float.PositiveInfinity;
 
-    JackEnvTrainingConfig _trainingConfig;
+    EnvTrainingConfig _trainingConfig;
     JackTrainingMode _resolvedTrainingMode = JackTrainingMode.Full;
 
     public JackTrainingMode ResolvedTrainingMode => _resolvedTrainingMode;
@@ -325,7 +344,11 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     bool IsSimpleTrainingMode =>
         _resolvedTrainingMode == JackTrainingMode.WoodOnly
         || _resolvedTrainingMode == JackTrainingMode.FoodOnly
+        || _resolvedTrainingMode == JackTrainingMode.WaterOnly
         || _resolvedTrainingMode == JackTrainingMode.ZombieOnly;
+
+    bool IsGeorgeSimpleTrainingMode =>
+        UsesGeorgeSurvivalOptions && _trainingConfig != null && _trainingConfig.IsGeorgeSimpleTask();
 
     public float SurvivalGoalSeconds => survivalGoalSeconds;
     public float SurvivalTotalSeconds => survivalGoalSeconds * 3f;
@@ -414,11 +437,26 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     [SerializeField] private float rewardOnZombieKillDo = 10f;
     [Tooltip("Зомби за спиной не бьются DO. dot(forward, к зомби): 0 = полусфера впереди, 0.5 ≈ 60°, 1 = строго вперёд.")]
     [SerializeField] [Range(0f, 1f)] private float zombieDoMinForwardDot = 0.5f;
+    [Header("Friendly fire (DO)")]
+    [SerializeField] private int allyDoDamage = 10;
+    [SerializeField] private float friendlyFireDoPenalty = -10f;
+    [SerializeField] private float allyKnockbackDistance = 0.55f;
+    [SerializeField] private float allyKnockbackUp = 0.12f;
+
+    public void StunForSeconds(float seconds)
+    {
+        if (seconds <= 0f)
+            return;
+        _movementStunUntilTime = Mathf.Max(_movementStunUntilTime, Time.time + seconds);
+    }
+
+    bool CanMoveThisStep => !frozen_jack && Time.time >= _movementStunUntilTime;
+    bool CanRotateThisStep => !frozen_jack;
 
     public override void Initialize()
     {
         controller = GetComponent<CharacterController>();
-        animator = GetComponent<Animator>();
+        ResolveAnimatorReference();
         _lastShowOptionTaskIcon = showOptionTaskIcon;
         _lastChopActionForAnim = 0;
         _doCooldownRemaining = 0f;
@@ -447,6 +485,17 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         CacheTrainingConfig();
         ResolveTrainingMode();
         ApplyEpisodeStepLimit();
+        EnsureGeorgeTrainingBehaviorName();
+    }
+
+    void EnsureGeorgeTrainingBehaviorName()
+    {
+        if (!UsesGeorgeSurvivalOptions)
+            return;
+
+        var bp = GetComponent<BehaviorParameters>();
+        if (bp != null && bp.BehaviorName != GeorgeBehaviorName)
+            bp.BehaviorName = GeorgeBehaviorName;
     }
 
     private void Awake()
@@ -468,17 +517,27 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         if (envRoot == null)
             return;
 
-        _trainingConfig = envRoot.GetComponent<JackEnvTrainingConfig>();
+        _trainingConfig = envRoot.GetComponent<EnvTrainingConfig>();
         if (_trainingConfig == null)
-            _trainingConfig = envRoot.gameObject.AddComponent<JackEnvTrainingConfig>();
+            _trainingConfig = envRoot.gameObject.AddComponent<EnvTrainingConfig>();
     }
 
     void ResolveTrainingMode()
     {
         CacheTrainingConfig();
         _resolvedTrainingMode = _trainingConfig != null
-            ? _trainingConfig.ResolveMode()
+            ? _trainingConfig.ResolveJackMode()
             : JackTrainingMode.Full;
+    }
+
+    public void EnsureTrainingCampfireLit(float seconds)
+    {
+        if (seconds <= 0f || fireVfx == null)
+            return;
+
+        EnsureCampfireLocalBinding();
+        _campfireBurnSecondsRemaining = seconds;
+        SetCampfireVisible(true);
     }
 
     void ApplyEpisodeStepLimit()
@@ -488,6 +547,8 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         else if (IsZombieTrainingMode)
             MaxStep = _trainingConfig != null ? _trainingConfig.ZombieMaxSteps : 3000;
         else if (IsWoodFoodSwitchMode)
+            MaxStep = _trainingConfig != null ? _trainingConfig.SimpleMaxSteps : 400;
+        else if (IsGeorgeSimpleTrainingMode)
             MaxStep = _trainingConfig != null ? _trainingConfig.SimpleMaxSteps : 400;
         else if (IsSimpleTrainingMode)
             MaxStep = _trainingConfig != null ? _trainingConfig.SimpleMaxSteps : 400;
@@ -565,7 +626,8 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     {
         if (!ShouldShowOptionTaskIcon()) return;
         if (optionIconRenderer != null) return;
-        if (optionWoodSprite == null && optionFoodSprite == null && optionZombieSprite == null && optionWaterSprite == null) return;
+        if (optionWoodSprite == null && optionFoodSprite == null && optionZombieSprite == null
+            && optionWaterSprite == null && optionHeatSprite == null) return;
 
         var existing = transform.Find(OptionIconObjectName);
         if (existing != null)
@@ -595,6 +657,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
             OptionFood => optionFoodIconScale,
             OptionZombie => ResolveZombieOptionIconScale(),
             OptionWater => ResolveWaterOptionIconScale(),
+            OptionHeat => optionHeatIconScale,
             _ => optionFoodIconScale
         };
         _optionIconBaseScale = Mathf.Max(0.01f, s);
@@ -738,7 +801,20 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
 
     protected void CycleHeuristicOption()
     {
-        int next = currentOptionTrain switch
+        if (UsesGeorgeSurvivalOptions)
+        {
+            int next = currentOptionTrain switch
+            {
+                OptionFood => OptionWater,
+                OptionWater => OptionHeat,
+                OptionHeat => OptionFood,
+                _ => OptionFood
+            };
+            SetOption(next);
+            return;
+        }
+
+        int nextJack = currentOptionTrain switch
         {
             OptionWood => OptionFood,
             OptionFood => OptionZombie,
@@ -746,7 +822,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
             OptionWater => OptionWood,
             _ => OptionWood
         };
-        SetOption(next);
+        SetOption(nextJack);
     }
 
     /// <summary>Один прыжок из Twitch #up=N: высота = N × рост персонажа (N 1–5).</summary>
@@ -776,7 +852,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
 
     Vector3 GetTwitchForwardPushVelocity()
     {
-        if (_forwardPushTimeLeft <= 0f || frozen_jack)
+        if (_forwardPushTimeLeft <= 0f || !CanMoveThisStep)
             return Vector3.zero;
 
         _forwardPushTimeLeft -= Time.deltaTime;
@@ -811,10 +887,10 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
                 TwitchEphemeralEffects.OnPresentationJackEpisodeBegin(this);
         }
 
-        if (animator == null)
-            animator = GetComponent<Animator>();
+        ResolveAnimatorReference();
         if (animator != null)
             animator.speed = 1f;
+        _movementStunUntilTime = 0f;
 
         // Локальные координаты относительно корня Env (как в инспекторе у Jack).
         const float groundY = -5.228786f;
@@ -850,6 +926,8 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         prevPosition = transform.position;
         stepCount = 0;
         _survivalPhase = 1;
+        if (TrainingEnvSpace.IsPresentationTransform(transform))
+            BackgroundMusic.SetSurvivalPhase(1);
         _nextNightmareBossSpawnTime = float.PositiveInfinity;
         _episodeStartTime = Time.unscaledTime;
         _lastChopActionForAnim = 0;
@@ -880,16 +958,45 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         prevSheepDist = 0f;
         prevWaterDist = 0f;
         prevZombieDist = 0f;
+        prevHouseDist = -1f;
+        _warmthGainTimer = 0f;
         WaterGoalPath.Get(transform)?.ResetAgent(transform);
-        _lastNonZombieOption = OptionWood;
+        _lastNonZombieOption = UsesGeorgeSurvivalOptions ? OptionFood : OptionWood;
         HeuristicOptionsLocked = false;
 
         hp = maxHp;
 
+        EnvTrainingConfig.Get(transform)?.ApplyForEpisodeBegin();
+
         ResolveTrainingMode();
         ApplyEpisodeStepLimit();
 
-        if (IsZombieTrainingMode)
+        if (UsesGeorgeSurvivalOptions)
+        {
+            StopZombieSpawnerForEpisode();
+            if (_trainingConfig != null && _trainingConfig.IsGeorgeSimpleTask())
+            {
+                int fixedOption = _trainingConfig.ResolveFixedJackOption();
+                currentOptionTrain = fixedOption;
+                currentOption = fixedOption;
+            }
+            else if (useUtilitySoftmaxSampling)
+            {
+                int prevOption = currentOptionTrain;
+                int sampled = SampleGeorgeOptionUtilitySoftmax(currentOptionTrain);
+                ResetWaterGoalIfEntered(prevOption, sampled);
+                currentOptionTrain = sampled;
+                currentOption = sampled;
+            }
+            else
+            {
+                int[] georgeOptions = { OptionFood, OptionWater, OptionHeat };
+                int randomOption = georgeOptions[Random.Range(0, georgeOptions.Length)];
+                currentOptionTrain = randomOption;
+                currentOption = randomOption;
+            }
+        }
+        else if (IsZombieTrainingMode)
         {
             currentOptionTrain = OptionZombie;
             currentOption = OptionZombie;
@@ -909,9 +1016,16 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
                 currentOptionTrain = 1;
                 currentOption = 1;
             }
+            else if (_resolvedTrainingMode == JackTrainingMode.WaterOnly)
+            {
+                currentOptionTrain = OptionWater;
+                currentOption = OptionWater;
+            }
             else if (useUtilitySoftmaxSampling)
             {
+                int prevOption = currentOptionTrain;
                 int sampled = SampleOptionUtilitySoftmax(currentOptionTrain);
+                ResetWaterGoalIfEntered(prevOption, sampled);
                 currentOptionTrain = sampled;
                 currentOption = sampled;
             }
@@ -923,7 +1037,8 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
             }
         }
 
-        if (IsSimpleTrainingMode && (_trainingConfig == null || _trainingConfig.FreezeNeeds))
+        if ((IsSimpleTrainingMode || IsGeorgeSimpleTrainingMode)
+            && (_trainingConfig == null || _trainingConfig.FreezeNeeds))
         {
             satiety = maxSatiety / 2;
             heat = maxHeat / 2;
@@ -1046,17 +1161,27 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         return 999f; // большое значение, если деревьев нет
     }
 
+    void ResetWaterGoalIfEntered(int prevOption, int newOption)
+    {
+        if (newOption == OptionWater && prevOption != OptionWater)
+            WaterGoalPath.Get(transform)?.ResetAgent(transform);
+    }
+
     public void SetOption(int option)
     {
-        // Проверяем валидность опции
-        if (option != OptionWood && option != OptionFood && option != OptionZombie && option != OptionWater)
+        if (!IsAllowedOption(option))
         {
             Debug.LogWarning($"AgentGoToHouseDiscrete.SetOption: Некорректная опция {option}, игнорируем");
             return;
         }
+
+        int prevOption = currentOptionTrain;
         
         if (option == OptionWood || option == OptionFood)
             _lastNonZombieOption = option;
+
+        if (option == OptionWater && prevOption != OptionWater)
+            WaterGoalPath.Get(transform)?.ResetAgent(transform);
 
         currentOptionTrain = option;
         currentOption = option;
@@ -1096,9 +1221,36 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         }
     }
 
+    void ResolveAnimatorReference()
+    {
+        if (animator == null)
+            animator = GetComponent<Animator>();
+        if (animator == null)
+            animator = GetComponentInChildren<Animator>(true);
+        if (animator == null)
+            return;
+
+        animator.applyRootMotion = false;
+        if (animator.runtimeAnimatorController != null)
+            return;
+
+        var fallback = DefaultHeroAnimatorController.ForAgent(this);
+        if (fallback != null)
+            animator.runtimeAnimatorController = fallback;
+    }
+
     private void ApplyWalkAnimatorSpeed()
     {
         if (animator == null || controller == null) return;
+
+        if (!CanMoveThisStep)
+        {
+            if (walkAnimSpeedDamp > 0f)
+                animator.SetFloat("Speed", 0f, walkAnimSpeedDamp, Time.deltaTime);
+            else
+                animator.SetFloat("Speed", 0f);
+            return;
+        }
 
         Vector3 v = controller.velocity;
         v.y = 0f;
@@ -1143,6 +1295,10 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
                 optionIconRenderer.sprite = optionWaterSprite;
                 optionIconRenderer.enabled = optionWaterSprite != null;
                 break;
+            case OptionHeat:
+                optionIconRenderer.sprite = optionHeatSprite;
+                optionIconRenderer.enabled = optionHeatSprite != null;
+                break;
             default:
                 optionIconRenderer.enabled = false;
                 break;
@@ -1162,7 +1318,6 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     {
         if (amount <= 0 || _deathSequenceStarted) return;
         hp = Mathf.Max(0, hp - amount);
-        AgentHitFlash.GetOrCreate(gameObject).Flash();
         if (applyHpLossPenalty && hpLossPenaltyPerHit != 0f)
             AddReward(-hpLossPenaltyPerHit);
         if (hp <= 0)
@@ -1175,11 +1330,11 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
                 return;
             }
 
-            if (TrainingEnvSpace.IsPresentationTransform(transform))
+            if (TrainingEnvSpace.IsPresentationTransform(transform) && !TrainingEnvSpace.IsGeorgeAgent(this))
                 TwitchEphemeralEffects.OnPresentationJackDeath();
 
             EvalEpisodeTracker.NotifyEpisodeEnded();
-            AgentDeathOverlay.ShowAndEndEpisode(this, "Джек погиб");
+            AgentDeathOverlay.ShowAndEndEpisode(this, AgentDeathOverlay.GetDeathMessageFor(this));
         }
     }
 
@@ -1205,6 +1360,9 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     public void RefreshTrainingOption(bool force = false)
     {
         if (HeuristicOptionsLocked && !force)
+            return;
+
+        if (UsesGeorgeSurvivalOptions)
             return;
 
         if (IsZombieTrainingMode)
@@ -1444,18 +1602,30 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
 
         // Utility sampling: пересэмпливаем каждые 20 шагов (если включено)
         if (IsOptionSwitchTrainingMode && useUtilitySoftmaxSampling && !HeuristicOptionsLocked
-            && !IsZombieTrainingMode
+            && !IsZombieTrainingMode && !UsesGeorgeSurvivalOptions
             && stepCount > 0 && (stepCount % 20) == 0)
         {
             if (!IsWoodGatherGoalReached && (!IsFullTrainingMode || !HasZombieInActivationRadius()))
             {
+                int prevOption = currentOptionTrain;
                 int sampled = SampleOptionUtilitySoftmax(currentOptionTrain);
+                ResetWaterGoalIfEntered(prevOption, sampled);
                 currentOptionTrain = sampled;
                 currentOption = sampled;
                 if (sampled == OptionWood || sampled == OptionFood)
                     _lastNonZombieOption = sampled;
                 UpdateOptionIconVisual();
             }
+        }
+        else if (UsesGeorgeSurvivalOptions && useUtilitySoftmaxSampling && !HeuristicOptionsLocked
+            && stepCount > 0 && (stepCount % 20) == 0)
+        {
+            int prevOption = currentOptionTrain;
+            int sampled = SampleGeorgeOptionUtilitySoftmax(currentOptionTrain);
+            ResetWaterGoalIfEntered(prevOption, sampled);
+            currentOptionTrain = sampled;
+            currentOption = sampled;
+            UpdateOptionIconVisual();
         }
 
         RefreshTrainingOption();
@@ -1477,21 +1647,20 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         float rotateInput = 0f;
 
         // --- Движение ---
-        if (!frozen_jack)
+        if (CanMoveThisStep)
         {
             if (moveAction == 1) moveInput = 1f;
             else if (moveAction == 3) moveInput = -1f;
         }
 
         // --- Поворот ---
-        if (!frozen_jack)
+        if (CanRotateThisStep)
         {
             if (rotateAction == 1) rotateInput = 1f;
             else if (rotateAction == 3) rotateInput = -1f;
         }
 
-        // --- Поворот ---
-        if (!frozen_jack)
+        if (CanRotateThisStep)
             transform.Rotate(0f, rotateInput * rotationSpeed * Time.deltaTime, 0f);
 
         // --- Гравитация ---
@@ -1509,12 +1678,12 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
 
             // --- Итоговое движение ---
             Vector3 pushVel = GetTwitchForwardPushVelocity();
-            Vector3 move = frozen_jack
-                ? (Vector3.up * verticalVelocity)
-                : (transform.forward * moveInput * moveSpeed + pushVel + Vector3.up * verticalVelocity);
+            Vector3 move = CanMoveThisStep
+                ? (transform.forward * moveInput * moveSpeed + pushVel + Vector3.up * verticalVelocity)
+                : (Vector3.up * verticalVelocity);
 
             controller.Move(move * Time.deltaTime);
-            float planarSpeed = frozen_jack ? 0f : Mathf.Max(Mathf.Abs(moveInput) * moveSpeed, pushVel.magnitude);
+            float planarSpeed = CanMoveThisStep ? Mathf.Max(Mathf.Abs(moveInput) * moveSpeed, pushVel.magnitude) : 0f;
             AgentFootsteps.NotifyMovement(gameObject, planarSpeed);
         }
 
@@ -1536,13 +1705,19 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
 
         bool hitZombieOnDo = false;
         bool zombieKilledOnDo = false;
+        bool hitAllyOnDo = false;
         int woodBeforeChop = wood;
         if (doReady)
         {
             if (damageOnDoIfZombieNearby && zombieDamageOnDo > 0 && IsZombieNearbyForDo())
+            {
                 TakeDamage(zombieDamageOnDo);
+                HeroDamageFeedback.Play(transform);
+            }
 
-            if (knockbackZombieOnDo)
+            hitAllyOnDo = TryDamageAllyOnDo();
+
+            if (knockbackZombieOnDo && !UsesGeorgeSurvivalOptions)
                 hitZombieOnDo = KnockbackNearbyZombiesOnDo(out zombieKilledOnDo);
 
             woodBeforeChop = wood;
@@ -1554,10 +1729,11 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
 
             if (emptyDoActionPenalty < 0f)
             {
-                bool usefulDo = (hitZombieOnDo && currentOptionSnapshot == OptionZombie)
-                    || (gainedWoodFromChop && currentOptionSnapshot == OptionWood)
+                bool usefulDo = (!UsesGeorgeSurvivalOptions && hitZombieOnDo && currentOptionSnapshot == OptionZombie)
+                    || (!UsesGeorgeSurvivalOptions && gainedWoodFromChop && currentOptionSnapshot == OptionWood)
                     || (ateSheep && currentOptionSnapshot == OptionFood)
-                    || collectedWater;
+                    || collectedWater
+                    || (!UsesGeorgeSurvivalOptions && hitAllyOnDo);
                 if (!usefulDo)
                 {
                     AddReward(emptyDoActionPenalty);
@@ -1608,7 +1784,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
             }
         }
 
-        if (hitZombieOnDo && currentOptionSnapshot == OptionZombie)
+        if (hitZombieOnDo && currentOptionSnapshot == OptionZombie && !UsesGeorgeSurvivalOptions)
         {
             if (zombieKilledOnDo && rewardOnZombieKillDo != 0f)
             {
@@ -1742,13 +1918,36 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
             }
         }
 
+        if (UsesGeorgeSurvivalOptions && currentOptionTrain == OptionHeat && houseTarget != null)
+        {
+            float currHouseDist = Vector3.Distance(transform.position, houseTarget.position);
+            if (prevHouseDist > 0f)
+            {
+                float reward = (prevHouseDist - currHouseDist) * moveTowardsHouseWhenColdRewardScale;
+                AddReward(reward);
+                currentStepReward += reward;
+            }
+            prevHouseDist = currHouseDist;
+        }
+        else
+        {
+            prevHouseDist = -1f;
+        }
+
         prevPosition = transform.position;
         
         stepCount++;
 
-        if (IsSimpleTrainingMode)
+        if (IsSimpleTrainingMode && !UsesGeorgeSurvivalOptions)
         {
-            TryEndSimpleTrainingEpisode(choppedTree, gainedWoodFromChop, ateSheep, zombieKilledOnDo);
+            TryEndSimpleTrainingEpisode(choppedTree, gainedWoodFromChop, ateSheep, zombieKilledOnDo, collectedWater);
+            _lastChopActionForAnim = chopAction;
+            return;
+        }
+
+        if (IsGeorgeSimpleTrainingMode)
+        {
+            TryEndGeorgeSimpleTrainingEpisode(ateSheep, collectedWater);
             _lastChopActionForAnim = chopAction;
             return;
         }
@@ -1799,6 +1998,8 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         UpdateFreezing();
         UpdateStarving();
         UpdateDehydration();
+        if (UsesGeorgeSurvivalOptions)
+            UpdateGeorgeWarmthAtCampfire();
 
         bool onHouse = Vector3.Distance(transform.position, houseTarget.position) <= HouseReach;
 
@@ -1871,7 +2072,12 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         }
     }
 
-    void TryEndSimpleTrainingEpisode(bool choppedTree, bool gainedWoodFromChop, bool ateSheep, bool zombieKilledOnDo)
+    void TryEndSimpleTrainingEpisode(
+        bool choppedTree,
+        bool gainedWoodFromChop,
+        bool ateSheep,
+        bool zombieKilledOnDo,
+        bool collectedWater)
     {
         if (_trainingConfig != null && _trainingConfig.StepPenalty != 0f)
         {
@@ -1925,6 +2131,19 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
                 return;
             }
 
+            if (_resolvedTrainingMode == JackTrainingMode.WaterOnly
+                && (collectedWater || IsWaterPathComplete()))
+            {
+                float bonus = _trainingConfig.SuccessReward;
+                if (bonus != 0f)
+                {
+                    AddReward(bonus);
+                    currentStepReward += bonus;
+                }
+                EndEpisode();
+                return;
+            }
+
             if (_resolvedTrainingMode == JackTrainingMode.ZombieOnly && zombieKilledOnDo)
             {
                 if (_trainingConfig != null && !_trainingConfig.ZombieEndOnKill)
@@ -1960,6 +2179,57 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         return _trainingConfig.SimpleEpisodeTimeoutSeconds;
     }
 
+    bool IsWaterPathComplete()
+    {
+        var path = WaterGoalPath.Get(transform);
+        return path != null && path.HasCompletedPath(transform);
+    }
+
+    void TryEndGeorgeSimpleTrainingEpisode(bool ateSheep, bool collectedWater)
+    {
+        if (_trainingConfig == null)
+            return;
+
+        if (_trainingConfig.StepPenalty != 0f)
+        {
+            float penalty = _trainingConfig.StepPenalty;
+            AddReward(penalty);
+            currentStepReward += penalty;
+        }
+
+        if (!_trainingConfig.EndOnSuccess)
+            return;
+
+        var task = _trainingConfig.ResolveTask();
+        if (task == EnvTrainingTask.GeorgeFood && ateSheep)
+        {
+            if (_trainingConfig.SuccessReward != 0f)
+                AddReward(_trainingConfig.SuccessReward);
+            EndEpisode();
+            return;
+        }
+
+        if (task == EnvTrainingTask.GeorgeWater && (collectedWater || IsWaterPathComplete()))
+        {
+            if (_trainingConfig.SuccessReward != 0f)
+                AddReward(_trainingConfig.SuccessReward);
+            EndEpisode();
+            return;
+        }
+
+        if (task == EnvTrainingTask.GeorgeHeat && IsGeorgeNearBurningCampfire())
+        {
+            if (_trainingConfig.SuccessReward != 0f)
+                AddReward(_trainingConfig.SuccessReward);
+            EndEpisode();
+            return;
+        }
+
+        if (_trainingConfig.SimpleEpisodeTimeoutSeconds > 0f
+            && SurvivalElapsedSeconds >= _trainingConfig.SimpleEpisodeTimeoutSeconds)
+            EndEpisode();
+    }
+
     void EnsureZombieSpawners()
     {
         var envRoot = TrainingEnvSpace.FindRoot(transform);
@@ -1969,9 +2239,9 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
                 zombieSpawner = FindZombieSpawnerInEnv(envRoot, PrimaryZombieSpawnerName);
             if (zombieSpawnerSecondary == null)
                 zombieSpawnerSecondary = FindSecondaryZombieSpawnerInEnv(envRoot);
-            var envConfig = envRoot.GetComponent<JackEnvTrainingConfig>();
+            var envConfig = envRoot.GetComponent<EnvTrainingConfig>();
             if (envConfig != null
-                && envConfig.ResolveMode() == JackTrainingMode.ZombieOnly
+                && envConfig.ResolveJackMode() == JackTrainingMode.ZombieOnly
                 && zombieSpawnerSecondary == null)
             {
                 Debug.LogWarning(
@@ -2118,7 +2388,10 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         }
 
         if (TrainingEnvSpace.IsPresentationTransform(transform))
+        {
             SurvivalPhaseAnnouncement.ShowPhase2();
+            BackgroundMusic.SetSurvivalPhase(2);
+        }
 
         StartZombieSpawnerForEpisode(includeSecondarySpawner: false);
     }
@@ -2141,7 +2414,10 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         }
 
         if (TrainingEnvSpace.IsPresentationTransform(transform))
+        {
             SurvivalPhaseAnnouncement.ShowPhase3();
+            BackgroundMusic.SetSurvivalPhase(3);
+        }
 
         ActivateSecondaryZombieSpawner();
         ApplyNightmareZombieSpeedToEnv();
@@ -2317,6 +2593,92 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         return SoftmaxSample2(uWood, uFood, Mathf.Max(0.0001f, tau));
     }
 
+    int SampleGeorgeOptionUtilitySoftmax(int currentOpt)
+    {
+        float heatRatio = maxHeat > 0 ? (float)heat / maxHeat : 0f;
+        float satietyRatio = maxSatiety > 0 ? Mathf.Clamp01((float)satiety / maxSatiety) : 1f;
+        float waterRatio = Mathf.Clamp01(water / 12f);
+
+        float needHeat = Mathf.Clamp01(1f - heatRatio);
+        float needFood = Mathf.Clamp01(1f - satietyRatio);
+        float needWater = Mathf.Clamp01(1f - waterRatio);
+
+        float accessFood = DistanceToAccess(GetDistanceToNearestSheep());
+        float accessWater = DistanceToAccess(prevWaterDist > 0f ? prevWaterDist : 999f);
+        float accessHouse = DistanceToAccess(houseTarget != null
+            ? Vector3.Distance(transform.position, houseTarget.position)
+            : 999f);
+
+        float stickFood = currentOpt == OptionFood ? 1f : 0f;
+        float stickWater = currentOpt == OptionWater ? 1f : 0f;
+        float stickHeat = currentOpt == OptionHeat ? 1f : 0f;
+
+        float epsFood = Random.Range(-noise, noise);
+        float epsWater = Random.Range(-noise, noise);
+        float epsHeat = Random.Range(-noise, noise);
+
+        float uFood = 2.5f * needFood + 1.0f * accessFood + stickinessBonus * stickFood + epsFood;
+        float uWater = 2.5f * needWater + 1.0f * accessWater + stickinessBonus * stickWater + epsWater;
+        float uHeat = 2.5f * needHeat + 1.0f * accessHouse + stickinessBonus * stickHeat + epsHeat;
+
+        return SoftmaxSample3(uFood, uWater, uHeat, OptionFood, OptionWater, OptionHeat, Mathf.Max(0.0001f, tau));
+    }
+
+    AgentGoToHouseDiscrete FindCampfireJackInEnv()
+    {
+        var envRoot = TrainingEnvSpace.FindRoot(transform);
+        if (envRoot == null)
+            return null;
+
+        var agents = envRoot.GetComponentsInChildren<AgentGoToHouseDiscrete>(false);
+        for (int i = 0; i < agents.Length; i++)
+        {
+            var agent = agents[i];
+            if (agent == null || TrainingEnvSpace.IsGeorgeAgent(agent) || TwitchEphemeralEffects.IsTwitchClone(agent))
+                continue;
+            return agent;
+        }
+
+        return null;
+    }
+
+    bool IsGeorgeNearBurningCampfire()
+    {
+        var jack = FindCampfireJackInEnv();
+        if (jack == null || jack.CampfireBurnSecondsRemaining <= 0f || houseTarget == null)
+            return false;
+
+        return Vector3.Distance(transform.position, houseTarget.position) <= HouseReach;
+    }
+
+    void UpdateGeorgeWarmthAtCampfire()
+    {
+        if (_deathSequenceStarted || currentOptionTrain != OptionHeat)
+        {
+            _warmthGainTimer = 0f;
+            return;
+        }
+
+        if (!IsGeorgeNearBurningCampfire())
+        {
+            _warmthGainTimer = 0f;
+            return;
+        }
+
+        _warmthGainTimer += Time.deltaTime;
+        if (_warmthGainTimer < warmthGainInterval)
+            return;
+
+        _warmthGainTimer = 0f;
+        if (heat < maxHeat)
+            heat = Mathf.Min(maxHeat, heat + 1);
+        if (warmthRewardAtCampfire != 0f)
+        {
+            AddReward(warmthRewardAtCampfire);
+            FloatingRewardPopup.ShowWarmedUp(transform, warmthRewardAtCampfire);
+        }
+    }
+
     private float DistanceToAccess(float distance)
     {
         if (float.IsNaN(distance) || float.IsInfinity(distance)) return 0f;
@@ -2334,6 +2696,22 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         float e1 = Mathf.Exp(a1 - m);
         float p0 = e0 / (e0 + e1);
         return Random.value < p0 ? 0 : 1;
+    }
+
+    static int SoftmaxSample3(float u0, float u1, float u2, int opt0, int opt1, int opt2, float temperature)
+    {
+        float a0 = u0 / temperature;
+        float a1 = u1 / temperature;
+        float a2 = u2 / temperature;
+        float m = Mathf.Max(a0, Mathf.Max(a1, a2));
+        float e0 = Mathf.Exp(a0 - m);
+        float e1 = Mathf.Exp(a1 - m);
+        float e2 = Mathf.Exp(a2 - m);
+        float sum = e0 + e1 + e2;
+        float r = Random.value * sum;
+        if (r < e0) return opt0;
+        if (r < e0 + e1) return opt1;
+        return opt2;
     }
 
     private bool IsZombieColliderInFrontForDo(Vector3 origin, Collider c)
@@ -2369,6 +2747,122 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         }
 
         return false;
+    }
+
+    bool TryDamageAllyOnDo()
+    {
+        if (allyDoDamage <= 0 && Mathf.Approximately(friendlyFireDoPenalty, 0f))
+            return false;
+
+        Vector3 origin = transform.position;
+        float radius = Mathf.Max(zombieKnockbackRadiusOnDo, 1.6f);
+        Collider[] hits = Physics.OverlapSphere(origin, radius);
+        if (hits == null || hits.Length == 0)
+            return false;
+
+        var envRoot = TrainingEnvSpace.FindRoot(transform);
+        LilyScript bestLily = null;
+        AgentGoToHouseDiscrete bestAlly = null;
+        float bestDist = float.MaxValue;
+
+        for (int i = 0; i < hits.Length; i++)
+        {
+            var c = hits[i];
+            if (c == null)
+                continue;
+            if (!IsZombieColliderInFrontForDo(origin, c))
+                continue;
+
+            var lily = c.GetComponentInParent<LilyScript>();
+            if (lily != null)
+            {
+                if (envRoot != null && !TrainingEnvSpace.IsDescendantOf(lily.transform, envRoot))
+                    continue;
+                float d = Vector3.Distance(origin, c.ClosestPoint(origin));
+                if (d < bestDist)
+                {
+                    bestDist = d;
+                    bestLily = lily;
+                    bestAlly = null;
+                }
+
+                continue;
+            }
+
+            var ally = c.GetComponentInParent<AgentGoToHouseDiscrete>();
+            if (ally == null || ally == this)
+                continue;
+            if (envRoot != null && !TrainingEnvSpace.IsDescendantOf(ally.transform, envRoot))
+                continue;
+
+            float dist = Vector3.Distance(origin, c.ClosestPoint(origin));
+            if (dist < bestDist)
+            {
+                bestDist = dist;
+                bestAlly = ally;
+                bestLily = null;
+            }
+        }
+
+        if (bestLily == null && bestAlly == null)
+            return false;
+
+        if (allyDoDamage > 0)
+        {
+            if (bestLily != null)
+            {
+                bestLily.TakeDamage(allyDoDamage);
+                HeroDamageFeedback.Play(bestLily.transform);
+            }
+            else
+            {
+                bestAlly.TakeDamage(allyDoDamage);
+                HeroDamageFeedback.Play(bestAlly.transform);
+            }
+        }
+
+        if (bestLily != null)
+            ApplyFriendlyKnockbackOnly(bestLily.transform);
+        else if (bestAlly != null)
+            ApplyFriendlyKnockbackOnly(bestAlly.transform);
+
+        if (friendlyFireDoPenalty != 0f)
+        {
+            AddReward(friendlyFireDoPenalty);
+            currentStepReward += friendlyFireDoPenalty;
+        }
+
+        return true;
+    }
+
+    void ApplyFriendlyKnockbackOnly(Transform victim)
+    {
+        if (victim == null)
+            return;
+
+        var lily = victim.GetComponentInParent<LilyScript>();
+        if (lily != null)
+        {
+            lily.ApplyFriendlyKnockbackFrom(transform.position, allyKnockbackDistance, allyKnockbackUp);
+            return;
+        }
+
+        Vector3 dir = victim.position - transform.position;
+        dir.y = 0f;
+        if (dir.sqrMagnitude < 1e-4f)
+            dir = transform.forward;
+        dir.Normalize();
+
+        Vector3 delta = dir * allyKnockbackDistance + Vector3.up * allyKnockbackUp;
+        var cc = victim.GetComponent<CharacterController>();
+        if (cc != null && cc.enabled)
+            cc.Move(delta);
+        else
+            victim.position += delta;
+
+        var ally = victim.GetComponent<AgentGoToHouseDiscrete>();
+        if (ally != null)
+            ally.StunForSeconds(0.35f);
     }
 
     private bool KnockbackNearbyZombiesOnDo(out bool zombieKilled)
@@ -2521,7 +3015,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     }
 
     protected virtual bool GetHeuristicChopPressed() =>
-        TrainingEnvSpace.IsGeorgeAgent(this) ? Input.GetMouseButton(1) : Input.GetMouseButton(0);
+        Input.GetMouseButton(0);
 
     public override void Heuristic(in ActionBuffers actionsOut)
     {

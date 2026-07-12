@@ -13,6 +13,8 @@ public class ZombieChase : MonoBehaviour
     [Header("Movement")]
     [SerializeField] private float moveSpeed = 0.5f;
     [SerializeField] private float rotationSpeed = 120f;
+    [Tooltip("На этой дистанции зомби останавливается и бьёт, не залезая на цель.")]
+    [SerializeField] private float stopDistance = 1.25f;
 
     [Header("Path (optional)")]
     [Tooltip("Если true — зомби идёт по точкам внутри pathRoot (FirstPoint, SecondPoint...) вместо преследования целей.")]
@@ -73,20 +75,54 @@ public class ZombieChase : MonoBehaviour
         if (envRoot == null)
             return;
 
-        var jacks = envRoot.GetComponentsInChildren<AgentGoToHouseDiscrete>(false);
-        for (int i = 0; i < jacks.Length; i++)
+        var agents = envRoot.GetComponentsInChildren<AgentGoToHouseDiscrete>(false);
+        for (int i = 0; i < agents.Length; i++)
         {
-            var jack = jacks[i];
-            if (jack != null && !TwitchEphemeralEffects.IsTwitchClone(jack))
-            {
-                jackTarget = jack.transform;
-                break;
-            }
+            var agent = agents[i];
+            if (!IsValidChaseAgent(agent))
+                continue;
+
+            if (TrainingEnvSpace.IsGeorgeAgent(agent))
+                continue;
+
+            jackTarget = agent.transform;
+            break;
         }
 
         var lily = envRoot.GetComponentInChildren<LilyScript>(false);
-        if (lily != null)
+        if (lily != null && lily.Hp > 0)
             lilyTarget = lily.transform;
+    }
+
+    static bool IsValidChaseAgent(AgentGoToHouseDiscrete agent)
+    {
+        if (agent == null || !agent.gameObject.activeInHierarchy)
+            return false;
+        if (TwitchEphemeralEffects.IsTwitchClone(agent))
+            return false;
+        return agent.IsAliveForTwitch;
+    }
+
+    static bool IsValidChaseLily(LilyScript lily)
+    {
+        return lily != null && lily.gameObject.activeInHierarchy && lily.Hp > 0;
+    }
+
+    float GetEffectiveStopDistance() => stopDistance;
+
+    static void TryPickNearest(Transform candidate, Vector3 fromPos, ref Transform best, ref float bestDist)
+    {
+        if (candidate == null || !candidate.gameObject.activeInHierarchy)
+            return;
+
+        Vector3 p = candidate.position;
+        p.y = 0f;
+        float d = Vector3.Distance(fromPos, p);
+        if (d < bestDist)
+        {
+            bestDist = d;
+            best = candidate;
+        }
     }
 
     public void EnableAgentChaseMode()
@@ -144,7 +180,7 @@ public class ZombieChase : MonoBehaviour
     {
         controller = GetComponent<CharacterController>();
         rb = GetComponent<Rigidbody>();
-        animator = GetComponent<Animator>();
+        animator = GetComponent<Animator>() ?? GetComponentInChildren<Animator>();
         useRigidbody = (controller == null && rb != null);
 
         var envRoot = TrainingEnvSpace.FindRoot(transform);
@@ -199,15 +235,23 @@ public class ZombieChase : MonoBehaviour
         }
 
         Vector3 dir = delta.normalized;
-        _walkAnimIntent = 1f;
+        float dist = delta.magnitude;
+        float stopAt = GetEffectiveStopDistance();
 
-        // Поворот в сторону цели
         Quaternion targetRot = Quaternion.LookRotation(dir);
         transform.rotation = Quaternion.RotateTowards(
             transform.rotation,
             targetRot,
             rotationSpeed * Time.deltaTime
         );
+
+        if (dist <= stopAt)
+        {
+            _walkAnimIntent = 0f;
+            return;
+        }
+
+        _walkAnimIntent = 1f;
 
         if (controller != null)
         {
@@ -249,6 +293,15 @@ public class ZombieChase : MonoBehaviour
         delta.y = 0f;
         if (delta.sqrMagnitude < 0.001f) return;
         Vector3 dir = delta.normalized;
+        float dist = delta.magnitude;
+        float stopAt = GetEffectiveStopDistance();
+
+        if (dist <= stopAt)
+        {
+            rb.linearVelocity = new Vector3(0f, rb.linearVelocity.y, 0f);
+            _walkAnimIntent = 0f;
+            return;
+        }
 
         Vector3 vel = dir * moveSpeed;
         vel.y = rb.linearVelocity.y + gravity * Time.fixedDeltaTime;
@@ -413,40 +466,40 @@ public class ZombieChase : MonoBehaviour
             animator.SetFloat("Speed", target);
     }
 
-    /// <summary>Ближайшая цель по горизонтали (XZ).</summary>
+    /// <summary>Ближайший живой Jack, George или Lily в этом Env.</summary>
     private Transform GetClosestTarget()
     {
         Vector3 pos = transform.position;
         pos.y = 0f;
 
-        float distJack = float.MaxValue;
-        if (jackTarget != null)
+        Transform best = null;
+        float bestDist = float.MaxValue;
+
+        var envRoot = TrainingEnvSpace.FindRoot(transform);
+        if (envRoot != null)
         {
-            var jackGo = jackTarget.gameObject;
-            if (jackGo != null && jackGo.activeInHierarchy)
+            var agents = envRoot.GetComponentsInChildren<AgentGoToHouseDiscrete>(false);
+            for (int i = 0; i < agents.Length; i++)
             {
-                Vector3 j = jackTarget.position;
-                j.y = 0f;
-                distJack = Vector3.Distance(pos, j);
+                if (!IsValidChaseAgent(agents[i]))
+                    continue;
+                TryPickNearest(agents[i].transform, pos, ref best, ref bestDist);
             }
+
+            var lilies = envRoot.GetComponentsInChildren<LilyScript>(false);
+            for (int i = 0; i < lilies.Length; i++)
+            {
+                if (!IsValidChaseLily(lilies[i]))
+                    continue;
+                TryPickNearest(lilies[i].transform, pos, ref best, ref bestDist);
+            }
+
+            if (best != null)
+                return best;
         }
 
-        float distLily = float.MaxValue;
-        if (lilyTarget != null)
-        {
-            var lilyGo = lilyTarget.gameObject;
-            if (lilyGo != null && lilyGo.activeInHierarchy)
-            {
-                Vector3 l = lilyTarget.position;
-                l.y = 0f;
-                distLily = Vector3.Distance(pos, l);
-            }
-        }
-
-        if (distJack <= distLily && jackTarget != null)
-            return jackTarget;
-        if (lilyTarget != null)
-            return lilyTarget;
-        return null;
+        TryPickNearest(jackTarget, pos, ref best, ref bestDist);
+        TryPickNearest(lilyTarget, pos, ref best, ref bestDist);
+        return best;
     }
 }
