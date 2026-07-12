@@ -17,6 +17,11 @@ set -o pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 cd "${ROOT}"
 
+# shellcheck source=train_scripts/lab_comp/lab_comp_env.bash
+if [ -f "${ROOT}/train_scripts/lab_comp/lab_comp_env.bash" ]; then
+  source "${ROOT}/train_scripts/lab_comp/lab_comp_env.bash"
+fi
+
 BUILD="${BUILD:-stream_forest_survival_2_12_07_2026}"
 RUN_ID="${RUN_ID:-jack_lily_george_1}"
 TIME_SCALE="${TIME_SCALE:-1}"

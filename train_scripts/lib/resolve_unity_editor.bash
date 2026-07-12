@@ -10,7 +10,8 @@ resolve_unity_editor() {
   for p in \
     "${HOME}/Unity/Hub/Editor/"*/Editor/Unity \
     "${HOME}/.local/share/Unity/Hub/Editor/"*/Editor/Unity \
-    "/opt/unity/Editor/Unity"; do
+    "/opt/unity/Editor/Unity" \
+    "/usr/local/Unity/Editor/Unity"; do
     if [ -x "${p}" ]; then
       echo "${p}"
       return 0

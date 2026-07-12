@@ -28,4 +28,5 @@ rsync -avz --progress -e "${RSYNC_SSH}" \
   train_headless_jack_lily_george.bash \
   "${REMOTE}:${REMOTE_DIR}/"
 
-echo "[sync] done"
+echo "[sync] lab_comp run scripts included in train_scripts/"
+echo "[sync] done — на сервере: bash train_scripts/lab_comp/detect_unity_editor.bash"
