@@ -703,7 +703,8 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         }
 
         if (TrainingEnvSpace.IsPresentationTransform(transform)
-            && !TwitchEphemeralEffects.IsTwitchClone(this))
+            && !TwitchEphemeralEffects.IsTwitchClone(this)
+            && !TrainingEnvSpace.IsStreamOnlyMode)
             ProcessGlobalManualKeysOnce();
 
         ProcessHeuristicOptionKeys();
@@ -786,6 +787,8 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
 
     protected virtual bool IsManualOptionControlActive()
     {
+        if (TrainingEnvSpace.IsStreamOnlyMode)
+            return false;
         if (!TrainingEnvSpace.IsPresentationTransform(transform))
             return false;
         if (TwitchEphemeralEffects.IsTwitchClone(this))
@@ -3011,6 +3014,8 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
 
     protected virtual bool IsManualWasdControlActive()
     {
+        if (TrainingEnvSpace.IsStreamOnlyMode)
+            return false;
         if (TrainingEnvSpace.IsGeorgeAgent(this))
             return ManualPlayControl.GeorgeManualActive;
         return !ManualPlayControl.GeorgeManualActive;

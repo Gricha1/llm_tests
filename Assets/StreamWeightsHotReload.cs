@@ -105,6 +105,9 @@ public sealed class StreamWeightsHotReload : MonoBehaviour
             _loadedSignature[behaviorName] = signature;
             Debug.Log($"[StreamWeightsHotReload] hot reload {behaviorName} <- {sentisPath}");
         }
+
+        if (_loadedSignature.Count > 0)
+            Debug.Log($"[StreamWeightsHotReload] активные модели: {string.Join(", ", _loadedSignature.Keys)}");
     }
 
     static bool TryLoadStableFile(string path)

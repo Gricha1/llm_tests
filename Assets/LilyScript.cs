@@ -681,6 +681,8 @@ public class LilyScript : Agent, IHasHp
 
     static bool IsManualControlActive(Transform t)
     {
+        if (TrainingEnvSpace.IsStreamOnlyMode)
+            return false;
         if (!TrainingEnvSpace.IsPresentationTransform(t))
             return false;
 
