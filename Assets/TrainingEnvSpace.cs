@@ -28,6 +28,8 @@ public static class TrainingEnvSpace
     static EnvRunMode _runMode = EnvRunMode.All;
     static int _singleEnvTaskCopyIndex = -1;
     static string _streamWeightsDirectory;
+    static bool _cachedHasMultipleEnvs;
+    static bool _envCountsCached;
 
     public static bool IsStreamOnlyMode => _runMode == EnvRunMode.StreamOnly;
     public static string StreamWeightsDirectory => _streamWeightsDirectory;
@@ -135,9 +137,13 @@ public static class TrainingEnvSpace
             ? ReadForestStreamWeightsDirFromArgs()
             : null;
         EnvTrainingConfig.ClearForcedCopyIndex();
+        InvalidateEnvCountsCache();
 
         if (_runMode == EnvRunMode.All)
+        {
+            CacheEnvCounts();
             return;
+        }
 
         _presentationRoot = null;
         var presentation = PresentationRoot;
@@ -184,7 +190,27 @@ public static class TrainingEnvSpace
 
         _presentationRoot = null;
         Debug.Log($"[TrainingEnvSpace] EnvRunMode={_runMode}");
+        CacheEnvCounts();
     }
+
+    static void InvalidateEnvCountsCache() => _envCountsCached = false;
+
+    static void CacheEnvCounts()
+    {
+        int active = 0;
+        foreach (var envRoot in FindAllEnvRoots())
+        {
+            if (envRoot != null && envRoot.gameObject.activeInHierarchy)
+                active++;
+        }
+
+        _cachedHasMultipleEnvs = active > 1;
+        _envCountsCached = true;
+    }
+
+    /// <summary>Editor Play с одной Env — без train/stream флагов.</summary>
+    public static bool IsSingleEnvPlayMode() =>
+        _runMode == EnvRunMode.All && _envCountsCached && !_cachedHasMultipleEnvs && !IsStreamOnlyMode;
 
     public static bool ParallelEnvsVisible => _parallelEnvsVisible;
 
@@ -283,6 +309,9 @@ public static class TrainingEnvSpace
         if (IsStreamOnlyMode)
             return envRoot == PresentationRoot;
 
+        if (IsSingleEnvPlayMode() && !IsMlAgentsTrainingActive())
+            return envRoot == PresentationRoot;
+
         var cfg = envRoot.GetComponent<EnvTrainingConfig>();
         if (cfg != null)
             return cfg.ResolveTask() == EnvTrainingTask.PresentationFull;
@@ -340,6 +369,18 @@ public static class TrainingEnvSpace
 
     public static bool IsPresentationTransform(Transform t)
     {
+        if (t == null)
+            return !IsMlAgentsTrainingActive();
+
+        // Быстрый путь: одна Env в Play — как до chunk 5, без ResolveTask/обхода сцены.
+        if (IsSingleEnvPlayMode() && !IsMlAgentsTrainingActive())
+        {
+            var presentation = PresentationRoot;
+            if (presentation == null)
+                return true;
+            return IsDescendantOf(t, presentation);
+        }
+
         var root = FindRoot(t);
         if (root == null)
             return !IsMlAgentsTrainingActive();
@@ -347,10 +388,10 @@ public static class TrainingEnvSpace
         if (!IsPresentationStreamEnv(root))
             return false;
 
-        var presentation = PresentationRoot;
-        if (presentation == null || t == null)
+        var presentationRoot = PresentationRoot;
+        if (presentationRoot == null)
             return true;
-        return IsDescendantOf(t, presentation);
+        return IsDescendantOf(t, presentationRoot);
     }
 
     public static bool ShouldPlayFeedback(Transform source)
@@ -665,14 +706,9 @@ public static class TrainingEnvSpace
 
     public static bool HasMultipleTrainingEnvs()
     {
-        int active = 0;
-        foreach (var envRoot in FindAllEnvRoots())
-        {
-            if (envRoot != null && envRoot.gameObject.activeInHierarchy)
-                active++;
-        }
-
-        return active > 1;
+        if (!_envCountsCached)
+            CacheEnvCounts();
+        return _cachedHasMultipleEnvs;
     }
 
     public static Transform[] GetAllEnvRoots()

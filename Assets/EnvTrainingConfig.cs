@@ -220,6 +220,14 @@ public sealed class EnvTrainingConfig : MonoBehaviour
             return;
 
         _initialSetupDone = true;
+        EnsureHeroCache();
+        HideLegacyHeroShells();
+
+        if (TrainingEnvSpace.IsSingleEnvPlayMode()
+            && TrainingEnvSpace.IsPresentationEnv(transform)
+            && !TrainingEnvSpace.IsMlAgentsTrainingActive())
+            return;
+
         var resolved = ResolveTask();
         ApplyTrainingCampfire(resolved);
         ApplyAgentVisibility(resolved);
