@@ -14,15 +14,15 @@ public static class GeorgeHudBootstrap
     internal static void EnsureAll()
     {
         foreach (var d in Resources.FindObjectsOfTypeAll<GeorgeWaterDisplay>())
-            if (d != null) { EnsureHudVisible(d); d.ApplyLayoutPosition(); }
+            if (d != null && ForestSceneBootstrap.IsLoadedSceneComponent(d)) { EnsureHudVisible(d); d.ApplyLayoutPosition(); }
         foreach (var d in Resources.FindObjectsOfTypeAll<GeorgeSatietyDisplay>())
-            if (d != null) { EnsureHudVisible(d); d.ApplyLayoutPosition(); }
+            if (d != null && ForestSceneBootstrap.IsLoadedSceneComponent(d)) { EnsureHudVisible(d); d.ApplyLayoutPosition(); }
         foreach (var d in Resources.FindObjectsOfTypeAll<GeorgeHeatDisplay>())
-            if (d != null) { EnsureHudVisible(d); d.ApplyLayoutPosition(); }
+            if (d != null && ForestSceneBootstrap.IsLoadedSceneComponent(d)) { EnsureHudVisible(d); d.ApplyLayoutPosition(); }
 
         foreach (var d in Resources.FindObjectsOfTypeAll<GeorgeWoodDisplay>())
         {
-            if (d != null && d.gameObject != null)
+            if (d != null && d.gameObject != null && ForestSceneBootstrap.IsLoadedSceneComponent(d))
                 Object.Destroy(d.gameObject);
         }
 

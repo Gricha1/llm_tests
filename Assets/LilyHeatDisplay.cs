@@ -17,7 +17,7 @@ public class LilyHeatDisplay : MonoBehaviour
         var displays = Resources.FindObjectsOfTypeAll<LilyHeatDisplay>();
         for (int i = 0; i < displays.Length; i++)
         {
-            if (displays[i] != null)
+            if (displays[i] != null && ForestSceneBootstrap.IsLoadedSceneComponent(displays[i]))
             {
                 displays[i].EnsureHudVisible();
                 displays[i].ApplyLayoutPosition();

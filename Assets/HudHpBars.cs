@@ -71,7 +71,8 @@ public sealed class HudHpBars : MonoBehaviour
         for (int i = 0; i < all.Length; i++)
         {
             var h = all[i];
-            if (h == null) continue;
+            if (h == null || !ForestSceneBootstrap.IsLoadedSceneComponent(h))
+                continue;
             var go = h.gameObject;
             var sc = go.scene;
             if (sc.IsValid() && sc.isLoaded)

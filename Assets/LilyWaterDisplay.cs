@@ -19,7 +19,7 @@ public class LilyWaterDisplay : MonoBehaviour
         var displays = Resources.FindObjectsOfTypeAll<LilyWaterDisplay>();
         for (int i = 0; i < displays.Length; i++)
         {
-            if (displays[i] != null)
+            if (displays[i] != null && ForestSceneBootstrap.IsLoadedSceneComponent(displays[i]))
                 displays[i].EnsureHudVisible();
         }
     }

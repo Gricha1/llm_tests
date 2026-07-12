@@ -23,11 +23,11 @@ public class RewardDisplay : MonoBehaviour
         var displays = Resources.FindObjectsOfTypeAll<RewardDisplay>();
         for (int i = 0; i < displays.Length; i++)
         {
-            if (displays[i] != null)
-            {
-                displays[i].EnsureHudVisible();
-                displays[i].ApplyLayout();
-            }
+            if (displays[i] == null || !ForestSceneBootstrap.IsLoadedSceneComponent(displays[i]))
+                continue;
+
+            displays[i].EnsureHudVisible();
+            displays[i].ApplyLayout();
         }
     }
 
