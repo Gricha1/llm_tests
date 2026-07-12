@@ -52,6 +52,7 @@ public sealed class StreamWeightsHotReload : MonoBehaviour
 
         Directory.CreateDirectory(_weightsDir);
         Debug.Log($"[StreamWeightsHotReload] watch dir={_weightsDir}");
+        ConfigurePresentationAgents();
         TryReloadAll(force: true);
     }
 
@@ -152,5 +153,45 @@ public sealed class StreamWeightsHotReload : MonoBehaviour
         }
 
         return applied;
+    }
+
+    static void ConfigurePresentationAgents()
+    {
+        var root = TrainingEnvSpace.PresentationRoot;
+        if (root == null)
+            return;
+
+        foreach (var jack in root.GetComponentsInChildren<AgentGoToHouseDiscrete>(true))
+        {
+            if (jack != null && jack.gameObject.activeInHierarchy)
+                jack.EnsureRuntimeAnimator();
+        }
+
+        foreach (var lily in root.GetComponentsInChildren<LilyScript>(true))
+        {
+            if (lily == null || !lily.gameObject.activeInHierarchy)
+                continue;
+
+            var animator = lily.GetComponent<Animator>() ?? lily.GetComponentInChildren<Animator>(true);
+            if (animator != null && animator.runtimeAnimatorController == null)
+            {
+                var fallback = DefaultHeroAnimatorController.ForAgent(lily);
+                if (fallback != null)
+                    animator.runtimeAnimatorController = fallback;
+            }
+        }
+
+        foreach (var bp in root.GetComponentsInChildren<BehaviorParameters>(true))
+        {
+            if (bp == null || TwitchEphemeralEffects.IsTwitchClone(bp))
+                continue;
+
+            var agent = bp.GetComponent<Agent>();
+            if (agent == null || !agent.gameObject.activeInHierarchy)
+                continue;
+
+            agent.LazyInitialize();
+            bp.BehaviorType = BehaviorType.InferenceOnly;
+        }
     }
 }

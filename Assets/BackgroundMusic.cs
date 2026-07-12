@@ -35,6 +35,9 @@ public sealed class BackgroundMusic : MonoBehaviour
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
     static void Bootstrap()
     {
+        if (!TrainingEnvSpace.ShouldPlayAmbientAudio())
+            return;
+
         if (FindObjectOfType<BackgroundMusic>() != null)
             return;
 

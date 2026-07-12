@@ -20,6 +20,9 @@ public sealed class ZombieAmbienceAudio : MonoBehaviour
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
     static void Bootstrap()
     {
+        if (!TrainingEnvSpace.ShouldPlayAmbientAudio())
+            return;
+
         if (FindObjectOfType<ZombieAmbienceAudio>() != null)
             return;
 
@@ -82,6 +85,9 @@ public sealed class ZombieAmbienceAudio : MonoBehaviour
 
     static bool ShouldPlayAmbience()
     {
+        if (!TrainingEnvSpace.ShouldPlayAmbientAudio())
+            return false;
+
         if (!TrainingEnvSpace.HasMultipleTrainingEnvs())
             return true;
 

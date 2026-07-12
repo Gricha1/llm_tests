@@ -228,6 +228,13 @@ public sealed class EnvTrainingConfig : MonoBehaviour
             && !TrainingEnvSpace.IsMlAgentsTrainingActive())
             return;
 
+        if (TrainingEnvSpace.IsStreamOnlyMode && TrainingEnvSpace.IsPresentationEnv(transform))
+        {
+            ApplyTrainingCampfire(EnvTrainingTask.PresentationFull);
+            ApplyAgentVisibility(EnvTrainingTask.PresentationFull);
+            return;
+        }
+
         var resolved = ResolveTask();
         ApplyTrainingCampfire(resolved);
         ApplyAgentVisibility(resolved);

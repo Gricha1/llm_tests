@@ -15,12 +15,16 @@ public static class DefaultHeroAnimatorController
 
     public static RuntimeAnimatorController ForAgent(Component agent)
     {
+        var fromCatalog = HeroAnimatorCatalog.ForAgent(agent);
+        if (fromCatalog != null)
+            return fromCatalog;
+
         if (agent is LilyScript)
-            return _lily ??= Load(LilyPath);
-        return _jack ??= Load(JackPath);
+            return _lily ??= LoadEditor(LilyPath);
+        return _jack ??= LoadEditor(JackPath);
     }
 
-    static RuntimeAnimatorController Load(string assetPath)
+    static RuntimeAnimatorController LoadEditor(string assetPath)
     {
 #if UNITY_EDITOR
         return UnityEditor.AssetDatabase.LoadAssetAtPath<RuntimeAnimatorController>(assetPath);

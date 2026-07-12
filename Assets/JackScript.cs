@@ -1239,6 +1239,8 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
             animator.runtimeAnimatorController = fallback;
     }
 
+    public void EnsureRuntimeAnimator() => ResolveAnimatorReference();
+
     private void ApplyWalkAnimatorSpeed()
     {
         if (animator == null || controller == null) return;

@@ -261,8 +261,22 @@ public static class TrainingEnvSpace
         ApplyEnvRunMode();
         _parallelEnvsVisible = IsShowParallelEnvsRequested();
         ApplyParallelEnvPresentation();
+        ApplyTrainProcessSilence();
         EnsureTrainingConfigs();
         EnsureEnvLocalHierarchyComponents();
+    }
+
+    static void ApplyTrainProcessSilence()
+    {
+        if (!IsTrainCopiesOnlyMode && !IsSingleEnvByPortMode)
+            return;
+
+        AudioListener.volume = 0f;
+        foreach (var listener in Object.FindObjectsByType<AudioListener>(FindObjectsInactive.Include, FindObjectsSortMode.None))
+        {
+            if (listener != null)
+                listener.enabled = false;
+        }
     }
 
     static void ApplyParallelEnvPresentation()
@@ -396,6 +410,9 @@ public static class TrainingEnvSpace
 
     public static bool ShouldPlayFeedback(Transform source)
     {
+        if (IsTrainCopiesOnlyMode || IsSingleEnvByPortMode)
+            return false;
+
         var root = PresentationRoot;
         if (root == null)
             return true;
@@ -403,6 +420,9 @@ public static class TrainingEnvSpace
             return false;
         return IsDescendantOf(source, root);
     }
+
+    public static bool ShouldPlayAmbientAudio() =>
+        !IsTrainCopiesOnlyMode && !IsSingleEnvByPortMode;
 
     public static T FindInPresentation<T>() where T : Component
     {
