@@ -88,9 +88,18 @@ public sealed class TwitchChatReader : MonoBehaviour
 
     void Start()
     {
-        if (connectOnPlay)
-            _ = ConnectAsync();
+#if UNITY_EDITOR
+        if (!connectOnPlay || !IsTruthyEnv(System.Environment.GetEnvironmentVariable("FOREST_TWITCH_CONNECT")))
+            return;
+#else
+        if (!connectOnPlay)
+            return;
+#endif
+        _ = ConnectAsync();
     }
+
+    static bool IsTruthyEnv(string value) =>
+        value == "1" || string.Equals(value, "true", System.StringComparison.OrdinalIgnoreCase);
 
     void Update()
     {

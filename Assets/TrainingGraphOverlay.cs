@@ -104,8 +104,16 @@ public sealed class TrainingGraphOverlay : MonoBehaviour
         if (toggleKey != KeyCode.None && Input.GetKeyDown(toggleKey))
             visible = !visible;
 
-        // Важно: трекинг награды идёт ВСЕГДА, даже когда UI скрыт,
-        // иначе #show metrics не видит историю «за всё время обучения».
+        bool trainingActive = Academy.IsInitialized && Academy.Instance.IsCommunicatorOn;
+        if (!trainingActive && Time.frameCount % 10 != 0)
+        {
+            bool showOnly = visible && ShouldShow();
+            if (_panel != null)
+                _panel.SetActive(showOnly);
+            return;
+        }
+
+        // Важно: трекинг награды идёт периодически (не каждый кадр в Play без обучения).
         RefreshTrackers();
         TrackAll(_jackTrackers, _jackRewards, ref _jackEma, ref _jackLastRaw,
             ref _jackAggSum, ref _jackAggCount, notifyPolicyStats: true,

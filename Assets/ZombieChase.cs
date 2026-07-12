@@ -37,9 +37,13 @@ public class ZombieChase : MonoBehaviour
     [Tooltip("Сглаживание Speed в Animator (0 = выкл).")]
     [SerializeField] private float walkAnimSpeedDamp = 0f;
 
+    static readonly int SpeedParamHash = Animator.StringToHash("Speed");
+
     private CharacterController controller;
     private Rigidbody rb;
     private Animator animator;
+    private bool _speedParamResolved;
+    private bool _hasSpeedParam;
     private float verticalVelocity;
     private bool useRigidbody;
     private float _baseMoveSpeed;
@@ -174,6 +178,26 @@ public class ZombieChase : MonoBehaviour
         _pathWaitLeft = 0f;
         _baseMoveSpeedCaptured = false;
         _moveSpeedMultiplier = 1f;
+        _speedParamResolved = false;
+        _hasSpeedParam = false;
+    }
+
+    void ResolveWalkSpeedParam()
+    {
+        _speedParamResolved = true;
+        _hasSpeedParam = false;
+        if (animator == null)
+            return;
+
+        for (int i = 0; i < animator.parameterCount; i++)
+        {
+            var p = animator.GetParameter(i);
+            if (p.type == AnimatorControllerParameterType.Float && p.nameHash == SpeedParamHash)
+            {
+                _hasSpeedParam = true;
+                return;
+            }
+        }
     }
 
     private void Start()
@@ -182,6 +206,8 @@ public class ZombieChase : MonoBehaviour
         rb = GetComponent<Rigidbody>();
         animator = GetComponent<Animator>() ?? GetComponentInChildren<Animator>();
         useRigidbody = (controller == null && rb != null);
+        _speedParamResolved = false;
+        ResolveWalkSpeedParam();
 
         var envRoot = TrainingEnvSpace.FindRoot(transform);
         if (envRoot != null)
@@ -432,11 +458,17 @@ public class ZombieChase : MonoBehaviour
 
     private void ApplyWalkAnimatorSpeed()
     {
-        if (animator == null) return;
+        if (animator == null)
+            return;
+
+        if (!_speedParamResolved)
+            ResolveWalkSpeedParam();
+        if (!_hasSpeedParam)
+            return;
 
         if (Time.time < stunnedUntilTime)
         {
-            animator.SetFloat("Speed", 0f);
+            animator.SetFloat(SpeedParamHash, 0f);
             return;
         }
 
@@ -461,9 +493,9 @@ public class ZombieChase : MonoBehaviour
             target = 0f;
 
         if (walkAnimSpeedDamp > 0f)
-            animator.SetFloat("Speed", target, walkAnimSpeedDamp, Time.deltaTime);
+            animator.SetFloat(SpeedParamHash, target, walkAnimSpeedDamp, Time.deltaTime);
         else
-            animator.SetFloat("Speed", target);
+            animator.SetFloat(SpeedParamHash, target);
     }
 
     /// <summary>Ближайший живой Jack, George или Lily в этом Env.</summary>
