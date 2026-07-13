@@ -234,6 +234,14 @@ public sealed class EnvTrainingConfig : MonoBehaviour
             return;
         }
 
+        if (TrainingEnvSpace.IsPresentationWorkerProcess)
+        {
+            ApplyAgentVisibility(EnvTrainingTask.PresentationFull);
+            if (TrainingEnvSpace.IsMlAgentsTrainingActive())
+                ApplyAgentRoles(EnvTrainingTask.PresentationFull);
+            return;
+        }
+
         var resolved = ResolveTask();
         ApplyTrainingCampfire(resolved);
         ApplyAgentVisibility(resolved);
@@ -402,6 +410,10 @@ public sealed class EnvTrainingConfig : MonoBehaviour
     void ApplyAgentRoles(EnvTrainingTask resolved)
     {
         if (!TrainingEnvSpace.IsMlAgentsTrainingActive())
+            return;
+        // Presentation worker тоже Default+train (пока нет sentis hot reload на сервере).
+        if (TrainingEnvSpace.IsPresentationWorkerProcess
+            && resolved != EnvTrainingTask.PresentationFull)
             return;
 
         var agents = GetComponentsInChildren<AgentGoToHouseDiscrete>(true);

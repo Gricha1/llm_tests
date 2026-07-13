@@ -57,6 +57,8 @@ public class LilyScript : Agent, IHasHp
     [SerializeField] private bool showOptionTaskIcon = true;
 
     internal Sprite GetOptionHeatSpriteForShare() => optionHeatSprite;
+    internal Sprite GetOptionWaterSpriteForShare() => optionWaterSprite;
+    internal Sprite GetOptionFoodSpriteForShare() => optionFoodSprite;
 
     private bool _lastShowOptionTaskIcon = true;
 

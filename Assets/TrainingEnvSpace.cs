@@ -37,6 +37,7 @@ public static class TrainingEnvSpace
 
     static EnvRunMode _runMode = EnvRunMode.All;
     static int _singleEnvTaskCopyIndex = -1;
+    static int _singleEnvWorkerIndex = -1;
     static bool _presentationWorkerZero;
     static string _streamWeightsDirectory;
     static bool _cachedHasMultipleEnvs;
@@ -47,13 +48,55 @@ public static class TrainingEnvSpace
     public static bool IsTrainCopiesOnlyMode => _runMode == EnvRunMode.TrainCopiesOnly;
     public static bool IsSingleEnvByPortMode => _runMode == EnvRunMode.SingleEnvByPort;
     public static int SingleEnvWorkerCopyIndex => _singleEnvTaskCopyIndex;
+    public static int SingleEnvWorkerIndex => _singleEnvWorkerIndex;
     public static bool IsTrainWithPresentationMode => _runMode == EnvRunMode.TrainWithPresentation;
-    /// <summary>SingleEnvByPort worker 0: presentation для OBS, workers 1–11 headless.</summary>
+    /// <summary>worker 0: OBS stream, InferenceOnly + hot reload.</summary>
+    /// <summary>worker 0 с графикой для OBS (не используется, если train all-headless + stream отдельно).</summary>
     public static bool IsPresentationWorkerProcess =>
-        IsSingleEnvByPortMode && _presentationWorkerZero && _singleEnvTaskCopyIndex == 0;
-    /// <summary>Train worker: SingleEnvByPort без presentation (workers 1–11 или все 11 без OBS).</summary>
+        IsSingleEnvByPortMode
+        && _presentationWorkerZero
+        && _singleEnvWorkerIndex == 0
+        && !IsTrainAllHeadlessRequested();
+
+    /// <summary>Train: все SingleEnvByPort без окна; стрим — отдельный процесс.</summary>
+    public static bool IsTrainAllHeadlessRequested()
+    {
+        if (IsTruthyEnv(System.Environment.GetEnvironmentVariable("FOREST_TRAIN_ALL_HEADLESS")))
+            return true;
+        foreach (var arg in System.Environment.GetCommandLineArgs())
+        {
+            if (arg == "-forestTrainAllHeadless" || arg == "--forest-train-all-headless")
+                return true;
+        }
+        return false;
+    }
+
+    /// <summary>Headless PresentationFull (worker 0 при all-headless train).</summary>
+    public static bool IsPresentationFullTrainWorker =>
+        IsSingleEnvByPortMode
+        && _presentationWorkerZero
+        && _singleEnvWorkerIndex == 0;
+
+    /// <summary>Стрим с Python onnxruntime: без Sentis hot reload, Behavior=Default.</summary>
+    public static bool IsExternalPythonBrainStream =>
+        IsStreamOnlyMode && IsExternalPythonBrainRequested();
+
+    static bool IsExternalPythonBrainRequested()
+    {
+        if (IsTruthyEnv(System.Environment.GetEnvironmentVariable("FOREST_STREAM_EXTERNAL_BRAIN")))
+            return true;
+        foreach (var arg in System.Environment.GetCommandLineArgs())
+        {
+            if (arg == "-forestExternalBrain" || arg == "--forest-external-brain")
+                return true;
+        }
+        return false;
+    }
+
+    /// <summary>Train worker: не graphics OBS (при all-headless — все включая w0).</summary>
     public static bool IsHeadlessTrainWorkerProcess =>
-        IsTrainCopiesOnlyMode || (IsSingleEnvByPortMode && !IsPresentationWorkerProcess);
+        IsTrainCopiesOnlyMode
+        || (IsSingleEnvByPortMode && !IsPresentationWorkerProcess);
     public static bool IsLivePresentationForObs =>
         IsStreamOnlyMode || IsTrainWithPresentationMode || IsPresentationWorkerProcess;
 
@@ -167,39 +210,56 @@ public static class TrainingEnvSpace
         return false;
     }
 
-    static int ResolveSingleEnvTaskCopyIndex()
+    static int ResolveSingleEnvWorkerIndex()
     {
         int mlPort = ReadMlAgentsPortFromArgs();
         int basePort = ReadForestBasePortFromArgs();
         if (mlPort < 0 || basePort < 0)
             return -1;
 
-        int worker = mlPort - basePort;
+        return mlPort - basePort;
+    }
+
+    static int ResolveTaskCopyIndexForWorker(int worker)
+    {
+        if (worker < 0)
+            return -1;
 
         if (_presentationWorkerZero)
         {
+            // Train: worker 0 = PresentationFull (headless), 1–11 = узкие задачи.
+            // Stream — отдельный процесс (не в num-envs).
             if (worker < 0 || worker > 11)
                 return -1;
-            // worker 0 → PresentationFull, workers 1–11 → train tasks
             return worker;
         }
 
         if (worker < 0 || worker > 10)
             return -1;
 
-        // legacy 11 workers: worker 0 → JackWood … worker 10 → GeorgeHeat
         return worker + 1;
+    }
+
+    static int ResolveSingleEnvTaskCopyIndex() =>
+        ResolveTaskCopyIndexForWorker(_singleEnvWorkerIndex);
+
+    static void RefreshStreamWeightsDirectory()
+    {
+        if (_runMode == EnvRunMode.StreamOnly
+            || (_presentationWorkerZero && _singleEnvWorkerIndex == 0))
+            _streamWeightsDirectory = ReadForestStreamWeightsDirFromArgs();
+        else
+            _streamWeightsDirectory = null;
     }
 
     static void ApplyEnvRunMode()
     {
         _runMode = ResolveEnvRunMode();
         _singleEnvTaskCopyIndex = -1;
+        _singleEnvWorkerIndex = -1;
         _presentationWorkerZero = _runMode == EnvRunMode.SingleEnvByPort
             && IsPresentationWorkerZeroRequested();
-        _streamWeightsDirectory = _runMode == EnvRunMode.StreamOnly
-            ? ReadForestStreamWeightsDirFromArgs()
-            : null;
+        _streamWeightsDirectory = null;
         EnvTrainingConfig.ClearForcedCopyIndex();
         InvalidateEnvCountsCache();
 
@@ -216,7 +276,9 @@ public static class TrainingEnvSpace
 
         if (_runMode == EnvRunMode.SingleEnvByPort)
         {
+            _singleEnvWorkerIndex = ResolveSingleEnvWorkerIndex();
             _singleEnvTaskCopyIndex = ResolveSingleEnvTaskCopyIndex();
+            RefreshStreamWeightsDirectory();
             if (_singleEnvTaskCopyIndex < 0)
                 Debug.LogWarning("[TrainingEnvSpace] SingleEnvByPort: не удалось определить задачу (mlagents-port / forestBasePort).");
 
@@ -236,7 +298,7 @@ public static class TrainingEnvSpace
                 var cfg = presentation.GetComponent<EnvTrainingConfig>();
                 if (cfg == null)
                     cfg = presentation.gameObject.AddComponent<EnvTrainingConfig>();
-                Debug.Log($"[TrainingEnvSpace] SingleEnvByPort worker={ReadMlAgentsPortFromArgs() - ReadForestBasePortFromArgs()} copyIndex={_singleEnvTaskCopyIndex} presentation={IsPresentationWorkerProcess} task={cfg.ResolveTask()}");
+                Debug.Log($"[TrainingEnvSpace] SingleEnvByPort worker={_singleEnvWorkerIndex} copyIndex={_singleEnvTaskCopyIndex} presentation={IsPresentationWorkerProcess} fullTrain={IsPresentationFullTrainWorker} task={cfg.ResolveTask()} weightsDir={_streamWeightsDirectory ?? "(none)"}");
             }
 
             _presentationRoot = null;
@@ -337,9 +399,13 @@ public static class TrainingEnvSpace
         _runMode = ResolveEnvRunMode();
         _presentationWorkerZero = _runMode == EnvRunMode.SingleEnvByPort
             && IsPresentationWorkerZeroRequested();
-        _singleEnvTaskCopyIndex = _runMode == EnvRunMode.SingleEnvByPort
-            ? ResolveSingleEnvTaskCopyIndex()
+        _singleEnvWorkerIndex = _runMode == EnvRunMode.SingleEnvByPort
+            ? ResolveSingleEnvWorkerIndex()
             : -1;
+        _singleEnvTaskCopyIndex = _runMode == EnvRunMode.SingleEnvByPort
+            ? ResolveTaskCopyIndexForWorker(_singleEnvWorkerIndex)
+            : -1;
+        RefreshStreamWeightsDirectory();
     }
 
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]

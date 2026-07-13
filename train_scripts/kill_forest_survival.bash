@@ -21,6 +21,13 @@ kill_by_regex() {
 echo "[kill] mlagents-learn..."
 pkill -9 -f mlagents-learn 2>/dev/null || true
 
+echo "[kill] sync_stream_weights / sentis export..."
+pkill -9 -f sync_stream_weights 2>/dev/null || true
+pkill -9 -f export_stream_sentis 2>/dev/null || true
+pkill -9 -f export_stream_sentis_glibc 2>/dev/null || true
+pkill -9 -f 'Editor/Unity' 2>/dev/null || true
+pkill -9 -f 'ld-linux.*Unity' 2>/dev/null || true
+
 echo "[kill] validate_video_watcher..."
 pkill -9 -f validate_video_watcher_fixed.bash 2>/dev/null || true
 

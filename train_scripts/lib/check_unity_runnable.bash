@@ -22,6 +22,7 @@ check_unity_runnable() {
 
 unity_glibc_hint() {
   echo "Unity 6000 нужен glibc >= 2.28 (Ubuntu 22.04+)." >&2
-  echo "На сервере: bash train_scripts/lab_comp/upgrade_to_2204.bash" >&2
-  echo "Или с Windows/WSL: RUN_ID=... bash train_scripts/lab_comp/sentis_bridge_wsl.bash" >&2
+  echo "На сервере (рекомендуется): bash train_scripts/lab_comp/build_sentis_docker.bash" >&2
+  echo "  → export_stream_sentis сам пойдёт через Docker." >&2
+  echo "Альтернатива: bash train_scripts/lab_comp/upgrade_to_2204.bash" >&2
 }

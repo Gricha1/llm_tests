@@ -2,13 +2,14 @@
 set -eu
 set -o pipefail
 
-# Jack+Lily+George: 12 Unity-процессов (num-envs=12).
-# worker 0 = presentation для OBS, workers 1–11 = headless train.
+# Jack+Lily+George: 12 Unity headless (num-envs=12) + стрим отдельно (run_stream_onnx.bash).
+# worker 0  = PresentationFull (все трое, headless train)
+# workers 1–11 = узкие задачи (headless)
 #
-#   bash train_headless_jack_lily_george.bash
-#   RUN_ID=run_60 bash train_headless_jack_lily_george.bash --resume
+#   RUN_ID=run_72 bash train_headless_jack_lily_george.bash --resume
+#   RUN_ID=run_72 bash train_scripts/lab_comp/run_stream_onnx.bash
 #
-# Без presentation (11 headless):
+# Без PresentationFull worker0 (11 envs):
 #   TRAIN_MODE=multi bash train_headless_jack_lily_george.bash
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
@@ -23,8 +24,17 @@ export FOREST_PRESENTATION_TIME_SCALE="${PRESENTATION_TIME_SCALE}"
 TORCH_DEVICE="${TORCH_DEVICE:-cuda}"
 TRAIN_PORT="${TRAIN_PORT:-5005}"
 export DISPLAY="${DISPLAY:-:1}"
-export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
-export MKL_NUM_THREADS="${MKL_NUM_THREADS:-4}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-2}"
+
+# Train на ядрах 0-3; стрим занимает 4,5 (см. cpu_affinity.env.bash).
+# shellcheck source=train_scripts/lab_comp/cpu_affinity.env.bash
+source "${ROOT}/train_scripts/lab_comp/cpu_affinity.env.bash"
+export FOREST_TRAIN_CPUS
+export FOREST_STREAM_CPUS
+
+# Стрим вынесен в run_stream_onnx.bash — train всегда без окон.
+export FOREST_TRAIN_ALL_HEADLESS=1
 
 if [ "${TRAIN_MODE}" = "multi" ]; then
   NUM_ENVS="${NUM_ENVS:-11}"
@@ -114,19 +124,31 @@ ML_ARGS=(
   --torch-device "${TORCH_DEVICE}"
 )
 
+# Важно: --resume/--force ДО --env-args, иначе mlagents съест их как аргументы Unity.
+[ "${RESUME}" -eq 1 ] && ML_ARGS+=(--resume)
+[ "${FORCE}" -eq 1 ] && ML_ARGS+=(--force)
+
 if [ "${TRAIN_MODE}" = "multi" ]; then
-  ML_ARGS+=(--env-args -forestSingleEnvByPort -forestBasePort "${TRAIN_PORT}")
+  ML_ARGS+=(--env-args -forestSingleEnvByPort -forestBasePort "${TRAIN_PORT}" -forestTrainAllHeadless)
 else
-  ML_ARGS+=(--env-args -forestSingleEnvByPort -forestPresentationWorker0 -forestBasePort "${TRAIN_PORT}")
+  ML_ARGS+=(
+    --env-args
+    -forestSingleEnvByPort
+    -forestPresentationWorker0
+    -forestBasePort "${TRAIN_PORT}"
+    -forestTrainAllHeadless
+  )
 fi
 
 export FOREST_BASE_PORT="${TRAIN_PORT}"
 
-[ "${RESUME}" -eq 1 ] && ML_ARGS+=(--resume)
-
-echo "[train] mode=${TRAIN_MODE} DISPLAY=${DISPLAY} run-id=${RUN_ID} num-envs=${NUM_ENVS} port=${TRAIN_PORT} time-scale=${TIME_SCALE} presentation-scale=${PRESENTATION_TIME_SCALE}"
+echo "[train] mode=${TRAIN_MODE} DISPLAY=${DISPLAY} run-id=${RUN_ID} num-envs=${NUM_ENVS} port=${TRAIN_PORT} time-scale=${TIME_SCALE} resume=${RESUME}"
+echo "[train] CPU affinity: train=${FOREST_TRAIN_CPUS} (stream reserved=${FOREST_STREAM_CPUS})"
 if [ "${TRAIN_MODE}" = "presentation" ]; then
-  echo "[train] worker0 = 1 окно с дисплеем (OBS), workers 1–11 = -batchmode -nographics без окна"
-  echo "[train] OBS: Захват окна → forest_survival (единственное окно)"
+  echo "[train] 12 headless: w0=PresentationFull, w1-11=узкие задачи"
+  echo "[train] Стрим отдельно: RUN_ID=${RUN_ID} bash train_scripts/lab_comp/run_stream_onnx.bash"
+fi
+if command -v taskset >/dev/null 2>&1; then
+  exec taskset -c "${FOREST_TRAIN_CPUS}" mlagents-learn "${ML_ARGS[@]}"
 fi
 exec mlagents-learn "${ML_ARGS[@]}"

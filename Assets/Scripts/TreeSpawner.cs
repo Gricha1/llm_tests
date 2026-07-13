@@ -111,6 +111,7 @@ public class TreeSpawner : MonoBehaviour
             if (!tooClose)
             {
                 GameObject tree = Instantiate(prefab, pos, Quaternion.identity, transform);
+                PrepareChoppableTree(tree);
                 trees.Add(tree);
                 return;
             }
@@ -161,6 +162,7 @@ public class TreeSpawner : MonoBehaviour
                 if (!tooClose)
                 {
                     GameObject tree = Instantiate(prefab, pos, Quaternion.identity, transform);
+                    PrepareChoppableTree(tree);
                     trees.Add(tree);
                     treePlaced = true;
                 }
@@ -169,6 +171,112 @@ public class TreeSpawner : MonoBehaviour
             if (!treePlaced)
                 Debug.LogWarning($"TreeSpawner: не удалось разместить дерево {i + 1}/{treeCount}");
         }
+    }
+
+    /// <summary>
+    /// Префабы часто без слоя Tree / только non-convex MeshCollider —
+    /// OverlapSphere и ClosestPoint тогда пропускают дерево рядом с агентом.
+    /// </summary>
+    static void PrepareChoppableTree(GameObject tree)
+    {
+        if (tree == null)
+            return;
+
+        int treeLayer = LayerMask.NameToLayer("Tree");
+        if (treeLayer >= 0)
+            SetLayerRecursively(tree.transform, treeLayer);
+
+        if (HasOverlapFriendlyCollider(tree))
+            return;
+
+        Bounds b = ComputeVisualBounds(tree);
+        var capsule = tree.GetComponent<CapsuleCollider>();
+        if (capsule == null)
+            capsule = tree.AddComponent<CapsuleCollider>();
+
+        float radius = Mathf.Max(0.25f, Mathf.Max(b.extents.x, b.extents.z) * 0.35f);
+        float height = Mathf.Max(radius * 2f + 0.5f, b.size.y);
+        capsule.radius = radius;
+        capsule.height = height;
+        capsule.direction = 1; // Y
+        Vector3 localCenter = tree.transform.InverseTransformPoint(b.center);
+        capsule.center = localCenter;
+    }
+
+    static bool HasOverlapFriendlyCollider(GameObject tree)
+    {
+        var cols = tree.GetComponentsInChildren<Collider>(true);
+        for (int i = 0; i < cols.Length; i++)
+        {
+            var c = cols[i];
+            if (c == null || !c.enabled)
+                continue;
+            if (c is MeshCollider mesh && !mesh.convex)
+                continue;
+            return true;
+        }
+        return false;
+    }
+
+    static Bounds ComputeVisualBounds(GameObject tree)
+    {
+        var renderers = tree.GetComponentsInChildren<Renderer>(true);
+        if (renderers.Length == 0)
+            return new Bounds(tree.transform.position + Vector3.up, Vector3.one * 2f);
+
+        Bounds b = renderers[0].bounds;
+        for (int i = 1; i < renderers.Length; i++)
+            b.Encapsulate(renderers[i].bounds);
+        return b;
+    }
+
+    static void SetLayerRecursively(Transform t, int layer)
+    {
+        t.gameObject.layer = layer;
+        for (int i = 0; i < t.childCount; i++)
+            SetLayerRecursively(t.GetChild(i), layer);
+    }
+
+    /// <summary>Ближайшее живое дерево по bounds (фолбэк, если Physics.OverlapSphere пустой).</summary>
+    public GameObject FindNearestTreeInReach(Vector3 origin, float reach)
+    {
+        RemoveDestroyedTrees();
+        GameObject best = null;
+        float bestDist = float.MaxValue;
+        for (int i = 0; i < trees.Count; i++)
+        {
+            var tree = trees[i];
+            if (!IsAlive(tree))
+                continue;
+
+            float d = DistanceToTreeBounds(origin, tree);
+            if (d > reach || d >= bestDist)
+                continue;
+
+            bestDist = d;
+            best = tree;
+        }
+        return best;
+    }
+
+    public static float DistanceToTreeBounds(Vector3 origin, GameObject tree)
+    {
+        var cols = tree.GetComponentsInChildren<Collider>(true);
+        for (int i = 0; i < cols.Length; i++)
+        {
+            var c = cols[i];
+            if (c == null || !c.enabled)
+                continue;
+            return Vector3.Distance(origin, c.bounds.ClosestPoint(origin));
+        }
+
+        var rend = tree.GetComponentInChildren<Renderer>(true);
+        if (rend != null)
+            return Vector3.Distance(origin, rend.bounds.ClosestPoint(origin));
+
+        Vector3 p = tree.transform.position;
+        p.y = origin.y;
+        return Vector3.Distance(origin, p);
     }
 
     private void ClearTrees()
@@ -218,6 +326,7 @@ public class TreeSpawner : MonoBehaviour
 
                 GameObject prefab = treePrefabs[Random.Range(0, treePrefabs.Length)];
                 GameObject spawnedTree = Instantiate(prefab, pos, Quaternion.identity, transform);
+                PrepareChoppableTree(spawnedTree);
                 trees.Add(spawnedTree);
                 spawned++;
                 break;

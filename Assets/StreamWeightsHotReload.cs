@@ -26,7 +26,11 @@ public sealed class StreamWeightsHotReload : MonoBehaviour
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
     static void Bootstrap()
     {
+        // Sentis hot reload только для старого stream_inference_watch.
+        // Новый стрим: Python onnxruntime (-forestExternalBrain) — агенты Default.
         if (!TrainingEnvSpace.IsStreamOnlyMode)
+            return;
+        if (TrainingEnvSpace.IsExternalPythonBrainStream)
             return;
 
         var go = new GameObject(nameof(StreamWeightsHotReload));
@@ -45,7 +49,7 @@ public sealed class StreamWeightsHotReload : MonoBehaviour
         _weightsDir = TrainingEnvSpace.StreamWeightsDirectory;
         if (string.IsNullOrEmpty(_weightsDir))
         {
-            Debug.LogWarning("[StreamWeightsHotReload] каталог весов не задан (-forestStreamWeightsDir)");
+            Debug.LogWarning("[StreamWeightsHotReload] каталог весов не задан (-forestStreamWeightsDir / FOREST_STREAM_WEIGHTS_DIR)");
             enabled = false;
             return;
         }

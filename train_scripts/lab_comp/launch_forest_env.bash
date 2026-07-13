@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# Обёртка для mlagents --env: worker 0 с дисплеем, остальные без окна.
-# Переменные задаёт train_headless_jack_lily_george.bash:
-#   FOREST_BUILD_PATH, FOREST_BASE_PORT, FOREST_TRAIN_MODE=presentation|multi
+# Обёртка для mlagents --env.
+# TRAIN_MODE=presentation + FOREST_TRAIN_ALL_HEADLESS=1 → все без окна (стрим отдельно).
+# TRAIN_MODE=presentation без ALL_HEADLESS → worker 0 с графикой (старый режим).
 set -eu
 set -o pipefail
 
 BUILD="${FOREST_BUILD_PATH:?FOREST_BUILD_PATH не задан}"
 BASE_PORT="${FOREST_BASE_PORT:-}"
 TRAIN_MODE="${FOREST_TRAIN_MODE:-presentation}"
+ALL_HEADLESS="${FOREST_TRAIN_ALL_HEADLESS:-0}"
 
 chmod +x "${BUILD}" 2>/dev/null || true
 
@@ -36,7 +37,9 @@ while [ "${i}" -lt "$#" ]; do
 done
 
 use_graphics=0
-if [ "${TRAIN_MODE}" = "presentation" ] && [ "${presentation_worker0}" -eq 1 ]; then
+if [ "${ALL_HEADLESS}" != "1" ] \
+  && [ "${TRAIN_MODE}" = "presentation" ] \
+  && [ "${presentation_worker0}" -eq 1 ]; then
   if [ -n "${ml_port}" ] && [ -n "${forest_base_port}" ]; then
     worker=$((ml_port - forest_base_port))
     if [ "${worker}" -eq 0 ]; then
@@ -46,8 +49,13 @@ if [ "${TRAIN_MODE}" = "presentation" ] && [ "${presentation_worker0}" -eq 1 ]; 
 fi
 
 if [ "${use_graphics}" -eq 1 ]; then
+  if command -v taskset >/dev/null 2>&1 && [ -n "${FOREST_TRAIN_CPUS:-}" ]; then
+    exec taskset -c "${FOREST_TRAIN_CPUS}" "${BUILD}" "$@"
+  fi
   exec "${BUILD}" "$@"
 fi
 
-# Headless: как mlagents --no-graphics (DISPLAY оставляем — без него SIGSEGV).
+if command -v taskset >/dev/null 2>&1 && [ -n "${FOREST_TRAIN_CPUS:-}" ]; then
+  exec taskset -c "${FOREST_TRAIN_CPUS}" "${BUILD}" -batchmode -nographics "$@"
+fi
 exec "${BUILD}" -batchmode -nographics "$@"

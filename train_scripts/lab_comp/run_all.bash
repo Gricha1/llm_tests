@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Один процесс: train + presentation Env для OBS.
+# Train only (12 headless). Стрим: run_stream_onnx.bash
 set -eu
 set -o pipefail
 
@@ -20,5 +20,5 @@ ARGS=()
 [ "${RESUME}" -eq 1 ] && ARGS+=(--resume)
 [ "${FORCE}" -eq 1 ] && ARGS+=(--force)
 
-echo "[run_all] train + presentation (один Unity, без stream/sentis)"
+echo "[run_all] train headless — стрим: RUN_ID=... bash train_scripts/lab_comp/run_stream_onnx.bash"
 exec bash train_scripts/lab_comp/run_train.bash "${ARGS[@]}"

@@ -28,9 +28,10 @@ public sealed class GeorgeScript : AgentGoToHouseDiscrete
         var jack = TrainingEnvSpace.FindPresentationPrimaryJack();
         if (jack != null)
             jack.ShareOptionSpritesWith(this);
-        else
-            ResolveMissingOptionSprites();
 
+        // У Jack часто нет water/heat в инспекторе — добираем с Lily после share.
+        ResolveMissingOptionSprites();
         EnsureOptionIconRenderer();
+        UpdateOptionIconVisual();
     }
 }

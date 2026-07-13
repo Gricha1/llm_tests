@@ -1,4 +1,4 @@
 #!/usr/bin/env bash
-# Устарело: stream + sentis. Используй run_train.bash (presentation + train в одном Unity).
-echo "[run_stream] DEPRECATED: используй bash train_scripts/lab_comp/run_train.bash" >&2
-exec bash "$(dirname "$0")/run_train.bash" "$@"
+# Стрим OBS: Unity + onnxruntime (не sentis).
+echo "[run_stream] → run_stream_onnx.bash"
+exec bash "$(cd "$(dirname "$0")" && pwd)/run_stream_onnx.bash" "$@"

@@ -5,8 +5,7 @@
 #   FOREST_STREAM_SENTIS_DIR=stream_weights/run_56 \
 #   bash train_scripts/export_stream_sentis.bash
 #
-# Переменные:
-#   UNITY_EDITOR=/path/to/Unity   (Linux: ~/Unity/Hub/Editor/6000.0.26f1/Editor/Unity)
+# На Ubuntu 18.04 host: при GLIBC auto Docker (build_sentis_docker.bash один раз).
 
 set -eu
 set -o pipefail
@@ -30,30 +29,60 @@ fi
 UNITY_BIN="$(resolve_unity_editor || true)"
 if [ -z "${UNITY_BIN}" ]; then
   echo "[export_stream_sentis] ERROR: Unity Editor не найден." >&2
-  echo "  Задай UNITY_EDITOR, например:" >&2
   echo "  export UNITY_EDITOR=\"\$HOME/Unity/Hub/Editor/6000.0.26f1/Editor/Unity\"" >&2
-  echo "  Или установи Editor через: bash train_scripts/lab_comp/install_unity_gui.bash" >&2
   if [ "${FOREST_STREAM_SENTIS_REQUIRED:-0}" = "1" ]; then
     exit 1
   fi
   exit 0
 fi
 
+export UNITY_EDITOR="${UNITY_BIN}"
+
+# Только если явно попросили (Ubuntu 18.04 / Personal): host Unity через glibc22.
+if [ "${FOREST_FORCE_SENTIS_GLIBC:-0}" = "1" ]; then
+  bash "${ROOT}/train_scripts/lab_comp/export_stream_sentis_glibc.bash"
+  exit $?
+fi
+
+USE_DOCKER=0
+
 RUN_CHECK=1
 if [[ "${UNITY_BIN}" == *.exe ]]; then
   RUN_CHECK=0
 fi
 if [ "${RUN_CHECK}" -eq 1 ]; then
-  if ! check_unity_runnable "${UNITY_BIN}"; then
-    rc=$?
+  # Важно: после `if ! cmd` $? будет 0 — брать rc отдельно.
+  set +e
+  check_unity_runnable "${UNITY_BIN}"
+  rc=$?
+  set -e
+  if [ "${rc}" -ne 0 ]; then
     if [ "${rc}" -eq 2 ]; then
-      unity_glibc_hint
+      # Сначала host+glibc (лицензия Hub), Docker Personal часто пустой.
+      if bash "${ROOT}/train_scripts/lab_comp/export_stream_sentis_glibc.bash"; then
+        exit 0
+      fi
+      if command -v docker >/dev/null 2>&1; then
+        echo "[export_stream_sentis] glibc-wrap fail → Docker (license может не сработать)" >&2
+        USE_DOCKER=1
+      else
+        unity_glibc_hint
+        if [ "${FOREST_STREAM_SENTIS_REQUIRED:-0}" = "1" ]; then
+          exit 1
+        fi
+        exit 0
+      fi
+    else
+      if [ "${FOREST_STREAM_SENTIS_REQUIRED:-0}" = "1" ]; then
+        exit 1
+      fi
+      exit 0
     fi
-    if [ "${FOREST_STREAM_SENTIS_REQUIRED:-0}" = "1" ]; then
-      exit 1
-    fi
-    exit 0
   fi
+fi
+
+if [ "${USE_DOCKER}" -eq 1 ] || [ "${FOREST_FORCE_SENTIS_DOCKER:-0}" = "1" ]; then
+  exec bash "${ROOT}/train_scripts/lab_comp/export_stream_sentis_docker.bash"
 fi
 
 PROJECT_PATH="${ROOT}"

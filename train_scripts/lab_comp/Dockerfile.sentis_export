@@ -1,0 +1,24 @@
+# Образ только для onnx→sentis на lab_comp (Ubuntu 18.04 host + Unity 6000).
+# Host glibc слишком старый; внутри контейнера 22.04.
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libgtk-3-0 \
+    libnss3 \
+    libxss1 \
+    libasound2 \
+    libgbm1 \
+    libx11-6 \
+    libxcursor1 \
+    libxrandr2 \
+    libxi6 \
+    libglu1-mesa \
+    libgl1 \
+    libicu70 \
+    libatomic1 \
+    libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /project

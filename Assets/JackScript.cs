@@ -722,22 +722,30 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         if (target.optionWaterSprite == null) target.optionWaterSprite = optionWaterSprite;
         if (target.optionHeatSprite == null) target.optionHeatSprite = optionHeatSprite;
 
+        var lily = TrainingEnvSpace.FindPresentationLily();
+        if (lily == null)
+            return;
+
         if (target.optionHeatSprite == null)
-        {
-            var lily = TrainingEnvSpace.FindPresentationLily();
-            if (lily != null)
-                target.optionHeatSprite = lily.GetOptionHeatSpriteForShare();
-        }
+            target.optionHeatSprite = lily.GetOptionHeatSpriteForShare();
+        if (target.optionWaterSprite == null)
+            target.optionWaterSprite = lily.GetOptionWaterSpriteForShare();
+        if (target.optionFoodSprite == null)
+            target.optionFoodSprite = lily.GetOptionFoodSpriteForShare();
     }
 
     protected void ResolveMissingOptionSprites()
     {
-        if (optionHeatSprite != null)
+        var lily = TrainingEnvSpace.FindPresentationLily();
+        if (lily == null)
             return;
 
-        var lily = TrainingEnvSpace.FindPresentationLily();
-        if (lily != null)
+        if (optionHeatSprite == null)
             optionHeatSprite = lily.GetOptionHeatSpriteForShare();
+        if (optionWaterSprite == null)
+            optionWaterSprite = lily.GetOptionWaterSpriteForShare();
+        if (optionFoodSprite == null)
+            optionFoodSprite = lily.GetOptionFoodSpriteForShare();
     }
 
     private void ApplyOptionIconLocalScale()
@@ -1613,9 +1621,12 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
 
     /// <summary>
     /// Дистанция добычи: до ближайшей точки на коллайдере, а не до pivot (центр дерева недостижим).
+    /// Non-convex MeshCollider: ClosestPoint бесполезен (отдаёт ту же точку) — берём bounds.
     /// </summary>
     private static float HarvestReachDistance(Vector3 from, Collider c)
     {
+        if (c is MeshCollider mesh && !mesh.convex)
+            return Vector3.Distance(from, c.bounds.ClosestPoint(from));
         return Vector3.Distance(from, c.ClosestPoint(from));
     }
 
@@ -1753,8 +1764,9 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         if (TrainingEnvSpace.IsPresentationTransform(transform) && !TwitchEphemeralEffects.IsTwitchClone(this))
             TrainingPolicyStats.RecordJackActions(moveAction, rotateAction, chopAction);
 
-        bool chopJustPressed = chopAction == 1 && _lastChopActionForAnim != 1;
-        bool doReady = chopJustPressed && _doCooldownRemaining <= 0f;
+        // Не только фронт нажатия: иначе один промах у дерева — и пока chop=1, рубки больше нет.
+        bool chopHeld = chopAction == 1;
+        bool doReady = chopHeld && _doCooldownRemaining <= 0f;
 
         if (doReady && doActionAnimTrigger.Length > 0)
             animator.SetTrigger(doActionAnimTrigger);
@@ -3083,6 +3095,8 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         if (UsesGeorgeSurvivalOptions)
             return false;
 
+        EnsureSpawners();
+
         Vector3 origin = transform.position;
         Collider[] hits = Physics.OverlapSphere(origin, ChopReach, treeLayer);
 
@@ -3100,6 +3114,10 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
                 bestRoot = root;
             }
         }
+
+        // Фолбэк: список TreeSpawner (когда у инстанса нет overlap-friendly коллайдера).
+        if (bestRoot == null && treeSpawner != null)
+            bestRoot = treeSpawner.FindNearestTreeInReach(origin, ChopReach);
 
         if (bestRoot == null)
             return false;
