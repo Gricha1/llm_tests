@@ -110,6 +110,15 @@ public sealed class DayNightCycle : MonoBehaviour
     {
         CacheLight();
         _time01 = Mathf.Repeat(startTime01, 1f);
+        if (TrainingEnvSpace.IsPresentationWorkerProcess
+            || TrainingEnvSpace.IsStreamOnlyMode
+            || (TrainingEnvSpace.IsMlAgentsTrainingActive() && TrainingEnvSpace.IsSingleEnvByPortMode))
+        {
+            animate = false;
+            _manualOverride = true;
+            _manualIsNight = false;
+            _time01 = 0.5f;
+        }
         ApplyLighting();
     }
 

@@ -23,5 +23,15 @@ resolve_unity_editor() {
     return 0
   fi
 
+  # WSL: Unity Editor for Windows
+  if [ -d "/mnt/c/Program Files/Unity/Hub/Editor" ]; then
+    for p in "/mnt/c/Program Files/Unity/Hub/Editor/"*/Editor/Unity.exe; do
+      if [ -f "${p}" ]; then
+        echo "${p}"
+        return 0
+      fi
+    done
+  fi
+
   return 1
 }

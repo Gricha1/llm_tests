@@ -84,6 +84,6 @@ fi
 echo "[stream] DISPLAY=${DISPLAY}"
 echo "[stream] build: ${BUILD_PATH} (with graphics, for OBS)"
 echo "[stream] run-id: ${RUN_ID}  num-envs: ${NUM_ENVS}  time-scale: ${TIME_SCALE}"
-echo "[stream] OBS: Window Capture на окно Unity"
+echo "[stream] OBS: Window Capture → «forest_survival [PRESENTATION OBS]» (не train headless)"
 
 exec mlagents-learn "${ML_ARGS[@]}"

@@ -31,6 +31,9 @@ public sealed class TwitchChatGameBridge : MonoBehaviour
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
     static void Bootstrap()
     {
+        if (!TrainingEnvSpace.ShouldRunPresentationOnlyServices())
+            return;
+
         if (FindObjectOfType<TwitchChatGameBridge>() != null)
             return;
 

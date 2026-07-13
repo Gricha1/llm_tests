@@ -80,6 +80,8 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     public const int OptionHeat = 4;
     public const int OptionCount = 5;
     public const string GeorgeBehaviorName = "GeorgeLowLevelAgent";
+    public const int PresentationStartNeedLevel = 10;
+    public const int PresentationStartFoodHeatLevel = 15;
 
     protected virtual string OptionIconObjectName => "JackOptionIcon";
 
@@ -125,7 +127,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     [SerializeField] private Transform houseTarget;
 
     [Header("Heat")]
-    [SerializeField] private float heatDecayInterval = 5.0f; // секунд на 1 единицу тепла
+    [SerializeField] private float heatDecayInterval = 2.5f; // секунд на 1 единицу тепла (×2 быстрее)
     public int heat;
     private float heatTimer;
 
@@ -139,7 +141,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     [SerializeField] private int maxSatiety = 20;  // шкала для UI/наблюдений, не лимит инвентаря
     public int satiety;                               // текущая сытость
     private float satietyTimer;
-    [SerializeField] private float satietyDecayInterval = 5.0f; // секунд на 1 единицу сытости
+    [SerializeField] private float satietyDecayInterval = 2.5f; // секунд на 1 единицу сытости (×2 быстрее)
 
     [Header("Starving (satiety = 0)")]
     [SerializeField] private float hungerDamageInterval = 0.25f;
@@ -283,6 +285,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
 
     bool ControlsSharedCampfire =>
         fireVfx != null
+        && !UsesGeorgeSurvivalOptions
         && !TwitchEphemeralEffects.IsTwitchClone(this)
         && TrainingEnvSpace.IsPresentationTransform(transform);
 
@@ -500,12 +503,46 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
 
     private void Awake()
     {
+        ResolveCampfireVfxReference();
         // Только presentation-Jack управляет HUD; копии Env (1)… не должны его гасить.
         if (TrainingEnvSpace.IsPresentationTransform(transform))
             HudHpBars.SetGlobalEnabled(showHudHpTopLeft);
         EnsureCampfireAudio();
         EnsureCampfireLocalBinding();
         EnsureCampfireBurnTimerDisplay();
+        ResolveMissingOptionSprites();
+    }
+
+    void Start()
+    {
+        NormalizeFoodHeatDecayIntervals();
+        TrainingEnvSpace.CapturePresentationSpawn(transform);
+    }
+
+    protected void NormalizeFoodHeatDecayIntervals()
+    {
+        const float fastInterval = 2.5f;
+        if (satietyDecayInterval >= 4.5f)
+            satietyDecayInterval = fastInterval;
+        if (heatDecayInterval >= 4.5f)
+            heatDecayInterval = fastInterval;
+    }
+
+    /// <summary>У каждого Env свой дочерний Fire; не использовать чужой из префаба.</summary>
+    void ResolveCampfireVfxReference()
+    {
+        if (TwitchEphemeralEffects.IsTwitchClone(this))
+            return;
+
+        var envRoot = TrainingEnvSpace.FindRoot(transform);
+        if (envRoot == null)
+            return;
+
+        if (fireVfx != null && TrainingEnvSpace.IsDescendantOf(fireVfx.transform, envRoot))
+            return;
+
+        var fire = envRoot.Find("Fire");
+        fireVfx = fire != null ? fire.gameObject : null;
     }
 
     void CacheTrainingConfig()
@@ -532,12 +569,37 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
 
     public void EnsureTrainingCampfireLit(float seconds)
     {
+        ResolveCampfireVfxReference();
         if (seconds <= 0f || fireVfx == null)
             return;
 
         EnsureCampfireLocalBinding();
         _campfireBurnSecondsRemaining = seconds;
         SetCampfireVisible(true);
+    }
+
+    void ApplyEpisodeStartNeeds(bool isTwitchClone)
+    {
+        if (!isTwitchClone && UsesPresentationFullStartNeeds())
+        {
+            satiety = PresentationStartFoodHeatLevel;
+            water = PresentationStartNeedLevel;
+            heat = PresentationStartFoodHeatLevel;
+            return;
+        }
+
+        satiety = maxSatiety / 2;
+        water = satiety + 6;
+        heat = maxHeat;
+    }
+
+    bool UsesPresentationFullStartNeeds()
+    {
+        if (!TrainingEnvSpace.IsPresentationTransform(transform))
+            return false;
+
+        var config = _trainingConfig ?? EnvTrainingConfig.Get(transform);
+        return config == null || config.ResolveTask() == EnvTrainingTask.PresentationFull;
     }
 
     void ApplyEpisodeStepLimit()
@@ -580,6 +642,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     /// <summary>Костёр живёт в локальных координатах Env, привязан к HomeSpot.</summary>
     public void EnsureCampfireLocalBinding()
     {
+        ResolveCampfireVfxReference();
         if (fireVfx == null || houseTarget == null || TwitchEphemeralEffects.IsTwitchClone(this))
             return;
 
@@ -648,6 +711,35 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         ApplyOptionIconLocalScale();
     }
 
+    internal void ShareOptionSpritesWith(AgentGoToHouseDiscrete target)
+    {
+        if (target == null || target == this)
+            return;
+
+        if (target.optionWoodSprite == null) target.optionWoodSprite = optionWoodSprite;
+        if (target.optionFoodSprite == null) target.optionFoodSprite = optionFoodSprite;
+        if (target.optionZombieSprite == null) target.optionZombieSprite = optionZombieSprite;
+        if (target.optionWaterSprite == null) target.optionWaterSprite = optionWaterSprite;
+        if (target.optionHeatSprite == null) target.optionHeatSprite = optionHeatSprite;
+
+        if (target.optionHeatSprite == null)
+        {
+            var lily = TrainingEnvSpace.FindPresentationLily();
+            if (lily != null)
+                target.optionHeatSprite = lily.GetOptionHeatSpriteForShare();
+        }
+    }
+
+    protected void ResolveMissingOptionSprites()
+    {
+        if (optionHeatSprite != null)
+            return;
+
+        var lily = TrainingEnvSpace.FindPresentationLily();
+        if (lily != null)
+            optionHeatSprite = lily.GetOptionHeatSpriteForShare();
+    }
+
     private void ApplyOptionIconLocalScale()
     {
         if (optionIconRenderer == null) return;
@@ -704,7 +796,8 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
 
         if (TrainingEnvSpace.IsPresentationTransform(transform)
             && !TwitchEphemeralEffects.IsTwitchClone(this)
-            && !TrainingEnvSpace.IsStreamOnlyMode)
+            && !TrainingEnvSpace.IsStreamOnlyMode
+            && !(TrainingEnvSpace.IsLivePresentationForObs && TrainingEnvSpace.IsMlAgentsTrainingActive()))
             ProcessGlobalManualKeysOnce();
 
         ProcessHeuristicOptionKeys();
@@ -789,6 +882,8 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     {
         if (TrainingEnvSpace.IsStreamOnlyMode)
             return false;
+        if (TrainingEnvSpace.IsLivePresentationForObs && TrainingEnvSpace.IsMlAgentsTrainingActive())
+            return false;
         if (!TrainingEnvSpace.IsPresentationTransform(transform))
             return false;
         if (TwitchEphemeralEffects.IsTwitchClone(this))
@@ -872,6 +967,17 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         _pendingTwitchJumpHeights = 0;
     }
 
+    public bool IsInDeathState => _deathSequenceStarted || hp <= 0;
+
+    /// <summary>Синхронный респавн, если ML-Agents не успел вызвать OnEpisodeBegin после EndEpisode.</summary>
+    public void ForceHardRespawnFromDeath()
+    {
+        if (!IsInDeathState)
+            return;
+
+        OnEpisodeBegin();
+    }
+
     public override void OnEpisodeBegin()
     {
         _deathSequenceStarted = false;
@@ -883,7 +989,8 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         {
             DeathFreeze.EnsureEnvSimulationRunning();
             DeathFreeze.UnfreezeWorld();
-            AgentDeathOverlay.Hide();
+            if (!AgentDeathOverlay.IsDeathSequenceRunning)
+                AgentDeathOverlay.Hide();
             BackgroundMusic.ResumeMusic();
             var primary = TrainingEnvSpace.FindPresentationPrimaryJack();
             if (primary == this)
@@ -904,25 +1011,27 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
 
         if (!isTwitchClone)
         {
-            // Одна Env — не телепортируем, остаётся позиция из сцены (~4, -5.2, 15).
-            bool skipTeleport = !spawnAtHouseFixed && !TrainingEnvSpace.HasMultipleTrainingEnvs();
-
-            if (!skipTeleport)
+            if (!TrainingEnvSpace.TryRestorePresentationSpawn(transform, controller))
             {
-                controller.enabled = false;
-                if (spawnAtHouseFixed)
+                bool skipTeleport = !spawnAtHouseFixed && !TrainingEnvSpace.HasMultipleTrainingEnvs();
+
+                if (!skipTeleport)
                 {
-                    transform.position = TrainingEnvSpace.LocalToWorld(transform, fixedSpawnPosition);
-                    transform.rotation = TrainingEnvSpace.LocalToWorldRotation(transform, fixedSpawnEuler);
+                    controller.enabled = false;
+                    if (spawnAtHouseFixed)
+                    {
+                        transform.position = TrainingEnvSpace.LocalToWorld(transform, fixedSpawnPosition);
+                        transform.rotation = TrainingEnvSpace.LocalToWorldRotation(transform, fixedSpawnEuler);
+                    }
+                    else
+                    {
+                        float randX = Random.Range(minX, maxX);
+                        float randZ = Random.Range(minZ, maxZ);
+                        transform.position = TrainingEnvSpace.LocalToWorld(transform, new Vector3(randX, groundY, randZ));
+                        transform.rotation = TrainingEnvSpace.LocalToWorldRotation(transform, new Vector3(0f, Random.Range(0f, 360f), 0f));
+                    }
+                    controller.enabled = true;
                 }
-                else
-                {
-                    float randX = Random.Range(minX, maxX);
-                    float randZ = Random.Range(minZ, maxZ);
-                    transform.position = TrainingEnvSpace.LocalToWorld(transform, new Vector3(randX, groundY, randZ));
-                    transform.rotation = TrainingEnvSpace.LocalToWorldRotation(transform, new Vector3(0f, Random.Range(0f, 360f), 0f));
-                }
-                controller.enabled = true;
             }
         }
 
@@ -940,11 +1049,9 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         _forwardPushSpeed = 0f;
 
         wood = 0;
-        satiety = maxSatiety / 2;
-        water = satiety + 6;
+        ApplyEpisodeStartNeeds(isTwitchClone);
         satietyTimer = 0f;
         waterTimer = 0f;
-        heat = maxHeat;
         heatTimer = 0f;
 
         burnTimer = 0f;
@@ -1041,7 +1148,8 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         }
 
         if ((IsSimpleTrainingMode || IsGeorgeSimpleTrainingMode)
-            && (_trainingConfig == null || _trainingConfig.FreezeNeeds))
+            && (_trainingConfig == null || _trainingConfig.FreezeNeeds)
+            && !UsesPresentationFullStartNeeds())
         {
             satiety = maxSatiety / 2;
             heat = maxHeat / 2;
@@ -1261,6 +1369,8 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         v.y = 0f;
         float velNorm = moveSpeed > 1e-4f ? Mathf.Clamp01(v.magnitude / moveSpeed) : 0f;
         float target = Mathf.Max(Mathf.Abs(_lastPlanarMoveInput), velNorm);
+        if (_doCooldownRemaining > 0f && Mathf.Abs(_lastPlanarMoveInput) > 0.01f)
+            target = Mathf.Max(target, 0.55f);
         if (target < 0.02f)
             target = 0f;
 
@@ -1270,7 +1380,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
             animator.SetFloat("Speed", target);
     }
 
-    private void UpdateOptionIconVisual()
+    protected virtual void UpdateOptionIconVisual()
     {
         if (!ShouldShowOptionTaskIcon())
         {
@@ -1340,6 +1450,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
 
             EvalEpisodeTracker.NotifyEpisodeEnded();
             AgentDeathOverlay.ShowAndEndEpisode(this, AgentDeathOverlay.GetDeathMessageFor(this));
+            return;
         }
     }
 
@@ -1737,7 +1848,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
                 bool usefulDo = (!UsesGeorgeSurvivalOptions && hitZombieOnDo && currentOptionSnapshot == OptionZombie)
                     || (!UsesGeorgeSurvivalOptions && gainedWoodFromChop && currentOptionSnapshot == OptionWood)
                     || (ateSheep && currentOptionSnapshot == OptionFood)
-                    || collectedWater
+                    || (collectedWater && currentOptionSnapshot == OptionWater)
                     || (!UsesGeorgeSurvivalOptions && hitAllyOnDo);
                 if (!usefulDo)
                 {
@@ -1776,17 +1887,14 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
             lastRewardForOption1 = accumulatedRewardForOption1;
         }
 
-        if (collectedWater && waterCollectReward != 0f)
+        if (collectedWater && currentOptionSnapshot == OptionWater && waterCollectReward != 0f)
         {
             AddReward(waterCollectReward);
             GameSfx.PlayFood(source: transform);
             FloatingRewardPopup.ShowGotWater(transform, waterCollectReward);
             currentStepReward += waterCollectReward;
-            if (currentOptionSnapshot == OptionWater)
-            {
-                accumulatedRewardForOption0 += waterCollectReward;
-                lastRewardForOption0 = accumulatedRewardForOption0;
-            }
+            accumulatedRewardForOption0 += waterCollectReward;
+            lastRewardForOption0 = accumulatedRewardForOption0;
         }
 
         if (hitZombieOnDo && currentOptionSnapshot == OptionZombie && !UsesGeorgeSurvivalOptions)
@@ -2972,6 +3080,8 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     private bool TryChopTree(out bool gainedWood)
     {
         gainedWood = false;
+        if (UsesGeorgeSurvivalOptions)
+            return false;
 
         Vector3 origin = transform.position;
         Collider[] hits = Physics.OverlapSphere(origin, ChopReach, treeLayer);

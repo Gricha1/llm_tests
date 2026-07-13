@@ -56,6 +56,8 @@ public class LilyScript : Agent, IHasHp
     [Tooltip("Снять галочку, чтобы скрыть иконку задачи над агентом.")]
     [SerializeField] private bool showOptionTaskIcon = true;
 
+    internal Sprite GetOptionHeatSpriteForShare() => optionHeatSprite;
+
     private bool _lastShowOptionTaskIcon = true;
 
     [Header("Heat / House (опция «тепло»)")]
@@ -87,6 +89,7 @@ public class LilyScript : Agent, IHasHp
     [SerializeField] private SheepSpawner sheepSpawner;
     [SerializeField] private LayerMask sheepLayer;
     [SerializeField] private float eatDistance = 1.2f;
+    [SerializeField] private float sheepEatReward = 10f;
     [SerializeField] private float waterCollectDistance = 2.5f;
     [SerializeField] private float waterCollectReward = 8f;
     [SerializeField] private int waterPerCollect = 1;
@@ -97,7 +100,7 @@ public class LilyScript : Agent, IHasHp
     [Header("Hunger / Satiety")]
     [SerializeField] private int maxSatiety = 20;
     public int Satiety { get; private set; }
-    [SerializeField] private float satietyDecayInterval = 5f;
+    [SerializeField] private float satietyDecayInterval = 2.5f;
     private float satietyTimer;
 
     [Header("Starving (satiety = 0)")]
@@ -110,7 +113,7 @@ public class LilyScript : Agent, IHasHp
     [Tooltip("Только для наблюдений ML: Heat / scale, не лимит инвентаря.")]
     [SerializeField] private int heatObservationScale = 20;
     public int Heat { get; private set; }
-    [SerializeField] private float heatDecayInterval = 5f;
+    [SerializeField] private float heatDecayInterval = 2.5f;
     private float heatTimer;
 
     [Header("Freezing (heat = 0)")]
@@ -381,6 +384,8 @@ public class LilyScript : Agent, IHasHp
         v.y = 0f;
         float velNorm = moveSpeed > 1e-4f ? Mathf.Clamp01(v.magnitude / moveSpeed) : 0f;
         float target = Mathf.Max(Mathf.Abs(_lastPlanarMoveInput), velNorm);
+        if (_doCooldownRemaining > 0f && Mathf.Abs(_lastPlanarMoveInput) > 0.01f)
+            target = Mathf.Max(target, 0.55f);
         if (target < 0.02f)
             target = 0f;
 
@@ -435,6 +440,21 @@ public class LilyScript : Agent, IHasHp
     private void Awake()
     {
         ConfigurePresentationControl();
+    }
+
+    void Start()
+    {
+        NormalizeFoodHeatDecayIntervals();
+        TrainingEnvSpace.CapturePresentationSpawn(transform);
+    }
+
+    protected void NormalizeFoodHeatDecayIntervals()
+    {
+        const float fastInterval = 2.5f;
+        if (satietyDecayInterval >= 4.5f)
+            satietyDecayInterval = fastInterval;
+        if (heatDecayInterval >= 4.5f)
+            heatDecayInterval = fastInterval;
     }
 
     private void Update()
@@ -535,31 +555,38 @@ public class LilyScript : Agent, IHasHp
         }
     }
 
+    public bool IsInDeathState => _deathSequenceStarted || hp <= 0;
+
+    public void ForceHardRespawnFromDeath()
+    {
+        if (!IsInDeathState)
+            return;
+
+        OnEpisodeBegin();
+    }
+
     public override void OnEpisodeBegin()
     {
         _deathSequenceStarted = false;
         if (TrainingEnvSpace.IsPresentationTransform(transform))
         {
             DeathFreeze.UnfreezeWorld();
-            AgentDeathOverlay.Hide();
+            if (!AgentDeathOverlay.IsDeathSequenceRunning)
+                AgentDeathOverlay.Hide();
             BackgroundMusic.ResumeMusic();
         }
 
         stepCount = 0;
         _episodeStartTime = Time.unscaledTime;
-        prevPosition = transform.position;
         prevFlowerDist = -1f;
         prevJackDist = -1f;
         prevWaterDist = -1f;
         prevSheepDist = -1f;
         FlowerCount = 0;
         Love = 0;
-        WaterCount = 6;
         waterDecayTimer = 0f;
-        Satiety = maxSatiety / 2;
         satietyTimer = 0f;
         _hungerTimer = 0f;
-        Heat = startHeat;
         heatTimer = 0f;
         _freezeTimer = 0f;
         flowerDecayTimer = 0f;
@@ -582,6 +609,8 @@ public class LilyScript : Agent, IHasHp
             : EnvTrainingTask.PresentationFull;
         _trainingConfig?.ApplyForEpisodeBegin();
 
+        ApplyLilyEpisodeStartNeeds();
+
         if (IsLilySimpleTraining)
         {
             currentOption = _trainingConfig.ResolveFixedLilyOption();
@@ -592,6 +621,11 @@ public class LilyScript : Agent, IHasHp
                 Heat = startHeat;
                 WaterCount = 6;
             }
+        }
+        else if (_resolvedLilyTask == EnvTrainingTask.PresentationFull
+            && TrainingEnvSpace.IsPresentationTransform(transform))
+        {
+            MaxStep = 0;
         }
         else if (useUtilitySoftmaxSampling)
             currentOption = SampleOptionUtilitySoftmax(currentOption);
@@ -607,7 +641,8 @@ public class LilyScript : Agent, IHasHp
 
         bool skipTeleport = !spawnAtFixedPosition && !followPath && !TrainingEnvSpace.HasMultipleTrainingEnvs();
 
-        if (!skipTeleport)
+        if (!TrainingEnvSpace.TryRestorePresentationSpawn(transform, controller)
+            && !skipTeleport)
         {
             controller.enabled = false;
             if (spawnAtFixedPosition)
@@ -624,6 +659,8 @@ public class LilyScript : Agent, IHasHp
             }
             controller.enabled = true;
         }
+
+        prevPosition = transform.position;
 
         if (followPath && pathRoot != null && pathRoot.childCount > 0)
         {
@@ -647,6 +684,22 @@ public class LilyScript : Agent, IHasHp
         }
 
         UpdateOptionIconVisual();
+    }
+
+    void ApplyLilyEpisodeStartNeeds()
+    {
+        if (_resolvedLilyTask == EnvTrainingTask.PresentationFull
+            && TrainingEnvSpace.IsPresentationTransform(transform))
+        {
+            WaterCount = AgentGoToHouseDiscrete.PresentationStartNeedLevel;
+            Satiety = AgentGoToHouseDiscrete.PresentationStartFoodHeatLevel;
+            Heat = AgentGoToHouseDiscrete.PresentationStartFoodHeatLevel;
+            return;
+        }
+
+        WaterCount = 6;
+        Satiety = maxSatiety / 2;
+        Heat = startHeat;
     }
 
     void ConfigureTrainingControl()
@@ -682,6 +735,8 @@ public class LilyScript : Agent, IHasHp
     static bool IsManualControlActive(Transform t)
     {
         if (TrainingEnvSpace.IsStreamOnlyMode)
+            return false;
+        if (TrainingEnvSpace.IsLivePresentationForObs && TrainingEnvSpace.IsMlAgentsTrainingActive())
             return false;
         if (!TrainingEnvSpace.IsPresentationTransform(t))
             return false;
@@ -1048,7 +1103,10 @@ public class LilyScript : Agent, IHasHp
         {
             PathStep();
             stepCount++;
-            if (MaxStep > 0 && stepCount >= MaxStep)
+            if (!IsLilySimpleTraining
+                && _resolvedLilyTask != EnvTrainingTask.PresentationFull
+                && MaxStep > 0
+                && stepCount >= MaxStep)
             {
                 EvalEpisodeTracker.NotifyEpisodeEnded();
                 EndEpisode();
@@ -1097,7 +1155,7 @@ public class LilyScript : Agent, IHasHp
             if (TryCollectWater())
             {
                 collectedWaterThisStep = true;
-                if (waterCollectReward != 0f)
+                if (currentOption == OptionWater && waterCollectReward != 0f)
                 {
                     AddReward(waterCollectReward);
                     FloatingRewardPopup.ShowGotWater(transform, waterCollectReward);
@@ -1108,8 +1166,12 @@ public class LilyScript : Agent, IHasHp
             if (TryEatSheep())
             {
                 ateSheepThisStep = true;
-                GameSfx.PlayFood(source: transform);
-                FloatingRewardPopup.ShowGotFood(transform, 10f);
+                if (currentOption == OptionFood && sheepEatReward != 0f)
+                {
+                    AddReward(sheepEatReward);
+                    GameSfx.PlayFood(source: transform);
+                    FloatingRewardPopup.ShowGotFood(transform, sheepEatReward);
+                }
             }
         }
 
@@ -1304,7 +1366,10 @@ public class LilyScript : Agent, IHasHp
                 collectedWaterThisStep,
                 ateSheepThisStep);
         }
-        else if (MaxStep > 0 && stepCount >= MaxStep)
+        else if (!IsLilySimpleTraining
+            && _resolvedLilyTask != EnvTrainingTask.PresentationFull
+            && MaxStep > 0
+            && stepCount >= MaxStep)
         {
             EvalEpisodeTracker.NotifyEpisodeEnded();
             EndEpisode();

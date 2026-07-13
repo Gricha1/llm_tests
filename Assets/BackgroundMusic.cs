@@ -69,6 +69,9 @@ public sealed class BackgroundMusic : MonoBehaviour
 
     static void EnsureAudioListener()
     {
+        if (TrainingEnvSpace.IsHeadlessTrainWorkerProcess)
+            return;
+
         var listeners = FindObjectsByType<AudioListener>(FindObjectsInactive.Exclude, FindObjectsSortMode.None);
         for (int i = 0; i < listeners.Length; i++)
         {

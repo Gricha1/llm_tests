@@ -5,7 +5,7 @@ using TMPro;
 using Unity.MLAgents;
 
 /// <summary>
-/// График награды по эпизодам (Джек / Лили) поверх Game view.
+/// График награды по эпизодам (Джек / Лили / Гера) поверх Game view.
 /// При обучении с несколькими Env — только training-копии (не presentation Full).
 /// G — показать/скрыть.
 /// </summary>
@@ -28,6 +28,7 @@ public sealed class TrainingGraphOverlay : MonoBehaviour
 
     static readonly Color JackColor = new Color(0.22f, 0.48f, 0.95f, 1f);
     static readonly Color LilyColor = new Color(0.98f, 0.38f, 0.62f, 1f);
+    static readonly Color GeorgeColor = new Color(0.55f, 0.82f, 0.35f, 1f);
     static readonly Color GridColor = new Color(1f, 1f, 1f, 0.08f);
     static readonly Color BgColor = new Color(0.04f, 0.06f, 0.08f, 0.82f);
     static readonly Color AxisLabelColor = new Color(0.75f, 0.78f, 0.82f, 0.95f);
@@ -49,17 +50,23 @@ public sealed class TrainingGraphOverlay : MonoBehaviour
 
     readonly List<AgentEpisodeTracker> _jackTrackers = new List<AgentEpisodeTracker>();
     readonly List<AgentEpisodeTracker> _lilyTrackers = new List<AgentEpisodeTracker>();
+    readonly List<AgentEpisodeTracker> _georgeTrackers = new List<AgentEpisodeTracker>();
     readonly List<float> _jackRewards = new List<float>();
     readonly List<float> _lilyRewards = new List<float>();
+    readonly List<float> _georgeRewards = new List<float>();
 
     float _jackEma;
     float _lilyEma;
+    float _georgeEma;
     float _jackLastRaw;
     float _lilyLastRaw;
+    float _georgeLastRaw;
     float _jackAggSum;
     int _jackAggCount;
     float _lilyAggSum;
     int _lilyAggCount;
+    float _georgeAggSum;
+    int _georgeAggCount;
     bool _usesTrainingEnvs;
     bool _needsRedraw = true;
     int _graphPointCounter;
@@ -104,6 +111,14 @@ public sealed class TrainingGraphOverlay : MonoBehaviour
         if (toggleKey != KeyCode.None && Input.GetKeyDown(toggleKey))
             visible = !visible;
 
+        int stride = TrainingEnvSpace.IsPresentationWorkerProcess ? 8 : 1;
+        if (Time.frameCount % stride != 0)
+        {
+            if (_panel != null)
+                _panel.SetActive(visible && ShouldShow());
+            return;
+        }
+
         bool trainingActive = Academy.IsInitialized && Academy.Instance.IsCommunicatorOn;
         if (!trainingActive && Time.frameCount % 10 != 0)
         {
@@ -120,6 +135,9 @@ public sealed class TrainingGraphOverlay : MonoBehaviour
             usePresentationSampling: !_usesTrainingEnvs);
         TrackAll(_lilyTrackers, _lilyRewards, ref _lilyEma, ref _lilyLastRaw,
             ref _lilyAggSum, ref _lilyAggCount, notifyPolicyStats: false,
+            usePresentationSampling: !_usesTrainingEnvs);
+        TrackAll(_georgeTrackers, _georgeRewards, ref _georgeEma, ref _georgeLastRaw,
+            ref _georgeAggSum, ref _georgeAggCount, notifyPolicyStats: false,
             usePresentationSampling: !_usesTrainingEnvs);
 
         bool show = visible && ShouldShow();
@@ -150,6 +168,7 @@ public sealed class TrainingGraphOverlay : MonoBehaviour
 
         SyncTrackers(CollectJackAgents(training), _jackTrackers);
         SyncTrackers(CollectLilyAgents(training), _lilyTrackers);
+        SyncTrackers(CollectGeorgeAgents(training), _georgeTrackers);
 
         if (_title != null)
         {
@@ -170,7 +189,7 @@ public sealed class TrainingGraphOverlay : MonoBehaviour
                 if (TrainingEnvSpace.IsPresentationEnv(root))
                     continue;
 
-                var jack = root.GetComponentInChildren<AgentGoToHouseDiscrete>(false);
+                var jack = FindJackInEnv(root);
                 if (jack != null)
                     agents.Add(jack);
             }
@@ -183,6 +202,60 @@ public sealed class TrainingGraphOverlay : MonoBehaviour
         }
 
         return agents;
+    }
+
+    static List<Agent> CollectGeorgeAgents(bool training)
+    {
+        var agents = new List<Agent>();
+
+        if (training && TrainingEnvSpace.HasMultipleTrainingEnvs())
+        {
+            foreach (var root in TrainingEnvSpace.GetAllEnvRoots())
+            {
+                if (TrainingEnvSpace.IsPresentationEnv(root))
+                    continue;
+
+                var george = FindGeorgeInEnv(root);
+                if (george != null)
+                    agents.Add(george);
+            }
+        }
+        else
+        {
+            var george = TrainingEnvSpace.FindPresentationGeorge();
+            if (george != null)
+                agents.Add(george);
+        }
+
+        return agents;
+    }
+
+    static AgentGoToHouseDiscrete FindJackInEnv(Transform envRoot)
+    {
+        if (envRoot == null)
+            return null;
+
+        foreach (var agent in envRoot.GetComponentsInChildren<AgentGoToHouseDiscrete>(false))
+        {
+            if (agent != null && !TrainingEnvSpace.IsGeorgeAgent(agent))
+                return agent;
+        }
+
+        return null;
+    }
+
+    static AgentGoToHouseDiscrete FindGeorgeInEnv(Transform envRoot)
+    {
+        if (envRoot == null)
+            return null;
+
+        foreach (var agent in envRoot.GetComponentsInChildren<AgentGoToHouseDiscrete>(false))
+        {
+            if (agent != null && TrainingEnvSpace.IsGeorgeAgent(agent))
+                return agent;
+        }
+
+        return null;
     }
 
     static List<Agent> CollectLilyAgents(bool training)
@@ -511,7 +584,11 @@ public sealed class TrainingGraphOverlay : MonoBehaviour
         float yMin = 0f;
         float yMax = 1f;
         bool showLily = _lilyTrackers.Count > 0;
-        ComputeRange(_jackRewards, showLily ? _lilyRewards : null, ref yMin, ref yMax);
+        bool showGeorge = _georgeTrackers.Count > 0;
+        var extra = new List<List<float>>();
+        if (showLily) extra.Add(_lilyRewards);
+        if (showGeorge) extra.Add(_georgeRewards);
+        ComputeRange(_jackRewards, extra, ref yMin, ref yMax);
         _lastYMin = yMin;
         _lastYMax = yMax;
 
@@ -524,6 +601,8 @@ public sealed class TrainingGraphOverlay : MonoBehaviour
         DrawSeries(pixels, GraphWidth, GraphHeight, _jackRewards, yMin, yMax, JackColor);
         if (showLily)
             DrawSeries(pixels, GraphWidth, GraphHeight, _lilyRewards, yMin, yMax, LilyColor);
+        if (showGeorge)
+            DrawSeries(pixels, GraphWidth, GraphHeight, _georgeRewards, yMin, yMax, GeorgeColor);
 
         _tex.SetPixels(pixels);
         _tex.Apply(false);
@@ -535,30 +614,35 @@ public sealed class TrainingGraphOverlay : MonoBehaviour
         if (_legend != null)
         {
             string src = _usesTrainingEnvs ? "training env" : "presentation";
+            var parts = new List<string>
+            {
+                $"<color=#{ColorToHex(JackColor)}>●</color> Джек EMA: {jackDisplay:F1} (посл. {_jackLastRaw:F1})"
+            };
             if (showLily)
             {
                 float lilyDisplay = _lilyRewards.Count > 0 ? _lilyRewards[_lilyRewards.Count - 1] : 0f;
-                _legend.text =
-                    $"<color=#{ColorToHex(JackColor)}>●</color> Джек EMA: {jackDisplay:F1} (посл. {_jackLastRaw:F1})   " +
-                    $"<color=#{ColorToHex(LilyColor)}>●</color> Лили EMA: {lilyDisplay:F1} (посл. {_lilyLastRaw:F1})   " +
-                    $"{src} · эп. {totalEpisodeBuckets}";
+                parts.Add($"<color=#{ColorToHex(LilyColor)}>●</color> Лили EMA: {lilyDisplay:F1} (посл. {_lilyLastRaw:F1})");
             }
-            else
+            if (showGeorge)
             {
-                _legend.text =
-                    $"<color=#{ColorToHex(JackColor)}>●</color> Джек EMA: {jackDisplay:F1} (посл. {_jackLastRaw:F1})   " +
-                    $"{src} · эп. {totalEpisodeBuckets}";
+                float georgeDisplay = _georgeRewards.Count > 0 ? _georgeRewards[_georgeRewards.Count - 1] : 0f;
+                parts.Add($"<color=#{ColorToHex(GeorgeColor)}>●</color> Гера EMA: {georgeDisplay:F1} (посл. {_georgeLastRaw:F1})");
             }
+            parts.Add($"{src} · эп. {totalEpisodeBuckets}");
+            _legend.text = string.Join("   ", parts);
         }
     }
 
-    static void ComputeRange(List<float> a, List<float> b, ref float yMin, ref float yMax)
+    static void ComputeRange(List<float> a, List<List<float>> extras, ref float yMin, ref float yMax)
     {
         yMin = float.PositiveInfinity;
         yMax = float.NegativeInfinity;
         AccumulateRange(a, ref yMin, ref yMax);
-        if (b != null)
-            AccumulateRange(b, ref yMin, ref yMax);
+        if (extras != null)
+        {
+            for (int i = 0; i < extras.Count; i++)
+                AccumulateRange(extras[i], ref yMin, ref yMax);
+        }
 
         if (float.IsInfinity(yMin))
         {

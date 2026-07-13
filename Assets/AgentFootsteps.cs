@@ -6,7 +6,7 @@ using UnityEngine;
 [RequireComponent(typeof(CharacterController))]
 public sealed class AgentFootsteps : MonoBehaviour
 {
-    [SerializeField] [Range(0f, 1f)] private float volume = 0.4f;
+    [SerializeField] [Range(0f, 1f)] private float volume = 0.2f;
     [SerializeField] private float minStepInterval = 0.32f;
     [SerializeField] private float minPlanarSpeed = 0.2f;
     [SerializeField] [Range(0.8f, 1.2f)] private float pitchMin = 0.95f;

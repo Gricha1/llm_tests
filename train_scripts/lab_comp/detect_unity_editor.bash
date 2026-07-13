@@ -28,14 +28,29 @@ fi
   echo "export RUN_ID=\"${RUN_ID}\""
   echo "export DISPLAY=\"${DISPLAY}\""
   if [ -n "${UNITY_BIN}" ] && [ -f "${UNITY_BIN}" ]; then
-    echo "export UNITY_EDITOR=\"${UNITY_BIN}\""
+    # shellcheck source=../lib/check_unity_runnable.bash
+    source "${ROOT}/train_scripts/lib/check_unity_runnable.bash"
+    if [[ "${UNITY_BIN}" != *.exe ]] && ! check_unity_runnable "${UNITY_BIN}" 2>/dev/null; then
+      echo "# UNITY_EDITOR=${UNITY_BIN} — не запускается (скорее всего glibc < 2.28 на Ubuntu 18.04)"
+      echo "# Используй: RUN_ID=${RUN_ID} bash train_scripts/lab_comp/sentis_bridge_wsl.bash (с Windows/WSL)"
+      echo "# Или: bash train_scripts/lab_comp/upgrade_to_2204.bash"
+    else
+      echo "export UNITY_EDITOR=\"${UNITY_BIN}\""
+    fi
   else
     echo "# UNITY_EDITOR not found — установи Editor 6000.0.26f1 (bash train_scripts/lab_comp/install_unity_gui.bash)"
   fi
 } > "${ENV_FILE}"
 
 if [ -n "${UNITY_BIN}" ] && [ -f "${UNITY_BIN}" ]; then
-  echo "[detect_unity] OK UNITY_EDITOR=${UNITY_BIN}"
+  # shellcheck source=../lib/check_unity_runnable.bash
+  source "${ROOT}/train_scripts/lib/check_unity_runnable.bash"
+  if [[ "${UNITY_BIN}" != *.exe ]] && ! check_unity_runnable "${UNITY_BIN}" 2>/dev/null; then
+    echo "[detect_unity] WARN: ${UNITY_BIN} не запускается (glibc < 2.28?)" >&2
+    unity_glibc_hint >&2
+  else
+    echo "[detect_unity] OK UNITY_EDITOR=${UNITY_BIN}"
+  fi
 else
   echo "[detect_unity] WARN Unity Editor не найден. onnx→sentis не будет работать." >&2
   echo "[detect_unity] Установи через Hub: bash train_scripts/lab_comp/install_unity_gui.bash" >&2

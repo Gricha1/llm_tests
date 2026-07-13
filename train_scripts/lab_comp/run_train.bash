@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Headless train 11 env — lab_comp (терминал A).
+# Train + presentation в одном Unity (lab_comp).
 set -eu
 set -o pipefail
 
@@ -20,6 +20,6 @@ ARGS=()
 [ "${RESUME}" -eq 1 ] && ARGS+=(--resume)
 [ "${FORCE}" -eq 1 ] && ARGS+=(--force)
 
-echo "[run_train] BUILD=${BUILD} RUN_ID=${RUN_ID} DISPLAY=${DISPLAY}"
-exec env BUILD="${BUILD}" RUN_ID="${RUN_ID}" DISPLAY="${DISPLAY}" \
+echo "[run_train] BUILD=${BUILD} RUN_ID=${RUN_ID} DISPLAY=${DISPLAY} (num-envs=12, worker0=presentation)"
+exec env BUILD="${BUILD}" RUN_ID="${RUN_ID}" DISPLAY="${DISPLAY}" TRAIN_MODE=presentation \
   bash train_headless_jack_lily_george.bash "${ARGS[@]}"

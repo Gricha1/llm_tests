@@ -72,7 +72,7 @@ public static class GameSfx
     static AudioClip LilyKiss => _lilyKiss ??= Load("lily_kiss");
     static AudioClip LilyKissShort => _lilyKissShort ??= CreateDurationClip(LilyKiss, 1f);
 
-    public static void PlayStepGrass(float volume = 0.4f, float pitchMin = 0.95f, float pitchMax = 1.05f, Transform source = null)
+    public static void PlayStepGrass(float volume = 0.2f, float pitchMin = 0.95f, float pitchMax = 1.05f, Transform source = null)
     {
         if (!TrainingEnvSpace.ShouldPlayFeedback(source))
             return;
@@ -88,7 +88,7 @@ public static class GameSfx
     }
 
     /// <summary>Зомби или friendly fire ударил Jack, Lily или George.</summary>
-    public static void PlayZombieHitAgent(float volume = 0.75f, Transform source = null)
+    public static void PlayZombieHitAgent(float volume = 0.375f, Transform source = null)
     {
         if (!TrainingEnvSpace.ShouldPlayFeedback(source))
             return;
@@ -109,7 +109,7 @@ public static class GameSfx
         Play(Wood, volume, Random.Range(0.97f, 1.03f));
     }
 
-    public static void PlayLilyKiss(float volume = 0.85f, Transform source = null)
+    public static void PlayLilyKiss(float volume = 0.425f, Transform source = null)
     {
         if (!TrainingEnvSpace.ShouldPlayFeedback(source))
             return;

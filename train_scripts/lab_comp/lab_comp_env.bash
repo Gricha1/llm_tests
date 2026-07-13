@@ -5,9 +5,19 @@ set -eu
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/../.." && pwd)"
 ENV_FILE="${ROOT}/.lab_comp_env"
 
+_CLI_RUN_ID="${RUN_ID:-}"
+_CLI_BUILD="${BUILD:-}"
+
 if [ -f "${ENV_FILE}" ]; then
   # shellcheck source=/dev/null
   source "${ENV_FILE}"
+fi
+
+if [ -n "${_CLI_RUN_ID}" ]; then
+  export RUN_ID="${_CLI_RUN_ID}"
+fi
+if [ -n "${_CLI_BUILD}" ]; then
+  export BUILD="${_CLI_BUILD}"
 fi
 
 # shellcheck source=../lib/resolve_unity_editor.bash

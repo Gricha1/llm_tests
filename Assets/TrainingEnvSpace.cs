@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.SceneManagement;
 
@@ -17,16 +18,26 @@ public static class TrainingEnvSpace
     static LilyScript _cachedLily;
     static AgentGoToHouseDiscrete _cachedGeorge;
 
+    struct PresentationSpawnSnapshot
+    {
+        public Vector3 LocalPos;
+        public Quaternion LocalRot;
+    }
+
+    static readonly Dictionary<int, PresentationSpawnSnapshot> PresentationSpawns = new();
+
     enum EnvRunMode
     {
         All,
         StreamOnly,
         TrainCopiesOnly,
         SingleEnvByPort,
+        TrainWithPresentation,
     }
 
     static EnvRunMode _runMode = EnvRunMode.All;
     static int _singleEnvTaskCopyIndex = -1;
+    static bool _presentationWorkerZero;
     static string _streamWeightsDirectory;
     static bool _cachedHasMultipleEnvs;
     static bool _envCountsCached;
@@ -35,6 +46,30 @@ public static class TrainingEnvSpace
     public static string StreamWeightsDirectory => _streamWeightsDirectory;
     public static bool IsTrainCopiesOnlyMode => _runMode == EnvRunMode.TrainCopiesOnly;
     public static bool IsSingleEnvByPortMode => _runMode == EnvRunMode.SingleEnvByPort;
+    public static int SingleEnvWorkerCopyIndex => _singleEnvTaskCopyIndex;
+    public static bool IsTrainWithPresentationMode => _runMode == EnvRunMode.TrainWithPresentation;
+    /// <summary>SingleEnvByPort worker 0: presentation для OBS, workers 1–11 headless.</summary>
+    public static bool IsPresentationWorkerProcess =>
+        IsSingleEnvByPortMode && _presentationWorkerZero && _singleEnvTaskCopyIndex == 0;
+    /// <summary>Train worker: SingleEnvByPort без presentation (workers 1–11 или все 11 без OBS).</summary>
+    public static bool IsHeadlessTrainWorkerProcess =>
+        IsTrainCopiesOnlyMode || (IsSingleEnvByPortMode && !IsPresentationWorkerProcess);
+    public static bool IsLivePresentationForObs =>
+        IsStreamOnlyMode || IsTrainWithPresentationMode || IsPresentationWorkerProcess;
+
+    /// <summary>Twitch, HUD стрима — только presentation worker (не train workers 1–11).</summary>
+    public static bool ShouldRunPresentationOnlyServices()
+    {
+        if (IsHeadlessTrainWorkerProcess)
+            return false;
+        if (IsPresentationWorkerProcess || IsStreamOnlyMode)
+            return true;
+#if UNITY_EDITOR
+        return !IsMlAgentsTrainingActive();
+#else
+        return false;
+#endif
+    }
 
     static bool IsTruthyEnv(string value) =>
         value == "1" || string.Equals(value, "true", System.StringComparison.OrdinalIgnoreCase);
@@ -44,6 +79,8 @@ public static class TrainingEnvSpace
     /// SingleEnvByPort: один Env в процессе, задача по (--mlagents-port - forestBasePort).
     static EnvRunMode ResolveEnvRunMode()
     {
+        if (IsTruthyEnv(System.Environment.GetEnvironmentVariable("FOREST_TRAIN_WITH_PRESENTATION")))
+            return EnvRunMode.TrainWithPresentation;
         if (IsTruthyEnv(System.Environment.GetEnvironmentVariable("FOREST_STREAM_ONLY")))
             return EnvRunMode.StreamOnly;
         if (IsTruthyEnv(System.Environment.GetEnvironmentVariable("FOREST_TRAIN_COPIES_ONLY")))
@@ -57,6 +94,8 @@ public static class TrainingEnvSpace
             var arg = args[i];
             if (arg == "-forestStreamOnly" || arg == "--forest-stream-only")
                 return EnvRunMode.StreamOnly;
+            if (arg == "-forestTrainWithPresentation" || arg == "--forest-train-with-presentation")
+                return EnvRunMode.TrainWithPresentation;
             if (arg == "-forestTrainCopiesOnly" || arg == "--forest-train-copies-only")
                 return EnvRunMode.TrainCopiesOnly;
             if (arg == "-forestSingleEnvByPort" || arg == "--forest-single-env-by-port")
@@ -114,6 +153,20 @@ public static class TrainingEnvSpace
         return -1;
     }
 
+    static bool IsPresentationWorkerZeroRequested()
+    {
+        if (IsTruthyEnv(System.Environment.GetEnvironmentVariable("FOREST_PRESENTATION_WORKER")))
+            return true;
+
+        foreach (var arg in System.Environment.GetCommandLineArgs())
+        {
+            if (arg == "-forestPresentationWorker0" || arg == "--forest-presentation-worker0")
+                return true;
+        }
+
+        return false;
+    }
+
     static int ResolveSingleEnvTaskCopyIndex()
     {
         int mlPort = ReadMlAgentsPortFromArgs();
@@ -122,10 +175,19 @@ public static class TrainingEnvSpace
             return -1;
 
         int worker = mlPort - basePort;
+
+        if (_presentationWorkerZero)
+        {
+            if (worker < 0 || worker > 11)
+                return -1;
+            // worker 0 → PresentationFull, workers 1–11 → train tasks
+            return worker;
+        }
+
         if (worker < 0 || worker > 10)
             return -1;
 
-        // worker 0 → Env (1) JackWood … worker 10 → Env (11) GeorgeHeat
+        // legacy 11 workers: worker 0 → JackWood … worker 10 → GeorgeHeat
         return worker + 1;
     }
 
@@ -133,14 +195,18 @@ public static class TrainingEnvSpace
     {
         _runMode = ResolveEnvRunMode();
         _singleEnvTaskCopyIndex = -1;
+        _presentationWorkerZero = _runMode == EnvRunMode.SingleEnvByPort
+            && IsPresentationWorkerZeroRequested();
         _streamWeightsDirectory = _runMode == EnvRunMode.StreamOnly
             ? ReadForestStreamWeightsDirFromArgs()
             : null;
         EnvTrainingConfig.ClearForcedCopyIndex();
         InvalidateEnvCountsCache();
 
-        if (_runMode == EnvRunMode.All)
+        if (_runMode == EnvRunMode.All || _runMode == EnvRunMode.TrainWithPresentation)
         {
+            if (_runMode == EnvRunMode.TrainWithPresentation)
+                EnsureTrainEnvCopies(11);
             CacheEnvCounts();
             return;
         }
@@ -170,7 +236,7 @@ public static class TrainingEnvSpace
                 var cfg = presentation.GetComponent<EnvTrainingConfig>();
                 if (cfg == null)
                     cfg = presentation.gameObject.AddComponent<EnvTrainingConfig>();
-                Debug.Log($"[TrainingEnvSpace] SingleEnvByPort copyIndex={_singleEnvTaskCopyIndex} task={cfg.ResolveTask()}");
+                Debug.Log($"[TrainingEnvSpace] SingleEnvByPort worker={ReadMlAgentsPortFromArgs() - ReadForestBasePortFromArgs()} copyIndex={_singleEnvTaskCopyIndex} presentation={IsPresentationWorkerProcess} task={cfg.ResolveTask()}");
             }
 
             _presentationRoot = null;
@@ -189,8 +255,19 @@ public static class TrainingEnvSpace
         }
 
         _presentationRoot = null;
-        Debug.Log($"[TrainingEnvSpace] EnvRunMode={_runMode}");
+        Debug.Log($"[TrainingEnvSpace] EnvRunMode={_runMode} activeEnvs={CountActiveEnvRoots()}");
         CacheEnvCounts();
+    }
+
+    static int CountActiveEnvRoots()
+    {
+        int n = 0;
+        foreach (var envRoot in FindAllEnvRoots())
+        {
+            if (envRoot != null && envRoot.gameObject.activeInHierarchy)
+                n++;
+        }
+        return n;
     }
 
     static void InvalidateEnvCountsCache() => _envCountsCached = false;
@@ -254,6 +331,17 @@ public static class TrainingEnvSpace
         return Unity.MLAgents.Academy.Instance.IsCommunicatorOn;
     }
 
+    [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.BeforeSceneLoad)]
+    static void InitializeRunModeEarly()
+    {
+        _runMode = ResolveEnvRunMode();
+        _presentationWorkerZero = _runMode == EnvRunMode.SingleEnvByPort
+            && IsPresentationWorkerZeroRequested();
+        _singleEnvTaskCopyIndex = _runMode == EnvRunMode.SingleEnvByPort
+            ? ResolveSingleEnvTaskCopyIndex()
+            : -1;
+    }
+
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
     static void ConfigureParallelEnvPresentation()
     {
@@ -268,14 +356,35 @@ public static class TrainingEnvSpace
 
     static void ApplyTrainProcessSilence()
     {
-        if (!IsTrainCopiesOnlyMode && !IsSingleEnvByPortMode)
+        if (IsPresentationWorkerProcess)
+            return;
+        if (!IsHeadlessTrainWorkerProcess)
             return;
 
+        EnforceHeadlessSilence();
+    }
+
+    public static void EnforceHeadlessSilence()
+    {
         AudioListener.volume = 0f;
-        foreach (var listener in Object.FindObjectsByType<AudioListener>(FindObjectsInactive.Include, FindObjectsSortMode.None))
+        AudioListener.pause = true;
+
+        foreach (var listener in Object.FindObjectsByType<AudioListener>(
+                     FindObjectsInactive.Include, FindObjectsSortMode.None))
         {
             if (listener != null)
                 listener.enabled = false;
+        }
+
+        foreach (var audio in Object.FindObjectsByType<AudioSource>(
+                     FindObjectsInactive.Include, FindObjectsSortMode.None))
+        {
+            if (audio == null)
+                continue;
+            audio.mute = true;
+            audio.volume = 0f;
+            if (audio.isPlaying)
+                audio.Stop();
         }
     }
 
@@ -299,7 +408,19 @@ public static class TrainingEnvSpace
 
             if (IsTrainCopiesOnlyMode || IsSingleEnvByPortMode)
             {
-                MuteEnvPresentation(envRoot);
+                if (IsPresentationWorkerProcess && envRoot == presentation)
+                    UnmuteEnvPresentation(envRoot, enableCameraAndAudio: true);
+                else
+                    MuteEnvPresentation(envRoot);
+                continue;
+            }
+
+            if (IsTrainWithPresentationMode)
+            {
+                if (envRoot == presentation)
+                    UnmuteEnvPresentation(envRoot, enableCameraAndAudio: true);
+                else
+                    MuteEnvPresentation(envRoot);
                 continue;
             }
 
@@ -410,19 +531,24 @@ public static class TrainingEnvSpace
 
     public static bool ShouldPlayFeedback(Transform source)
     {
-        if (IsTrainCopiesOnlyMode || IsSingleEnvByPortMode)
+        if (IsHeadlessTrainWorkerProcess)
             return false;
 
-        var root = PresentationRoot;
-        if (root == null)
+        if ((IsTrainCopiesOnlyMode || IsSingleEnvByPortMode) && !IsPresentationWorkerProcess)
+            return false;
+
+        var presentationRoot = PresentationRoot;
+        if (presentationRoot == null)
             return true;
         if (source == null)
             return false;
-        return IsDescendantOf(source, root);
+        return IsDescendantOf(source, presentationRoot);
     }
 
     public static bool ShouldPlayAmbientAudio() =>
-        !IsTrainCopiesOnlyMode && !IsSingleEnvByPortMode;
+        !IsHeadlessTrainWorkerProcess
+        && (IsPresentationWorkerProcess
+            || (!IsTrainCopiesOnlyMode && !IsSingleEnvByPortMode));
 
     public static T FindInPresentation<T>() where T : Component
     {
@@ -724,6 +850,43 @@ public static class TrainingEnvSpace
         return list.ToArray();
     }
 
+    static void EnsureTrainEnvCopies(int trainCopyCount)
+    {
+        var presentation = ResolvePresentationRoot();
+        if (presentation == null)
+        {
+            Debug.LogWarning("[TrainingEnvSpace] TrainWithPresentation: нет корня Env.");
+            return;
+        }
+
+        const float spacing = 300f;
+        var basePos = presentation.position;
+
+        for (int i = 1; i <= trainCopyCount; i++)
+        {
+            string copyName = $"Env ({i})";
+            if (FindEnvRootByName(copyName) != null)
+                continue;
+
+            var clone = Object.Instantiate(presentation.gameObject);
+            clone.name = copyName;
+            clone.transform.SetParent(null, true);
+            clone.transform.position = basePos + new Vector3(i * spacing, -400f, 0f);
+            Debug.Log($"[TrainingEnvSpace] создан {copyName} @ {clone.transform.position}");
+        }
+    }
+
+    static Transform FindEnvRootByName(string objectName)
+    {
+        foreach (var envRoot in FindAllEnvRoots())
+        {
+            if (envRoot != null && envRoot.name == objectName)
+                return envRoot;
+        }
+
+        return null;
+    }
+
     public static bool HasMultipleTrainingEnvs()
     {
         if (!_envCountsCached)
@@ -824,5 +987,62 @@ public static class TrainingEnvSpace
             if (renderer != null && renderer.gameObject.activeInHierarchy)
                 renderer.enabled = true;
         }
+    }
+
+    /// <summary>Запомнить стартовую позу героя в presentation Env (из сцены).</summary>
+    public static void CapturePresentationSpawn(Transform agent)
+    {
+        if (agent == null || !IsPresentationTransform(agent))
+            return;
+        if (agent.GetComponent<TwitchJackCloneMarker>() != null)
+            return;
+
+        int id = agent.GetInstanceID();
+        if (PresentationSpawns.ContainsKey(id))
+            return;
+
+        var envRoot = FindRoot(agent);
+        if (envRoot == null)
+            return;
+
+        PresentationSpawns[id] = new PresentationSpawnSnapshot
+        {
+            LocalPos = envRoot.InverseTransformPoint(agent.position),
+            LocalRot = Quaternion.Inverse(envRoot.rotation) * agent.rotation,
+        };
+    }
+
+    /// <summary>Вернуть героя на стартовую позицию presentation Env.</summary>
+    public static bool TryRestorePresentationSpawn(Transform agent, CharacterController controller)
+    {
+        if (agent == null || !IsPresentationTransform(agent))
+            return false;
+        if (agent.GetComponent<TwitchJackCloneMarker>() != null)
+            return false;
+
+        int id = agent.GetInstanceID();
+        if (!PresentationSpawns.TryGetValue(id, out var snap))
+        {
+            CapturePresentationSpawn(agent);
+            if (!PresentationSpawns.TryGetValue(id, out snap))
+                return false;
+        }
+
+        var envRoot = FindRoot(agent);
+        if (envRoot == null)
+            return false;
+
+        bool ccWasEnabled = controller != null && controller.enabled;
+        if (controller != null)
+            controller.enabled = false;
+
+        agent.SetPositionAndRotation(
+            envRoot.TransformPoint(snap.LocalPos),
+            envRoot.rotation * snap.LocalRot);
+
+        if (controller != null)
+            controller.enabled = ccWasEnabled;
+
+        return true;
     }
 }

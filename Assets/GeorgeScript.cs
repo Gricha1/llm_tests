@@ -8,4 +8,29 @@ using UnityEngine;
 public sealed class GeorgeScript : AgentGoToHouseDiscrete
 {
     protected override string OptionIconObjectName => "GeorgeOptionIcon";
+
+    void Start()
+    {
+        NormalizeFoodHeatDecayIntervals();
+        TrainingEnvSpace.CapturePresentationSpawn(transform);
+        EnsureGeorgeOptionSprites();
+    }
+
+    public override void OnEpisodeBegin()
+    {
+        base.OnEpisodeBegin();
+        EnsureGeorgeOptionSprites();
+        UpdateOptionIconVisual();
+    }
+
+    void EnsureGeorgeOptionSprites()
+    {
+        var jack = TrainingEnvSpace.FindPresentationPrimaryJack();
+        if (jack != null)
+            jack.ShareOptionSpritesWith(this);
+        else
+            ResolveMissingOptionSprites();
+
+        EnsureOptionIconRenderer();
+    }
 }

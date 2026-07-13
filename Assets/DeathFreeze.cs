@@ -13,13 +13,22 @@ public static class DeathFreeze
 
     public static void FreezeForAgent(Transform agent)
     {
-        if (_frozen || agent == null)
+        if (agent == null)
             return;
 
-        _frozen = true;
-        _frozenEnvRoot = TrainingEnvSpace.FindRoot(agent);
+        var envRoot = TrainingEnvSpace.FindRoot(agent);
+        if (_frozen && _frozenEnvRoot == envRoot)
+            return;
 
-        if (!TrainingEnvSpace.HasMultipleTrainingEnvs())
+        if (_frozen)
+            UnfreezeWorld();
+
+        _frozen = true;
+        _frozenEnvRoot = envRoot;
+
+        // Presentation worker: не ставим Time.timeScale=0 — иначе зависает ML-Agents и respawn.
+        if (!TrainingEnvSpace.HasMultipleTrainingEnvs()
+            && !TrainingEnvSpace.IsPresentationWorkerProcess)
         {
             _savedTimeScale = Time.timeScale;
             Time.timeScale = 0f;
@@ -37,7 +46,9 @@ public static class DeathFreeze
         var envRoot = _frozenEnvRoot;
         _frozenEnvRoot = null;
 
-        if (!TrainingEnvSpace.HasMultipleTrainingEnvs() && Time.timeScale == 0f)
+        if (!TrainingEnvSpace.HasMultipleTrainingEnvs()
+            && !TrainingEnvSpace.IsPresentationWorkerProcess
+            && Time.timeScale == 0f)
             Time.timeScale = _savedTimeScale > 0.001f ? _savedTimeScale : 1f;
 
         JointEpisodeReset.SetWorldSimulationEnabled(true, envRoot);

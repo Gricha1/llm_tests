@@ -13,6 +13,9 @@ public sealed class TwitchChatHelpHud : MonoBehaviour
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
     static void Bootstrap()
     {
+        if (!TrainingEnvSpace.ShouldRunPresentationOnlyServices())
+            return;
+
         if (_instance != null)
             return;
 

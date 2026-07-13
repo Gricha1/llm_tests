@@ -230,7 +230,8 @@ while true; do
         LAST_WEIGHTS_SIG="${sig}"
         ls -la "${WEIGHTS_DIR}"/*.sentis 2>/dev/null || echo "[stream] WARN: .sentis пока нет"
       else
-        echo "[stream] ERROR: onnx→sentis не удался (нужен Unity Editor на сервере)" >&2
+        echo "[stream] ERROR: onnx→sentis не удался." >&2
+        echo "[stream] Если GLIBC_2.28 — Ubuntu 18.04: с WSL запусти sentis_bridge_wsl.bash" >&2
       fi
     fi
   fi

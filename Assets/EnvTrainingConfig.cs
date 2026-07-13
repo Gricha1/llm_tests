@@ -230,7 +230,6 @@ public sealed class EnvTrainingConfig : MonoBehaviour
 
         if (TrainingEnvSpace.IsStreamOnlyMode && TrainingEnvSpace.IsPresentationEnv(transform))
         {
-            ApplyTrainingCampfire(EnvTrainingTask.PresentationFull);
             ApplyAgentVisibility(EnvTrainingTask.PresentationFull);
             return;
         }
@@ -448,7 +447,9 @@ public sealed class EnvTrainingConfig : MonoBehaviour
 
     void ApplyTrainingCampfire(EnvTrainingTask resolved)
     {
-        if (resolved != EnvTrainingTask.LilyHeat && resolved != EnvTrainingTask.GeorgeHeat)
+        // Presentation: костёр только когда Jack сам подносит дрова, не автозажигание.
+        if (resolved != EnvTrainingTask.LilyHeat
+            && resolved != EnvTrainingTask.GeorgeHeat)
             return;
 
         var jacks = GetComponentsInChildren<AgentGoToHouseDiscrete>(true);

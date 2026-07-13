@@ -1,16 +1,16 @@
 using UnityEngine;
 
 /// <summary>
-/// Сброс совместного эпизода Jack+Lily: оба агента, спавнеры и зомби.
+/// Сброс совместного эпизода Jack+Lily+George: агенты, спавнеры и зомби.
 /// </summary>
 public static class JointEpisodeReset
 {
-    public static void EndBothAgentEpisodes()
+    public static void EndAllAgentEpisodes()
     {
-        EndBothAgentEpisodes(null);
+        EndAllAgentEpisodes(null);
     }
 
-    public static void EndBothAgentEpisodes(Transform envScope)
+    public static void EndAllAgentEpisodes(Transform envScope)
     {
         foreach (var spawner in Object.FindObjectsOfType<ZombieSpawner>())
         {
@@ -32,7 +32,33 @@ public static class JointEpisodeReset
                 continue;
             lily.EndEpisode();
         }
+
+        EnsureAgentsRespawned(envScope);
     }
+
+    /// <summary>Если EndEpisode не поднял OnEpisodeBegin (часто у Геры на presentation), воскрешаем вручную.</summary>
+    public static void EnsureAgentsRespawned(Transform envScope)
+    {
+        foreach (var jack in Object.FindObjectsOfType<AgentGoToHouseDiscrete>())
+        {
+            if (envScope != null && !TrainingEnvSpace.IsDescendantOf(jack.transform, envScope))
+                continue;
+            jack.ForceHardRespawnFromDeath();
+        }
+
+        foreach (var lily in Object.FindObjectsOfType<LilyScript>())
+        {
+            if (envScope != null && !TrainingEnvSpace.IsDescendantOf(lily.transform, envScope))
+                continue;
+            lily.ForceHardRespawnFromDeath();
+        }
+    }
+
+    [System.Obsolete("Use EndAllAgentEpisodes")]
+    public static void EndBothAgentEpisodes() => EndAllAgentEpisodes();
+
+    [System.Obsolete("Use EndAllAgentEpisodes")]
+    public static void EndBothAgentEpisodes(Transform envScope) => EndAllAgentEpisodes(envScope);
 
     public static void SetAgentsMovementEnabled(bool enabled)
     {

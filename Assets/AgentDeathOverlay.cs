@@ -17,6 +17,8 @@ public sealed class AgentDeathOverlay : MonoBehaviour
     [SerializeField] private Color textColor = new Color(1f, 0.35f, 0.35f, 1f);
     [SerializeField] private int fontSize = 42;
 
+    const float FailsafeResetSeconds = 5f;
+
     static AgentDeathOverlay _instance;
     static bool _deathInProgress;
 
@@ -24,25 +26,13 @@ public sealed class AgentDeathOverlay : MonoBehaviour
     TextMeshProUGUI _text;
     Image _panel;
     Coroutine _routine;
+    Coroutine _failsafeRoutine;
 
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
     static void Bootstrap()
     {
         if (_instance != null)
             return;
-
-        var all = Resources.FindObjectsOfTypeAll<AgentDeathOverlay>();
-        for (int i = 0; i < all.Length; i++)
-        {
-            var h = all[i];
-            if (h == null) continue;
-            var sc = h.gameObject.scene;
-            if (sc.IsValid() && sc.isLoaded)
-            {
-                _instance = h;
-                return;
-            }
-        }
 
         var go = new GameObject(nameof(AgentDeathOverlay));
         DontDestroyOnLoad(go);
@@ -102,8 +92,14 @@ public sealed class AgentDeathOverlay : MonoBehaviour
             return;
         }
 
+        var envRoot = TrainingEnvSpace.FindRoot(agent.transform);
+
         if (_deathInProgress)
-            return;
+        {
+            Instance.CancelActiveRoutines();
+            ForceResetPresentationEnv(envRoot);
+            JointEpisodeReset.EnsureAgentsRespawned(envRoot);
+        }
 
         _deathInProgress = true;
 
@@ -113,24 +109,45 @@ public sealed class AgentDeathOverlay : MonoBehaviour
         DeathFreeze.FreezeForAgent(agent.transform);
 
         float delay = delaySeconds ?? Instance.displaySeconds;
-        Instance.StartDeathSequence(agent, message, delay);
+        Instance.StartDeathSequence(agent, message, delay, envRoot);
     }
 
     static void EndEpisodeInEnvOnly(Agent agent)
     {
-        JointEpisodeReset.EndBothAgentEpisodes(TrainingEnvSpace.FindRoot(agent.transform));
+        ForceResetPresentationEnv(TrainingEnvSpace.FindRoot(agent.transform));
     }
+
+    static void ForceResetPresentationEnv(Transform envRoot)
+    {
+        DeathFreeze.UnfreezeWorld();
+        JointEpisodeReset.EndAllAgentEpisodes(envRoot);
+        JointEpisodeReset.EnsureAgentsRespawned(envRoot);
+        BackgroundMusic.ResumeMusic();
+    }
+
+    void CancelActiveRoutines()
+    {
+        if (_routine != null)
+        {
+            StopCoroutine(_routine);
+            _routine = null;
+        }
+
+        if (_failsafeRoutine != null)
+        {
+            StopCoroutine(_failsafeRoutine);
+            _failsafeRoutine = null;
+        }
+    }
+
+    public static bool IsDeathSequenceRunning => _deathInProgress;
 
     public static void Hide()
     {
         if (_instance == null)
             return;
 
-        if (_instance._routine != null)
-        {
-            _instance.StopCoroutine(_instance._routine);
-            _instance._routine = null;
-        }
+        _instance.CancelActiveRoutines();
 
         if (_instance._canvas != null)
             _instance._canvas.enabled = false;
@@ -141,41 +158,74 @@ public sealed class AgentDeathOverlay : MonoBehaviour
         _deathInProgress = false;
     }
 
-    void StartDeathSequence(Agent agent, string message, float delay)
+    void StartDeathSequence(Agent agent, string message, float delay, Transform envRoot)
     {
-        if (_routine != null)
-            StopCoroutine(_routine);
-
-        _routine = StartCoroutine(DeathRoutine(agent, message, delay));
+        CancelActiveRoutines();
+        _routine = StartCoroutine(DeathRoutine(agent, message, delay, envRoot));
+        _failsafeRoutine = StartCoroutine(FailsafeRoutine(envRoot));
     }
 
-    IEnumerator DeathRoutine(Agent agent, string message, float delay)
+    IEnumerator FailsafeRoutine(Transform envRoot)
     {
-        if (_canvas == null)
-            BuildUi();
+        yield return new WaitForSecondsRealtime(FailsafeResetSeconds);
+        if (!_deathInProgress)
+            yield break;
 
-        _text.text = message;
-        _text.gameObject.SetActive(false);
-        _canvas.enabled = true;
+        Debug.LogWarning("[AgentDeathOverlay] failsafe: принудительный сброс после зависшей смерти");
+        ForceResetPresentationEnv(envRoot);
+        Hide();
+        _failsafeRoutine = null;
+    }
 
-        float beforeText = Mathf.Max(0f, textDelaySeconds);
-        if (beforeText > 0f)
-            yield return new WaitForSecondsRealtime(beforeText);
+    IEnumerator DeathRoutine(Agent agent, string message, float delay, Transform envRoot)
+    {
+        bool resetDone = false;
+        try
+        {
+            if (_canvas == null)
+                BuildUi();
 
-        _text.gameObject.SetActive(true);
-
-        yield return new WaitForSecondsRealtime(Mathf.Max(0.1f, delay));
-
-        JointEpisodeReset.EndBothAgentEpisodes(TrainingEnvSpace.FindRoot(agent.transform));
-
-        if (_canvas != null)
-            _canvas.enabled = false;
-
-        if (_text != null)
+            _text.text = message;
             _text.gameObject.SetActive(false);
+            _canvas.enabled = true;
 
-        _deathInProgress = false;
-        _routine = null;
+            float beforeText = Mathf.Max(0f, textDelaySeconds);
+            if (beforeText > 0f)
+                yield return new WaitForSecondsRealtime(beforeText);
+
+            _text.gameObject.SetActive(true);
+
+            // Сброс сразу при показе текста — иначе корутина может не дожить до конца (Джек/Гера).
+            ForceResetPresentationEnv(envRoot);
+            resetDone = true;
+
+            yield return new WaitForSecondsRealtime(Mathf.Max(0.1f, delay));
+        }
+        finally
+        {
+            if (!resetDone)
+            {
+                ForceResetPresentationEnv(envRoot);
+            }
+
+            DeathFreeze.UnfreezeWorld();
+            BackgroundMusic.ResumeMusic();
+
+            if (_canvas != null)
+                _canvas.enabled = false;
+
+            if (_text != null)
+                _text.gameObject.SetActive(false);
+
+            _deathInProgress = false;
+            _routine = null;
+
+            if (_failsafeRoutine != null)
+            {
+                StopCoroutine(_failsafeRoutine);
+                _failsafeRoutine = null;
+            }
+        }
     }
 
     void BuildUi()
