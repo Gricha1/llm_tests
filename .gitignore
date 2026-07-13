@@ -8,6 +8,14 @@ custom_configs/_autogen_*.yaml
 results/
 train_scripts/results/
 Assets/ML-Agents/weights/
+stream_weights/
+__pycache__/
+**/__pycache__/
+.git_commit_msg.txt
+Assets/ForestScene.unity.backup
+Assets/ForestScene.unity.backup.meta
+Assets/ForestScene.unity.broken
+Assets/ForestScene.unity.broken.meta
 
 # Local player builds / recordings (not Unity Build/)
 build_versions/
