@@ -1,74 +1,72 @@
 using System.Collections.Generic;
 using UnityEngine;
+using UnityEngine.SceneManagement;
 
 /// <summary>
-/// Спавнит по 1 зомби каждые N секунд в фиксированной точке.
-/// У префаба зомби должен быть слой Zombie и скрипты ZombieChase, ZombieHealth.
+/// Спавнит зомби. Высота в лесу — только local Y=0 у спавнера (без SerializeField на Y —
+/// старые значения в сцене ставили world Y≈0 и зомби «висели»).
 /// </summary>
 public class ZombieSpawner : MonoBehaviour
 {
     const float DefaultSpawnScale = 1f;
-    const float EnvGroundLocalY = -5.228786f;
     const float PrefabCharacterControllerHeight = 2f;
     const float PrefabCharacterControllerRadius = 0.5f;
     static readonly Vector3 PrefabCharacterControllerCenter = new Vector3(0f, 1f, 0f);
+    const float CityFixedSpawnWorldY = 0.44f;
+    const float ForestSpawnLocalY = 0f;
 
     [Header("Prefab")]
     [SerializeField] private GameObject zombiePrefab;
 
     [Header("Spawn Settings")]
-    [Tooltip("Если true: при старте спавнит 10 зомби сразу, затем раз в 2 секунды добавляет +1 (игнорируя лимит).")]
     [SerializeField] private bool zombie_from_hills = false;
-    [Tooltip("Если true: при включении спавнит 8 idle-зомби вокруг спавнера и больше не спавнит.")]
     [SerializeField] private bool spawn_idle = false;
-    [Tooltip("Один зомби появляется каждые столько секунд")]
     [SerializeField] private float spawnInterval = 5f;
-    [Tooltip("Максимум зомби на сцене")]
     [SerializeField] private int maxZombies = 15;
-    [Tooltip("Множитель размера заспawnенного зомби (1 = как в префабе).")]
     [SerializeField] private float spawnScaleMultiplier = 1f;
-    [Tooltip("Доп. смещение по Y поверх уровня земли Env (тонкая подстройка).")]
-    [SerializeField] private float spawnHeightOffset = 0f;
-    [Tooltip("Точка появления зомби")]
-    [SerializeField] private Vector3 spawnPosition = new Vector3(3.25f, -0.03f, -5.93f);
-
-    [Tooltip("Если включено — использовать позицию самого спавнера как точку спавна (удобно для ZombieSpawner_Hills).")]
-    [SerializeField] private bool useTransformPositionAsSpawn = true;
-
-    [Tooltip("Шаг сетки (расстояние между idle-зомби), если spawn_idle=true.")]
     [SerializeField] private float idleSpawnGridSpacing = 0.8f;
-
-    [Tooltip("Сколько зомби заспавнить плотным квадратом (если spawn_idle=true).")]
     [SerializeField] private int idleSpawnCount = 10;
 
-    private List<GameObject> zombies = new List<GameObject>();
-    private float nextRespawnTime;
-    Transform _spawnProxy;
+    readonly List<GameObject> zombies = new List<GameObject>();
+    float nextRespawnTime;
     GameObject _resolvedZombiePrefab;
     Vector3 _prefabRootScale = Vector3.one;
     float _spawnMoveSpeedMultiplier = 1f;
+    bool _bootstrapDone;
+    RuntimeAnimatorController _cachedZombieAnimator;
+
+    static bool IsCityScene()
+    {
+        string name = SceneManager.GetActiveScene().name;
+        return !string.IsNullOrEmpty(name)
+            && name.IndexOf("City", System.StringComparison.OrdinalIgnoreCase) >= 0;
+    }
 
     static bool IsAlive(GameObject go) => go != null;
 
-    private void OnEnable()
+    void OnEnable()
     {
-        // При включении объекта во время Play Start() может уже не вызываться — поэтому инициализация здесь.
+        if (_bootstrapDone)
+            return;
+        _bootstrapDone = true;
         BootstrapSpawn();
     }
 
-    private void Start()
+    void Start()
     {
-        // На случай, если объект активен с самого начала сцены.
+        if (_bootstrapDone)
+            return;
+        _bootstrapDone = true;
         BootstrapSpawn();
     }
 
-    private void BootstrapSpawn()
+    void OnDisable()
     {
-        if (useTransformPositionAsSpawn)
-            spawnPosition = transform.position;
-        else
-            spawnPosition = TrainingEnvSpace.LocalToWorld(transform, spawnPosition);
+        _bootstrapDone = false;
+    }
 
+    void BootstrapSpawn()
+    {
         if (spawn_idle)
         {
             SpawnIdleGrid(Mathf.Max(1, idleSpawnCount));
@@ -78,11 +76,8 @@ public class ZombieSpawner : MonoBehaviour
 
         if (zombie_from_hills)
         {
-            // Сразу спавним 10 зомби
             for (int i = 0; i < 10; i++)
                 SpawnOne();
-
-            // Дальше — раз в 2 секунды +1, независимо от лимита
             nextRespawnTime = Time.time + 2f;
         }
         else
@@ -91,30 +86,22 @@ public class ZombieSpawner : MonoBehaviour
         }
     }
 
-    private void Update()
+    void Update()
     {
-        if (ResolveZombiePrefab() == null) return;
-        if (spawn_idle) return;
-        if (Time.time < nextRespawnTime) return;
-        nextRespawnTime = Time.time + (zombie_from_hills ? 2f : spawnInterval);
+        if (ResolveZombiePrefab() == null)
+            return;
+        if (spawn_idle)
+            return;
+        if (Time.time < nextRespawnTime)
+            return;
 
+        nextRespawnTime = Time.time + (zombie_from_hills ? 2f : spawnInterval);
         RemoveDestroyed();
         if (zombie_from_hills || zombies.Count < maxZombies)
             SpawnOne();
     }
 
-    private void RemoveDestroyed()
-    {
-        zombies.RemoveAll(z => !IsAlive(z));
-    }
-
-    Transform ResolveSpawnParent()
-    {
-        if (gameObject.activeInHierarchy)
-            return transform;
-
-        return null;
-    }
+    void RemoveDestroyed() => zombies.RemoveAll(z => !IsAlive(z));
 
     public static ZombieSpawner FindPresentationZombieSpawner()
     {
@@ -142,41 +129,15 @@ public class ZombieSpawner : MonoBehaviour
         return all.Length > 0 ? all[0] : null;
     }
 
-    void ClearSpawnProxyChildren()
+    void SpawnOne() => SpawnOneAt(Vector3.zero);
+
+    void SpawnIdleGrid(int count)
     {
-        if (_spawnProxy == null)
+        if (ResolveZombiePrefab() == null || count <= 0)
             return;
 
-        for (int i = _spawnProxy.childCount - 1; i >= 0; i--)
-        {
-            var child = _spawnProxy.GetChild(i);
-            if (child != null)
-                Destroy(child.gameObject);
-        }
-    }
-
-    void OnDestroy()
-    {
-        if (_spawnProxy != null)
-            Destroy(_spawnProxy.gameObject);
-    }
-
-    private void SpawnOne()
-    {
-        SpawnOneAt(spawnPosition);
-    }
-
-    private void SpawnIdleGrid(int count)
-    {
-        if (ResolveZombiePrefab() == null) return;
-        if (count <= 0) return;
-
-        Vector3 center = useTransformPositionAsSpawn ? transform.position : spawnPosition;
-        // Плотная "квадратная" раскладка по XZ вокруг центра.
-        // Для 10 получится 4+3+3 (всего 10), начиная от центра.
         int side = Mathf.CeilToInt(Mathf.Sqrt(count));
         float spacing = Mathf.Max(0.05f, idleSpawnGridSpacing);
-
         int spawned = 0;
         for (int z = 0; z < side && spawned < count; z++)
         {
@@ -184,82 +145,207 @@ public class ZombieSpawner : MonoBehaviour
             {
                 float ox = (x - (side - 1) * 0.5f) * spacing;
                 float oz = (z - (side - 1) * 0.5f) * spacing;
-                SpawnOneAt(center + new Vector3(ox, 0f, oz));
+                SpawnOneForestLocal(ox, oz);
                 spawned++;
             }
         }
     }
 
-    private void SpawnOneAt(Vector3 worldPos)
+    void SpawnOneAt(Vector3 _)
     {
-        GameObject prefab = ResolveZombiePrefab();
-        if (prefab == null)
+        RemoveDestroyed();
+        if (zombies.Count >= maxZombies)
+            return;
+        if (ResolveZombiePrefab() == null)
             return;
 
-        worldPos = SnapSpawnToEnvGround(worldPos);
-        GameObject zombie = Instantiate(prefab, worldPos, Quaternion.Euler(0f, Random.Range(0f, 360f), 0f));
-        FinalizeSpawnedZombie(zombie);
+        if (IsCityScene())
+            SpawnOneCity();
+        else
+            SpawnOneForestLocal(Random.Range(-1.2f, 1.2f), Random.Range(-1.2f, 1.2f));
+    }
+
+    void SpawnOneForestLocal(float localX, float localZ)
+    {
+        GameObject zombie = Instantiate(ResolveZombiePrefab());
+        zombie.name = "FatZombie";
+        FinalizeForestZombie(zombie, localX, localZ, 1f);
         zombies.Add(zombie);
     }
 
-    Vector3 SnapSpawnToEnvGround(Vector3 worldPos)
+    void SpawnOneCity()
     {
-        var envRoot = TrainingEnvSpace.FindRoot(transform);
-        if (envRoot != null)
-        {
-            Vector3 local = envRoot.InverseTransformPoint(worldPos);
-            local.y = EnvGroundLocalY + spawnHeightOffset;
-            return envRoot.TransformPoint(local);
-        }
-
-        return worldPos + Vector3.up * spawnHeightOffset;
+        GameObject zombie = Instantiate(ResolveZombiePrefab());
+        zombie.name = "FatZombie";
+        Vector3 worldPos = transform.position;
+        worldPos.x += Random.Range(-1.2f, 1.2f);
+        worldPos.z += Random.Range(-1.2f, 1.2f);
+        worldPos.y = CityFixedSpawnWorldY;
+        FinalizeCityZombie(zombie, worldPos, 1f);
+        zombies.Add(zombie);
     }
 
-    float ResolveSpawnScale()
-    {
-        // В старых сценах поле могло не сериализоваться → 0 и зомби становились крошечными (0.1x).
-        return spawnScaleMultiplier > 0.01f ? spawnScaleMultiplier : DefaultSpawnScale;
-    }
-
-    void ApplySpawnScale(GameObject zombie, float extraMultiplier = 1f)
+    void ApplySpawnScale(GameObject zombie, float extraMultiplier)
     {
         if (zombie == null)
             return;
 
-        float scaleMult = ResolveSpawnScale() * Mathf.Max(0.1f, extraMultiplier);
+        float scaleMult = (spawnScaleMultiplier > 0.01f ? spawnScaleMultiplier : DefaultSpawnScale)
+            * Mathf.Max(0.1f, extraMultiplier);
         zombie.transform.localScale = _prefabRootScale * scaleMult;
 
-        // Модель крупная, но коллайдер — как у человека (не умножаем на scale).
         var cc = zombie.GetComponentInChildren<CharacterController>();
         if (cc != null)
         {
             cc.height = PrefabCharacterControllerHeight;
             cc.radius = PrefabCharacterControllerRadius;
             cc.center = PrefabCharacterControllerCenter;
+            cc.skinWidth = 0.08f;
+            cc.enabled = false;
         }
     }
 
-    void FinalizeSpawnedZombie(GameObject zombie, float scaleExtra = 1f)
+    void FinalizeForestZombie(GameObject zombie, float localX, float localZ, float scaleExtra)
+    {
+        zombie.SetActive(true);
+        DisableAnimRootMotion(zombie);
+        ApplySpawnScale(zombie, scaleExtra);
+        DisableCharacterControllers(zombie);
+
+        // Только local у спавнера — высота = высота спавнера/Джека, не world Y.
+        zombie.transform.SetParent(transform, false);
+        zombie.transform.localPosition = new Vector3(localX, ForestSpawnLocalY, localZ);
+        zombie.transform.localRotation = Quaternion.Euler(0f, Random.Range(0f, 360f), 0f);
+
+        FinishSpawnedZombie(zombie, city: false);
+    }
+
+    void FinalizeCityZombie(GameObject zombie, Vector3 worldPos, float scaleExtra)
+    {
+        zombie.SetActive(true);
+        DisableAnimRootMotion(zombie);
+        ApplySpawnScale(zombie, scaleExtra);
+        DisableCharacterControllers(zombie);
+
+        zombie.transform.SetParent(null, false);
+        zombie.transform.SetPositionAndRotation(
+            worldPos,
+            Quaternion.Euler(0f, Random.Range(0f, 360f), 0f));
+
+        FinishSpawnedZombie(zombie, city: true);
+    }
+
+    /// <summary>Совместимость с SpawnBossZombie(zombie, pos, scale).</summary>
+    void FinalizeSpawnedZombie(GameObject zombie, Vector3? forcedWorldPos = null, float scaleExtra = 1f)
     {
         if (zombie == null)
             return;
 
-        zombie.SetActive(true);
-        ApplySpawnScale(zombie, scaleExtra);
+        if (IsCityScene())
+        {
+            Vector3 p = forcedWorldPos ?? transform.position;
+            p.y = CityFixedSpawnWorldY;
+            FinalizeCityZombie(zombie, p, scaleExtra);
+        }
+        else
+        {
+            float lx = Random.Range(-1.2f, 1.2f);
+            float lz = Random.Range(-1.2f, 1.2f);
+            if (forcedWorldPos.HasValue)
+            {
+                Vector3 local = transform.InverseTransformPoint(forcedWorldPos.Value);
+                lx = local.x;
+                lz = local.z;
+            }
 
-        var envRoot = TrainingEnvSpace.FindRoot(transform);
-        zombie.transform.SetParent(envRoot != null ? envRoot : transform, true);
+            FinalizeForestZombie(zombie, lx, lz, scaleExtra);
+        }
+    }
+
+    void FinishSpawnedZombie(GameObject zombie, bool city)
+    {
         SetZombieLayer(zombie);
         EnsureZombieComponents(zombie);
+        EnsureZombieAnimatorController(zombie);
+
+        var cc = zombie.GetComponentInChildren<CharacterController>(true);
+        if (cc != null)
+            cc.enabled = true;
 
         var chase = zombie.GetComponentInChildren<ZombieChase>();
-        if (chase != null)
+        if (chase == null)
+            return;
+
+        chase.EnableAgentChaseMode();
+        if (city)
+            chase.LockWorldY(CityFixedSpawnWorldY);
+        else
+            chase.LockParentLocalY(ForestSpawnLocalY);
+
+        if (_spawnMoveSpeedMultiplier > 1f)
+            chase.SetMoveSpeedMultiplier(_spawnMoveSpeedMultiplier);
+        AssignEnvLocalTargets(zombie, transform, chase);
+    }
+
+    static void DisableCharacterControllers(GameObject zombie)
+    {
+        var ccs = zombie.GetComponentsInChildren<CharacterController>(true);
+        for (int i = 0; i < ccs.Length; i++)
         {
-            chase.EnableAgentChaseMode();
-            if (_spawnMoveSpeedMultiplier > 1f)
-                chase.SetMoveSpeedMultiplier(_spawnMoveSpeedMultiplier);
-            AssignEnvLocalTargets(zombie, transform, chase);
+            if (ccs[i] != null)
+                ccs[i].enabled = false;
         }
+    }
+
+    static void DisableAnimRootMotion(GameObject zombie)
+    {
+        var animators = zombie.GetComponentsInChildren<Animator>(true);
+        for (int i = 0; i < animators.Length; i++)
+        {
+            if (animators[i] != null)
+                animators[i].applyRootMotion = false;
+        }
+    }
+
+    void EnsureZombieAnimatorController(GameObject zombie)
+    {
+        if (zombie == null)
+            return;
+
+        var animators = zombie.GetComponentsInChildren<Animator>(true);
+        var controller = ResolveZombieAnimatorController();
+        for (int i = 0; i < animators.Length; i++)
+        {
+            var anim = animators[i];
+            if (anim == null)
+                continue;
+            anim.applyRootMotion = false;
+            if (anim.runtimeAnimatorController == null && controller != null)
+                anim.runtimeAnimatorController = controller;
+        }
+    }
+
+    RuntimeAnimatorController ResolveZombieAnimatorController()
+    {
+        if (_cachedZombieAnimator != null)
+            return _cachedZombieAnimator;
+
+#if UNITY_EDITOR
+        _cachedZombieAnimator = UnityEditor.AssetDatabase.LoadAssetAtPath<RuntimeAnimatorController>(
+            "Assets/ResilientLogicGames/ChubyCharacterFree/Animations/Animator Zombie.controller");
+        if (_cachedZombieAnimator != null)
+            return _cachedZombieAnimator;
+#endif
+
+        var prefab = ResolveZombiePrefab();
+        if (prefab != null)
+        {
+            var anim = prefab.GetComponentInChildren<Animator>(true);
+            if (anim != null)
+                _cachedZombieAnimator = anim.runtimeAnimatorController;
+        }
+
+        return _cachedZombieAnimator;
     }
 
     public void SetSpawnMoveSpeedMultiplier(float multiplier)
@@ -278,9 +364,9 @@ public class ZombieSpawner : MonoBehaviour
             return null;
 
         RemoveDestroyed();
-        Vector3 pos = SnapSpawnToEnvGround(GetSpawnCenterWorld());
-        GameObject zombie = Instantiate(ResolveZombiePrefab(), pos, Quaternion.Euler(0f, Random.Range(0f, 360f), 0f));
-        FinalizeSpawnedZombie(zombie, scaleMultiplier);
+        GameObject zombie = Instantiate(ResolveZombiePrefab());
+        zombie.name = "FatZombie";
+        FinalizeSpawnedZombie(zombie, transform.position, scaleMultiplier);
         zombies.Add(zombie);
 
         var health = zombie.GetComponentInChildren<ZombieHealth>();
@@ -328,12 +414,16 @@ public class ZombieSpawner : MonoBehaviour
             if (lilyScript != null)
                 lily = lilyScript.transform;
         }
-        else
+
+        if (jack == null)
         {
             var presentationJack = TrainingEnvSpace.FindPresentationJack();
             if (presentationJack != null)
                 jack = presentationJack.transform;
+        }
 
+        if (lily == null)
+        {
             var lilyRoot = TrainingEnvSpace.PresentationRoot;
             LilyScript presentationLily = lilyRoot != null
                 ? lilyRoot.GetComponentInChildren<LilyScript>(false)
@@ -350,6 +440,16 @@ public class ZombieSpawner : MonoBehaviour
         if (_resolvedZombiePrefab != null)
             return _resolvedZombiePrefab;
 
+#if UNITY_EDITOR
+        var gameFat = UnityEditor.AssetDatabase.LoadAssetAtPath<GameObject>("Assets/Prefabs/FatZombie.prefab");
+        if (gameFat != null)
+        {
+            _resolvedZombiePrefab = gameFat;
+            _prefabRootScale = gameFat.transform.localScale;
+            return _resolvedZombiePrefab;
+        }
+#endif
+
         if (zombiePrefab != null && !zombiePrefab.scene.IsValid())
         {
             _resolvedZombiePrefab = zombiePrefab;
@@ -361,36 +461,14 @@ public class ZombieSpawner : MonoBehaviour
         if (zombiePrefab != null)
         {
             var source = UnityEditor.PrefabUtility.GetCorrespondingObjectFromOriginalSource(zombiePrefab);
-            if (source != null)
+            if (source != null
+                && source.GetComponentInChildren<ZombieChase>(true) != null
+                && HasAnimatorController(source))
             {
                 _resolvedZombiePrefab = source;
-                _prefabRootScale = _resolvedZombiePrefab.transform.localScale;
+                _prefabRootScale = source.transform.localScale;
                 return _resolvedZombiePrefab;
             }
-        }
-
-        _resolvedZombiePrefab = UnityEditor.AssetDatabase.LoadAssetAtPath<GameObject>(
-            "Assets/Prefabs/FatZombie.prefab");
-        if (_resolvedZombiePrefab != null)
-        {
-            _prefabRootScale = _resolvedZombiePrefab.transform.localScale;
-            return _resolvedZombiePrefab;
-        }
-
-        _resolvedZombiePrefab = UnityEditor.AssetDatabase.LoadAssetAtPath<GameObject>(
-            "Assets/Prefabs/ZombieGoblin.prefab");
-        if (_resolvedZombiePrefab != null)
-        {
-            _prefabRootScale = _resolvedZombiePrefab.transform.localScale;
-            return _resolvedZombiePrefab;
-        }
-
-        _resolvedZombiePrefab = UnityEditor.AssetDatabase.LoadAssetAtPath<GameObject>(
-            "Assets/3D Characters Zombie City Streets Lowpoly Pack - Lite/Prefabs/(P) Characters_Zombie_SuitMan_1.prefab");
-        if (_resolvedZombiePrefab != null)
-        {
-            _prefabRootScale = _resolvedZombiePrefab.transform.localScale;
-            return _resolvedZombiePrefab;
         }
 #endif
 
@@ -400,15 +478,16 @@ public class ZombieSpawner : MonoBehaviour
         return _resolvedZombiePrefab;
     }
 
-    public Vector3 GetSpawnCenterWorld()
+    static bool HasAnimatorController(GameObject go)
     {
-        if (useTransformPositionAsSpawn)
-            return transform.position;
-
-        return TrainingEnvSpace.LocalToWorld(transform, spawnPosition);
+        if (go == null)
+            return false;
+        var anim = go.GetComponentInChildren<Animator>(true);
+        return anim != null && anim.runtimeAnimatorController != null;
     }
 
-    /// <summary>Спавн ровно в точке ZombieSpawner (домик).</summary>
+    public Vector3 GetSpawnCenterWorld() => transform.position;
+
     public int SpawnZombiesAtSpawner(int count)
     {
         if (ResolveZombiePrefab() == null)
@@ -416,36 +495,39 @@ public class ZombieSpawner : MonoBehaviour
 
         count = Mathf.Clamp(count, 1, 10);
         RemoveDestroyed();
-
-        Vector3 pos = GetSpawnCenterWorld();
         for (int i = 0; i < count; i++)
-            SpawnOneAt(pos);
-
+            SpawnOne();
         return count;
     }
 
-    private static void EnsureZombieComponents(GameObject zombie)
+    static void EnsureZombieComponents(GameObject zombie)
     {
-        if (zombie == null) return;
-        // Важно: на некоторых префабах компоненты могут быть на корне или на детях.
-        // Для логики игры нам нужен ZombieChase и ZombieAttack на корне (или хотя бы в иерархии),
-        // а ZombieHealth — чтобы зомби умирал от урона.
+        if (zombie == null)
+            return;
         if (zombie.GetComponentInChildren<ZombieChase>() == null)
             zombie.AddComponent<ZombieChase>();
         if (zombie.GetComponentInChildren<ZombieAttack>() == null)
             zombie.AddComponent<ZombieAttack>();
         if (zombie.GetComponentInChildren<ZombieHealth>() == null)
             zombie.AddComponent<ZombieHealth>();
+        if (zombie.GetComponentInChildren<CharacterController>() == null)
+        {
+            var cc = zombie.AddComponent<CharacterController>();
+            cc.height = PrefabCharacterControllerHeight;
+            cc.radius = PrefabCharacterControllerRadius;
+            cc.center = PrefabCharacterControllerCenter;
+            cc.skinWidth = 0.08f;
+        }
     }
 
-    private void SetZombieLayer(GameObject zombie)
+    void SetZombieLayer(GameObject zombie)
     {
         int layer = LayerMask.NameToLayer("Zombie");
         if (layer >= 0)
             SetLayerRecursively(zombie, layer);
     }
 
-    private void SetLayerRecursively(GameObject go, int layer)
+    static void SetLayerRecursively(GameObject go, int layer)
     {
         if (!IsAlive(go))
             return;
@@ -453,27 +535,54 @@ public class ZombieSpawner : MonoBehaviour
         go.layer = layer;
         foreach (Transform child in go.transform)
         {
-            if (child == null)
-                continue;
-            SetLayerRecursively(child.gameObject, layer);
+            if (child != null)
+                SetLayerRecursively(child.gameObject, layer);
         }
     }
 
-    /// <summary>Очистить всех зомби (например при новом эпизоде).</summary>
     public void ClearZombies()
     {
         RemoveDestroyed();
         foreach (var z in zombies)
         {
-            if (IsAlive(z))
-                Destroy(z);
+            if (!IsAlive(z))
+                continue;
+            z.SetActive(false);
+            Destroy(z);
         }
         zombies.Clear();
-        ClearSpawnProxyChildren();
         _spawnMoveSpeedMultiplier = 1f;
+
+        // Сироты без родителя.
+        var all = FindObjectsOfType<Transform>();
+        for (int i = 0; i < all.Length; i++)
+        {
+            var t = all[i];
+            if (t == null || t.parent != null)
+                continue;
+            string n = t.name;
+            if (n.IndexOf("FatZombie", System.StringComparison.OrdinalIgnoreCase) < 0)
+                continue;
+            Destroy(t.gameObject);
+        }
     }
 
-    /// <summary>Спавн count зомби вокруг worldPos (Twitch #zombie=N). Возвращает сколько создано.</summary>
+    /// <summary>Очистить всех зомби во всех Env (переключение меню K / #env_N).</summary>
+    public static void ClearZombiesInAllEnvs()
+    {
+        var spawners = Object.FindObjectsOfType<ZombieSpawner>(true);
+        for (int i = 0; i < spawners.Length; i++)
+        {
+            if (spawners[i] == null)
+                continue;
+            spawners[i].ClearZombies();
+            if (spawners[i].gameObject.name.IndexOf("Hills", System.StringComparison.OrdinalIgnoreCase) >= 0)
+                continue;
+            if (spawners[i].gameObject.activeSelf)
+                spawners[i].gameObject.SetActive(false);
+        }
+    }
+
     public int SpawnZombiesNear(Vector3 worldPos, int count, float radius = 7f)
     {
         if (ResolveZombiePrefab() == null)
@@ -481,38 +590,48 @@ public class ZombieSpawner : MonoBehaviour
 
         count = Mathf.Clamp(count, 1, 10);
         RemoveDestroyed();
-
         int spawned = 0;
-        float groundY = worldPos.y;
-
         for (int i = 0; i < count; i++)
         {
             Vector2 ring = Random.insideUnitCircle * radius;
-            Vector3 pos = new Vector3(worldPos.x + ring.x, groundY, worldPos.z + ring.y);
-            SpawnOneAt(pos);
+            if (IsCityScene())
+            {
+                Vector3 pos = new Vector3(worldPos.x + ring.x, CityFixedSpawnWorldY, worldPos.z + ring.y);
+                GameObject zombie = Instantiate(ResolveZombiePrefab());
+                zombie.name = "FatZombie";
+                FinalizeCityZombie(zombie, pos, 1f);
+                zombies.Add(zombie);
+            }
+            else
+            {
+                Vector3 local = transform.InverseTransformPoint(
+                    new Vector3(worldPos.x + ring.x, transform.position.y, worldPos.z + ring.y));
+                SpawnOneForestLocal(local.x, local.z);
+            }
+
             spawned++;
         }
 
         return spawned;
     }
 
-    /// <summary>Старт эпизода обучения: зомби сразу, дальше по spawnInterval.</summary>
-    public void StartTrainingEpisode(int immediateCount = 2)
+    public int StartTrainingEpisode(int immediateCount = 2)
     {
-        if (useTransformPositionAsSpawn)
-            spawnPosition = transform.position;
-        else
-            spawnPosition = TrainingEnvSpace.LocalToWorld(transform, spawnPosition);
+        ClearZombies();
+        if (ResolveZombiePrefab() == null)
+        {
+            Debug.LogWarning($"[{name}] StartTrainingEpisode: zombiePrefab=null", this);
+            return 0;
+        }
 
-        RemoveDestroyed();
         immediateCount = Mathf.Clamp(immediateCount, 1, maxZombies);
         for (int i = 0; i < immediateCount; i++)
             SpawnOne();
 
         nextRespawnTime = Time.time + Mathf.Max(0.5f, spawnInterval);
+        return zombies.Count;
     }
 
-    /// <summary>Убить всех зомби и заново запустить спавн (новый эпизод).</summary>
     public void ResetForNewEpisode()
     {
         ClearZombies();

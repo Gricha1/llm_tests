@@ -24,9 +24,11 @@ public static class PresentationWorldReset
 
         var treeSpawner = envRoot.GetComponentInChildren<TreeSpawner>(true);
         var sheepSpawner = envRoot.GetComponentInChildren<SheepSpawner>(true);
+        var flowerSpawner = envRoot.GetComponentInChildren<FlowerSpawner>(true);
 
         treeSpawner?.ResetTrees();
         sheepSpawner?.ResetSheep();
+        flowerSpawner?.ResetFlowers();
 
         var envConfig = envRoot.GetComponent<EnvTrainingConfig>();
         if (envConfig == null || envConfig.ResolveJackMode() != JackTrainingMode.ZombieOnly)
@@ -45,13 +47,25 @@ public static class PresentationWorldReset
     {
         if (trees != null)
         {
-            int alive = trees.AliveCount;
             int target = trees.TargetCount;
-            if (alive < Mathf.Max(1, Mathf.RoundToInt(target * MinFillRatio)))
+            int need = Mathf.Max(1, Mathf.RoundToInt(target * MinFillRatio));
+            for (int attempt = 0; attempt < 3; attempt++)
             {
+                int alive = trees.AliveCount;
+                if (alive >= need)
+                    break;
+
                 Debug.LogWarning(
-                    $"[PresentationWorldReset] деревьев мало ({alive}/{target}), повторный спавн");
+                    $"[PresentationWorldReset] деревьев мало ({alive}/{target}), " +
+                    $"повторный спавн {attempt + 1}/3");
                 trees.ResetTrees();
+            }
+
+            if (trees.AliveCount < need)
+            {
+                Debug.LogError(
+                    $"[PresentationWorldReset] деревья так и не восстановились " +
+                    $"({trees.AliveCount}/{target})");
             }
         }
 

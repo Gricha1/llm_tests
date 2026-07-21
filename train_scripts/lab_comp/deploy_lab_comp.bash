@@ -3,6 +3,7 @@
 #
 #   wsl bash train_scripts/lab_comp/deploy_lab_comp.bash
 #   wsl bash train_scripts/lab_comp/deploy_lab_comp.bash --skip-build
+#   wsl bash train_scripts/lab_comp/deploy_lab_comp.bash --skip-build --skip-sync-build
 #   BUILD=stream_forest_survival_2_12_07_2026 RUN_ID=run_60 wsl bash train_scripts/lab_comp/deploy_lab_comp.bash
 #
 # После деплоя на сервере (2 терминала):
@@ -19,10 +20,12 @@ BUILD="${BUILD:-stream_forest_survival_2_12_07_2026}"
 BUILD="${BUILD%.x86_64}"
 RUN_ID="${RUN_ID:-run_60}"
 SKIP_BUILD=0
+SKIP_SYNC_BUILD=0
 
 for arg in "$@"; do
   case "${arg}" in
     --skip-build) SKIP_BUILD=1 ;;
+    --skip-sync-build) SKIP_SYNC_BUILD=1 ;;
   esac
 done
 
@@ -37,8 +40,12 @@ else
   echo "[1/4] skip build (--skip-build)"
 fi
 
-echo "[2/4] sync build..."
-bash train_scripts/lab_comp/sync_build.bash
+if [ "${SKIP_SYNC_BUILD}" -eq 0 ]; then
+  echo "[2/4] sync build..."
+  bash train_scripts/lab_comp/sync_build.bash
+else
+  echo "[2/4] skip sync build (--skip-sync-build)"
+fi
 
 echo "[3/4] sync scripts + configs..."
 bash train_scripts/lab_comp/sync_scripts.bash
@@ -51,6 +58,9 @@ echo "=== deploy done ==="
 echo "На сервере (ssh reedgern@192.168.194.7):"
 echo "  cd ~/lab_work_space/forest_survival"
 echo "  RUN_ID=${RUN_ID} bash train_scripts/lab_comp/run_train.bash      # train + presentation OBS"
+echo ""
+echo "TensorBoard (с ПК, один скрипт):"
+echo "  RUN_ID=${RUN_ID} bash train_scripts/lab_comp/open_tensorboard.bash"
 echo ""
 echo "Или:"
 echo "  RUN_ID=${RUN_ID} bash train_scripts/lab_comp/run_all.bash"

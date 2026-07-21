@@ -81,7 +81,8 @@ public sealed class TwitchChatGameBridge : MonoBehaviour
                 HandleZombie(cmd);
                 break;
             case "clone_jack":
-                HandleCloneJack(cmd);
+                // Временно отключено: клон сбрасывает зомби/среду.
+                Debug.LogWarning("[TwitchChat] #clone_jack временно отключён");
                 break;
             case "size":
                 HandleSize(cmd);
@@ -92,13 +93,37 @@ public sealed class TwitchChatGameBridge : MonoBehaviour
             case "show_metrics":
                 HandleShowMetrics(cmd);
                 break;
+            case "add_fire":
+                HandleAddFire(cmd);
+                break;
             case "reset":
                 HandleReset(cmd);
                 break;
+            case "menu":
+                PresentationEnvSwitcher.ToggleMenu();
+                Debug.Log($"[TwitchChat] {cmd.DisplayName}: #menu");
+                break;
             default:
+                if (TryHandleEnvSwitch(cmd))
+                    break;
                 Debug.Log($"[TwitchChat] неизвестная команда: #{cmd.CommandName}={cmd.IntValue}");
                 break;
         }
+    }
+
+    static bool TryHandleEnvSwitch(TwitchChatCommand cmd)
+    {
+        string name = cmd.CommandName;
+        if (string.IsNullOrEmpty(name) || !name.StartsWith("env_", System.StringComparison.Ordinal))
+            return false;
+
+        string suffix = name.Substring(4);
+        if (!int.TryParse(suffix, out int envIndex))
+            return false;
+
+        PresentationEnvSwitcher.SelectEnvFromCommand(envIndex);
+        Debug.Log($"[TwitchChat] {cmd.DisplayName}: #env_{envIndex}");
+        return true;
     }
 
     void HandleAddTree(TwitchChatCommand cmd)
@@ -241,6 +266,19 @@ public sealed class TwitchChatGameBridge : MonoBehaviour
     {
         TrainingMetricsBurstOverlay.Toggle();
         Debug.Log($"[TwitchChat] {cmd.DisplayName}: #show metrics → переключить графики");
+    }
+
+    void HandleAddFire(TwitchChatCommand cmd)
+    {
+        var jack = TrainingEnvSpace.FindPresentationPrimaryJack();
+        if (jack == null)
+        {
+            Debug.LogWarning("[TwitchChat] add fire: Jack не найден в presentation Env");
+            return;
+        }
+
+        bool on = TwitchPermanentFire.Toggle();
+        Debug.Log($"[TwitchChat] {cmd.DisplayName}: #add fire → костёр {(on ? "включён" : "выключен")}");
     }
 
     void HandleReset(TwitchChatCommand cmd)

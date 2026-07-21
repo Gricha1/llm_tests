@@ -51,21 +51,14 @@ public class LilyWaterDisplay : MonoBehaviour
         if (_text == null)
             return;
 
-        if (lily == null || !lily.isActiveAndEnabled)
-            lily = TrainingEnvSpace.FindPresentationLily();
-
-        if (lily == null)
-            return;
-
-        if (!show)
+        lily = TrainingEnvSpace.FindPresentationLily();
+        if (lily == null || !TrainingEnvSpace.ShouldShowHudForRole(EnvTrainingAgentRole.Lily) || !show)
         {
-            if (_text.enabled)
-                _text.enabled = false;
+            _text.enabled = false;
             return;
         }
 
-        if (!_text.enabled)
-            _text.enabled = true;
+        _text.enabled = true;
 
         if (spriteAsset != null && _text.spriteAsset != spriteAsset)
             _text.spriteAsset = spriteAsset;

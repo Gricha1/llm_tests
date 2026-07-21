@@ -24,11 +24,14 @@ public class WaterDisplay : MonoBehaviour
         if (_text == null)
             return;
 
-        if (agent == null || !agent.gameObject.activeInHierarchy)
-            agent = TrainingEnvSpace.FindPresentationJack();
-
-        if (agent == null)
+        agent = TrainingEnvSpace.FindPresentationJack();
+        if (agent == null || !TrainingEnvSpace.ShouldShowHudForRole(EnvTrainingAgentRole.Jack))
+        {
+            _text.enabled = false;
             return;
+        }
+
+        _text.enabled = true;
 
         if (spriteAsset != null && _text.spriteAsset != spriteAsset)
             _text.spriteAsset = spriteAsset;

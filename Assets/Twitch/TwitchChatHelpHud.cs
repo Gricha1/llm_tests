@@ -2,12 +2,13 @@ using UnityEngine;
 using UnityEngine.UI;
 using TMPro;
 
-/// <summary>Подсказка справа снизу: команды Twitch и статус F.</summary>
+/// <summary>Подсказка справа снизу: команды Twitch для чата.</summary>
 public sealed class TwitchChatHelpHud : MonoBehaviour
 {
     static TwitchChatHelpHud _instance;
 
     GameObject _panel;
+    TMP_Text _title;
     TMP_Text _body;
 
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
@@ -44,17 +45,6 @@ public sealed class TwitchChatHelpHud : MonoBehaviour
 
         bool show = TrainingEnvSpace.PresentationRoot != null;
         _panel.SetActive(show);
-        if (!show || _body == null)
-            return;
-
-        string chatState = TwitchChatReader.CommandsEnabled
-            ? "<color=#7CFC90>вкл</color>"
-            : "<color=#FF7A7A>выкл</color>";
-
-        _body.text =
-            "Для взаимодействия пишите в чат\n" +
-            $"(F — обработка команд: {chatState})\n\n" +
-            TwitchChatCommandCatalog.HelpText;
     }
 
     void BuildUi()
@@ -78,24 +68,45 @@ public sealed class TwitchChatHelpHud : MonoBehaviour
         rt.anchorMax = new Vector2(1f, 0f);
         rt.pivot = new Vector2(1f, 0f);
         rt.anchoredPosition = new Vector2(-16f, 16f);
-        rt.sizeDelta = new Vector2(400f, 340f);
+        rt.sizeDelta = new Vector2(420f, 400f);
 
         var bg = _panel.AddComponent<Image>();
-        bg.color = new Color(0.04f, 0.06f, 0.08f, 0.78f);
+        bg.color = new Color(0.03f, 0.05f, 0.07f, 0.88f);
 
-        var textGo = new GameObject("Text");
+        var titleGo = new GameObject("Title");
+        titleGo.transform.SetParent(_panel.transform, false);
+        var titleRt = titleGo.AddComponent<RectTransform>();
+        titleRt.anchorMin = new Vector2(0f, 1f);
+        titleRt.anchorMax = new Vector2(1f, 1f);
+        titleRt.pivot = new Vector2(0.5f, 1f);
+        titleRt.anchoredPosition = new Vector2(0f, -10f);
+        titleRt.sizeDelta = new Vector2(-24f, 40f);
+
+        _title = titleGo.AddComponent<TextMeshProUGUI>();
+        _title.text = "Пиши в чате";
+        _title.fontSize = 28;
+        _title.fontStyle = FontStyles.Bold;
+        _title.alignment = TextAlignmentOptions.Center;
+        _title.color = new Color(1f, 0.92f, 0.55f, 1f);
+        if (TMP_Settings.defaultFontAsset != null)
+            _title.font = TMP_Settings.defaultFontAsset;
+
+        var textGo = new GameObject("Body");
         textGo.transform.SetParent(_panel.transform, false);
         var textRt = textGo.AddComponent<RectTransform>();
         textRt.anchorMin = Vector2.zero;
         textRt.anchorMax = Vector2.one;
-        textRt.offsetMin = new Vector2(12f, 10f);
-        textRt.offsetMax = new Vector2(-12f, -10f);
+        textRt.offsetMin = new Vector2(16f, 12f);
+        textRt.offsetMax = new Vector2(-16f, -56f);
 
         _body = textGo.AddComponent<TextMeshProUGUI>();
-        _body.fontSize = 17;
+        _body.text = TwitchChatCommandCatalog.HelpText;
+        _body.fontSize = 20;
         _body.alignment = TextAlignmentOptions.TopLeft;
         _body.richText = true;
         _body.enableWordWrapping = true;
+        _body.lineSpacing = 8f;
+        _body.color = new Color(0.95f, 0.97f, 1f, 1f);
         if (TMP_Settings.defaultFontAsset != null)
             _body.font = TMP_Settings.defaultFontAsset;
     }
@@ -103,16 +114,21 @@ public sealed class TwitchChatHelpHud : MonoBehaviour
 
 static class TwitchChatCommandCatalog
 {
+    /// <summary>
+    /// Только чат-команды (без Play-тест / клавиш 1–0).
+    /// Примеры с числом, чтобы зритель сразу копировал формат.
+    /// </summary>
     public const string HelpText =
-        "#add_tree=N — деревья у Джека (1–10)\n" +
-        "#add_sheep=N — овцы у Джека (1–20)\n" +
-        "#up=N — прыжок, высота N ростов (1–5)\n" +
-        "#forward=N — толчок вперёд (1–5)\n" +
-        "#zombie=N — зомби рядом (1–10)\n" +
-        "#clone_jack — один клон Jack (та же сеть)\n" +
-        "#size=N — размер (1=обычный, 2=×2, 5=×5)\n" +
-        "#speed_up=N — скорость бега (1–5, 3=×3)\n" +
-        "#reset — начать эпизод заново\n" +
-        "#show metrics — графики обучения (вкл/выкл)\n" +
-        "\nPlay-тест: 1–0 — те же команды, Z — #zombie=1, P — Env копии";
+        "• <b>#add_sheep=5</b> — овцы\n" +
+        "• <b>#add_tree=5</b> — деревья\n" +
+        "• <b>#add fire</b> — костёр вкл/выкл\n" +
+        "• <b>#zombie=3</b> — зомби рядом\n" +
+        "• <b>#up=3</b> — прыжок\n" +
+        "• <b>#forward=3</b> — рывок вперёд\n" +
+        "• <b>#size=2</b> — размер\n" +
+        "• <b>#speed_up=3</b> — скорость\n" +
+        "• <b>#reset</b> — новый эпизод\n" +
+        "• <b>#show metrics</b> — графики\n" +
+        "• <b>#menu</b> — меню сред\n" +
+        "• <b>#env_0</b>…<b>#env_11</b> — среда";
 }

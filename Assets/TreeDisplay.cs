@@ -22,11 +22,14 @@ public class TreeDisplay : MonoBehaviour
         if (text == null)
             return;
 
-        if (agent == null || !agent.gameObject.activeInHierarchy)
-            agent = TrainingEnvSpace.FindPresentationJack();
-
-        if (agent == null)
+        agent = TrainingEnvSpace.FindPresentationJack();
+        if (agent == null || !TrainingEnvSpace.ShouldShowHudForRole(EnvTrainingAgentRole.Jack))
+        {
+            text.enabled = false;
             return;
+        }
+
+        text.enabled = true;
 
         if (spriteAsset != null && text.spriteAsset != spriteAsset)
             text.spriteAsset = spriteAsset;

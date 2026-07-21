@@ -25,14 +25,24 @@ TARGET_FPS="${TARGET_FPS:-30}"
 QUALITY_LEVEL="${QUALITY_LEVEL:-1}"
 STREAM_WIDTH="${STREAM_WIDTH:-1920}"
 STREAM_HEIGHT="${STREAM_HEIGHT:-1080}"
+# Unity иногда долго молчит (хитч / death / тяжёлый ResetTrees) — не рвать стрим.
+TIMEOUT_WAIT="${TIMEOUT_WAIT:-300}"
 export DISPLAY="${DISPLAY:-:1}"
 
 BUILD_PATH="build_versions/${BUILD%.x86_64}.x86_64"
+BUILD_STAMP="build_versions/${BUILD%.x86_64}.BUILD_STAMP"
 if [ ! -f "${BUILD_PATH}" ]; then
   echo "ERROR: ${BUILD_PATH} не найден" >&2
   exit 1
 fi
 chmod +x "${BUILD_PATH}" 2>/dev/null || true
+
+if [ -f "${BUILD_STAMP}" ]; then
+  echo "[stream_onnx] BUILD_STAMP:"
+  sed 's/^/  /' "${BUILD_STAMP}"
+else
+  echo "WARN: нет ${BUILD_STAMP} — билд могли не заливать через sync_build (возможна старая версия)" >&2
+fi
 
 PY=""
 if [ -x "${HOME}/anaconda3/envs/mlagents/bin/python" ]; then
@@ -78,11 +88,12 @@ echo "[stream_onnx] OBS: захват окна Unity (forest_survival)"
 
 export FOREST_STREAM_EXTERNAL_BRAIN=1
 export FOREST_TIME_SCALE="${TIME_SCALE}"
+export FOREST_RESULTS_DIR="${ROOT}/results/${RUN_ID}"
 # Меньше пауз рендера / VSync — Unity не ждёт дисплей между env.step.
 export __GL_SYNC_TO_VBLANK="${__GL_SYNC_TO_VBLANK:-0}"
 export vblank_mode="${vblank_mode:-0}"
 
-# Стрим на выделенных ядрах (по умолчанию 4,5); train — на 0-3; OBS — отдельно на train.
+# Стрим+OBS на одном ядре (по умолчанию 5); train — на 0-4.
 # shellcheck source=cpu_affinity.env.bash
 source "${ROOT}/train_scripts/lab_comp/cpu_affinity.env.bash"
 echo "[stream_onnx] CPU affinity: stream=${FOREST_STREAM_CPUS} train=${FOREST_TRAIN_CPUS} obs=${FOREST_OBS_CPUS}"
@@ -108,6 +119,7 @@ STREAM_CMD=(
   --quality-level "${QUALITY_LEVEL}"
   --width "${STREAM_WIDTH}"
   --height "${STREAM_HEIGHT}"
+  --timeout "${TIMEOUT_WAIT}"
 )
 
 if command -v taskset >/dev/null 2>&1; then

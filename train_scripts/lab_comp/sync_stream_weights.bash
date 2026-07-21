@@ -62,25 +62,37 @@ find_onnx_for_behavior() {
   local beh="$1"
   local step="$2"
   local dir="${RUN_DIR}/${beh}"
-  local candidates=() f newest=""
+  local f best="" best_step=-1 cand_step
 
-  if [ -n "${step}" ] && [ "${step}" != "checkpoint" ]; then
-    candidates+=(
-      "${dir}/${beh}-${step}.onnx"
-      "${dir}/${beh}.onnx"
-      "${RUN_DIR}/${beh}.onnx"
-    )
+  if [ -n "${step}" ] && [ "${step}" != "checkpoint" ] && [ "${step}" -gt 0 ] 2>/dev/null; then
+    if [ -f "${dir}/${beh}-${step}.onnx" ]; then
+      echo "${dir}/${beh}-${step}.onnx"
+      return 0
+    fi
   fi
-  candidates+=("${dir}/${beh}.onnx" "${RUN_DIR}/${beh}.onnx")
+
+  # Max numeric step among Name-*.onnx (игнор -0 если есть старше).
   for f in "${dir}/${beh}-"*.onnx; do
     [ -f "${f}" ] || continue
-    newest="${f}"
+    cand_step="$(basename "${f}")"
+    cand_step="${cand_step#${beh}-}"
+    cand_step="${cand_step%.onnx}"
+    if [[ "${cand_step}" =~ ^[0-9]+$ ]] && [ "${cand_step}" -gt "${best_step}" ]; then
+      best_step="${cand_step}"
+      best="${f}"
+    fi
   done
-  [ -n "${newest}" ] && candidates+=("${newest}")
+  if [ -n "${best}" ] && [ "${best_step}" -gt 0 ]; then
+    echo "${best}"
+    return 0
+  fi
+  if [ -n "${best}" ]; then
+    echo "${best}"
+    return 0
+  fi
 
-  local c
-  for c in "${candidates[@]}"; do
-    [ -f "${c}" ] && { echo "${c}"; return 0; }
+  for f in "${dir}/${beh}.onnx" "${RUN_DIR}/${beh}.onnx"; do
+    [ -f "${f}" ] && { echo "${f}"; return 0; }
   done
   return 1
 }

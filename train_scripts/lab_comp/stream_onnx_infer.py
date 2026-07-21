@@ -35,14 +35,43 @@ def behavior_stem(behavior: str) -> str:
     return behavior.split("?", 1)[0]
 
 
+def _onnx_step(path: Path, name: str) -> int:
+    """Номер шага из Name-123.onnx. Без номера / мусор → -1."""
+    stem = path.stem  # JackLowLevelAgent-28444931
+    prefix = f"{name}-"
+    if not stem.startswith(prefix):
+        return -1
+    step_s = stem[len(prefix) :]
+    if not step_s.isdigit():
+        return -1
+    return int(step_s)
+
+
 def find_latest_onnx(run_dir: Path, behavior: str) -> Optional[Path]:
+    """Самый свежий чекпоинт по номеру шага (не по mtime).
+
+    ML-Agents иногда пишет Name-0.onnx рядом с checkpoint.pt — он новее по
+    времени, но это не обученные веса (шаг 0). Берём max(step).
+    """
     name = behavior_stem(behavior)
     d = run_dir / name
     if not d.is_dir():
         return None
-    candidates = sorted(d.glob(f"{name}-*.onnx"), key=lambda p: p.stat().st_mtime)
-    if candidates:
-        return candidates[-1]
+
+    best: Optional[Path] = None
+    best_step = -1
+    for path in d.glob(f"{name}-*.onnx"):
+        step = _onnx_step(path, name)
+        if step > best_step:
+            best_step = step
+            best = path
+
+    # step=0 только если других нет
+    if best is not None and best_step > 0:
+        return best
+    if best is not None:
+        return best
+
     plain = d / f"{name}.onnx"
     if plain.is_file():
         return plain
@@ -380,7 +409,7 @@ def parse_args():
         default=0.0,
         help="0 = только при конце эпизода Jack; >0 = ещё страховочный интервал",
     )
-    p.add_argument("--timeout", type=int, default=120)
+    p.add_argument("--timeout", type=int, default=300)
     p.add_argument("--time-scale", type=float, default=1.0)
     p.add_argument("--target-fps", type=float, default=30.0)
     p.add_argument("--quality-level", type=int, default=1)
@@ -426,6 +455,8 @@ def main() -> int:
     additional = [
         "-forestStreamOnly",
         "-forestExternalBrain",
+        "-forestResultsDir",
+        str(run_dir),
     ]
     _log(
         f"start Unity {env_path} port={args.port} DISPLAY={os.environ.get('DISPLAY')} "

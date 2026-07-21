@@ -6,27 +6,26 @@ set -o pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/../.." && pwd)"
 cd "${ROOT}"
 
-KEY="${SSH_KEY:-${HOME}/.ssh/lab_comp_key}"
-REMOTE="${REMOTE:-reedgern@192.168.194.7}"
-REMOTE_DIR="${REMOTE_DIR:-~/lab_work_space/forest_survival}"
+# shellcheck source=rsync_ssh.bash
+source "${ROOT}/train_scripts/lab_comp/rsync_ssh.bash"
+lab_comp_init_ssh
 
-mkdir -p "${HOME}/.ssh"
-if [ ! -f "${KEY}" ]; then
-  cp /mnt/c/Users/User/.ssh/id_ed25519 "${KEY}" 2>/dev/null || true
-  chmod 600 "${KEY}" 2>/dev/null || true
-fi
+echo "[sync] train_scripts + custom_configs -> ${LAB_COMP_RSYNC_REMOTE}:${REMOTE_DIR}"
 
-RSYNC_SSH="ssh -i ${KEY} -o StrictHostKeyChecking=no"
+echo "[sync] 1/3 train_scripts..."
+rsync -avz --progress --info=name2,progress2 -e "${LAB_COMP_RSYNC_SSH}" \
+  train_scripts/ "${LAB_COMP_RSYNC_REMOTE}:${REMOTE_DIR}/train_scripts/"
 
-echo "[sync] train_scripts + custom_configs -> ${REMOTE}:${REMOTE_DIR}"
-rsync -avz --progress -e "${RSYNC_SSH}" \
-  train_scripts/ "${REMOTE}:${REMOTE_DIR}/train_scripts/"
-rsync -avz --progress -e "${RSYNC_SSH}" \
-  custom_configs/ "${REMOTE}:${REMOTE_DIR}/custom_configs/"
-rsync -avz --progress -e "${RSYNC_SSH}" \
+echo "[sync] 2/3 custom_configs..."
+rsync -avz --progress --info=name2,progress2 -e "${LAB_COMP_RSYNC_SSH}" \
+  custom_configs/ "${LAB_COMP_RSYNC_REMOTE}:${REMOTE_DIR}/custom_configs/"
+
+echo "[sync] 3/3 root launch scripts..."
+rsync -avz --progress --info=name2,progress2 -e "${LAB_COMP_RSYNC_SSH}" \
   stream_inference_watch.bash \
   train_headless_jack_lily_george.bash \
-  "${REMOTE}:${REMOTE_DIR}/"
+  tensorboard.sh \
+  "${LAB_COMP_RSYNC_REMOTE}:${REMOTE_DIR}/"
 
 echo "[sync] lab_comp run scripts included in train_scripts/"
 echo "[sync] done — на сервере: bash train_scripts/lab_comp/detect_unity_editor.bash"

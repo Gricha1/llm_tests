@@ -36,4 +36,3 @@ public sealed class FollowTargetCamera : MonoBehaviour
         transform.rotation = rot;
     }
 }
-

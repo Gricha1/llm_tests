@@ -67,19 +67,20 @@ public sealed class CampfireBurnTimerDisplay : MonoBehaviour
             _worldAnchor = _jack.houseTargetPublic;
 
         float remaining = _jack != null ? _jack.CampfireBurnSecondsRemaining : 0f;
-        bool show = remaining > 0f
+        bool show = _jack != null
+            && _jack.ShouldShowCampfireTimer
             && _worldAnchor != null
-            && _jack != null
             && TrainingEnvSpace.ShouldPlayFeedback(_jack.transform);
 
         if (!show)
         {
-            if (_text != null)
-                _text.gameObject.SetActive(false);
+            Hide();
             return;
         }
 
         EnsureUi();
+        if (_canvas != null)
+            _canvas.gameObject.SetActive(true);
         _text.gameObject.SetActive(true);
         _text.color = textColor;
         _text.text = FormatRemaining(remaining);
@@ -109,6 +110,14 @@ public sealed class CampfireBurnTimerDisplay : MonoBehaviour
         }
 
         _textRt.position = screenPos;
+    }
+
+    public void Hide()
+    {
+        if (_text != null)
+            _text.gameObject.SetActive(false);
+        if (_canvas != null)
+            _canvas.gameObject.SetActive(false);
     }
 
     static string FormatRemaining(float seconds)

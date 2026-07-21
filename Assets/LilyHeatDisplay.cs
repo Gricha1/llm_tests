@@ -132,11 +132,14 @@ public class LilyHeatDisplay : MonoBehaviour
         if (_text == null)
             return;
 
-        if (lily == null || !lily.isActiveAndEnabled)
-            lily = TrainingEnvSpace.FindPresentationLily();
-
-        if (lily == null)
+        lily = TrainingEnvSpace.FindPresentationLily();
+        if (lily == null || !TrainingEnvSpace.ShouldShowHudForRole(EnvTrainingAgentRole.Lily))
+        {
+            _text.enabled = false;
             return;
+        }
+
+        _text.enabled = true;
 
         if (spriteAsset != null && _text.spriteAsset != spriteAsset)
             _text.spriteAsset = spriteAsset;

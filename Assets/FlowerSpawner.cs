@@ -36,6 +36,8 @@ public class FlowerSpawner : MonoBehaviour
 
     private Vector3 ToWorld(Vector3 localPos)
     {
+        if (_envRoot == null)
+            _envRoot = TrainingEnvSpace.FindRoot(transform);
         return _envRoot != null ? _envRoot.TransformPoint(localPos) : localPos;
     }
 
@@ -87,22 +89,115 @@ public class FlowerSpawner : MonoBehaviour
             if (!tooClose)
             {
                 GameObject flower = Instantiate(prefab, pos, Quaternion.Euler(0f, Random.Range(0f, 360f), 0f), transform);
-                SetFlowerLayer(flower);
+                PrepareCollectibleFlower(flower);
                 flowers.Add(flower);
                 return;
             }
         }
     }
 
+    public void NotifyFlowerCollected(GameObject flower)
+    {
+        if (flower != null)
+            flowers.Remove(flower);
+    }
+
+    public GameObject FindNearestFlowerInReach(Vector3 origin, float reach)
+    {
+        RemoveDestroyed();
+        GameObject best = null;
+        float bestDist = float.MaxValue;
+        for (int i = 0; i < flowers.Count; i++)
+        {
+            var flower = flowers[i];
+            if (!IsAlive(flower))
+                continue;
+
+            float d = DistanceToFlowerBounds(origin, flower);
+            if (d > reach || d >= bestDist)
+                continue;
+
+            bestDist = d;
+            best = flower;
+        }
+        return best;
+    }
+
+    public static float DistanceToFlowerBounds(Vector3 origin, GameObject flower)
+    {
+        if (flower == null)
+            return float.MaxValue;
+
+        var cols = flower.GetComponentsInChildren<Collider>(true);
+        for (int i = 0; i < cols.Length; i++)
+        {
+            var c = cols[i];
+            if (c == null || !c.enabled)
+                continue;
+            return Vector3.Distance(origin, c.ClosestPoint(origin));
+        }
+
+        var rend = flower.GetComponentInChildren<Renderer>(true);
+        if (rend != null)
+            return Vector3.Distance(origin, rend.bounds.ClosestPoint(origin));
+
+        Vector3 p = flower.transform.position;
+        p.y = origin.y;
+        return Vector3.Distance(origin, p);
+    }
+
+    static void PrepareCollectibleFlower(GameObject flower)
+    {
+        if (flower == null)
+            return;
+
+        SetFlowerLayer(flower);
+
+        // Выключаем огромные/non-convex меш-коллайдеры префаба — иначе OverlapSphere
+        // цепляет цветок с полкарты, а ClosestPoint даёт дистанцию ≈0.
+        var cols = flower.GetComponentsInChildren<Collider>(true);
+        for (int i = 0; i < cols.Length; i++)
+        {
+            var c = cols[i];
+            if (c == null)
+                continue;
+            if (c is MeshCollider || c is BoxCollider || c is CapsuleCollider || c is SphereCollider)
+                c.enabled = false;
+        }
+
+        Bounds b = ComputeVisualBounds(flower);
+        var sphere = flower.GetComponent<SphereCollider>();
+        if (sphere == null)
+            sphere = flower.AddComponent<SphereCollider>();
+
+        float radius = Mathf.Clamp(Mathf.Max(b.extents.x, b.extents.z) * 0.45f, 0.2f, 0.85f);
+        sphere.enabled = true;
+        sphere.isTrigger = false;
+        sphere.radius = radius;
+        sphere.center = flower.transform.InverseTransformPoint(b.center);
+    }
+
+    static Bounds ComputeVisualBounds(GameObject flower)
+    {
+        var renderers = flower.GetComponentsInChildren<Renderer>(true);
+        if (renderers.Length == 0)
+            return new Bounds(flower.transform.position + Vector3.up * 0.25f, Vector3.one * 0.5f);
+
+        Bounds b = renderers[0].bounds;
+        for (int i = 1; i < renderers.Length; i++)
+            b.Encapsulate(renderers[i].bounds);
+        return b;
+    }
+
     /// <summary>Ставит слой Flower — Jack игнорирует его (Physics.IgnoreLayerCollision), Lily застревает и собирает.</summary>
-    private void SetFlowerLayer(GameObject flower)
+    private static void SetFlowerLayer(GameObject flower)
     {
         int layer = LayerMask.NameToLayer("Flower");
         if (layer >= 0)
             SetLayerRecursively(flower, layer);
     }
 
-    private void SetLayerRecursively(GameObject go, int layer)
+    private static void SetLayerRecursively(GameObject go, int layer)
     {
         go.layer = layer;
         foreach (Transform child in go.transform)
@@ -111,8 +206,21 @@ public class FlowerSpawner : MonoBehaviour
 
     public void ResetFlowers()
     {
-        ClearFlowers();
+        ClearFlowersImmediate();
+        nextRespawnTime = Time.time + respawnInterval;
         SpawnAll();
+    }
+
+    void ClearFlowersImmediate()
+    {
+        flowers.Clear();
+        for (int i = transform.childCount - 1; i >= 0; i--)
+            DestroyImmediate(transform.GetChild(i).gameObject);
+    }
+
+    private void ClearFlowers()
+    {
+        ClearFlowersImmediate();
     }
 
     private void SpawnAll()
@@ -146,21 +254,11 @@ public class FlowerSpawner : MonoBehaviour
                 if (!tooClose)
                 {
                     GameObject flower = Instantiate(prefab, pos, Quaternion.Euler(0f, Random.Range(0f, 360f), 0f), transform);
-                    SetFlowerLayer(flower);
+                    PrepareCollectibleFlower(flower);
                     flowers.Add(flower);
                     break;
                 }
             }
         }
-    }
-
-    private void ClearFlowers()
-    {
-        foreach (var f in flowers)
-        {
-            if (IsAlive(f))
-                Destroy(f);
-        }
-        flowers.Clear();
     }
 }

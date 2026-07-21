@@ -37,11 +37,14 @@ public sealed class GeorgeWoodDisplay : MonoBehaviour
         if (_text == null)
             return;
 
-        if (george == null || !george.gameObject.activeInHierarchy)
-            george = TrainingEnvSpace.FindPresentationGeorge();
-
-        if (george == null)
+        george = TrainingEnvSpace.FindPresentationGeorge();
+        if (george == null || !TrainingEnvSpace.ShouldShowHudForRole(EnvTrainingAgentRole.George))
+        {
+            _text.enabled = false;
             return;
+        }
+
+        _text.enabled = true;
 
         if (spriteAsset != null && _text.spriteAsset != spriteAsset)
             _text.spriteAsset = spriteAsset;

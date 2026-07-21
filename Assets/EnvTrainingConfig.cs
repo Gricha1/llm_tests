@@ -4,7 +4,8 @@ using Unity.MLAgents.Actuators;
 using UnityEngine;
 
 /// <summary>
-/// Профиль задачи на корне Env. Auto + переименование копий Env (1)…Env (11).
+/// Профиль задачи на корне Env. Auto + copyIndex 0…N.
+/// Workers 12+ = boost: задачи с самым низким success rate (цикл по 4 слотам).
 /// </summary>
 public enum EnvTrainingTask
 {
@@ -37,8 +38,8 @@ public sealed class EnvTrainingConfig : MonoBehaviour
     [SerializeField] private EnvTrainingTask task = EnvTrainingTask.Auto;
 
     [Header("Simple modes")]
-    [SerializeField] private int simpleMaxSteps = 400;
-    [SerializeField] private float simpleEpisodeTimeoutSeconds = 45f;
+    [SerializeField] private int simpleMaxSteps = 1500;
+    [SerializeField] private float simpleEpisodeTimeoutSeconds = 90f;
     [SerializeField] private bool endOnSuccess = true;
     [SerializeField] private bool freezeNeeds = true;
     [SerializeField] private float successReward = 5f;
@@ -69,6 +70,19 @@ public sealed class EnvTrainingConfig : MonoBehaviour
     public EnvTrainingTask Task => task;
     public int SimpleMaxSteps => simpleMaxSteps;
     public float SimpleEpisodeTimeoutSeconds => simpleEpisodeTimeoutSeconds;
+
+    /// <summary>Старые сцены могли сериализовать 400/45 — для wood/food/water этого мало.</summary>
+    public int ResolveSimpleMaxSteps()
+    {
+        int floor = IsJackSimpleTask() || IsLilySimpleTask() || IsGeorgeSimpleTask() ? 1500 : 0;
+        return Mathf.Max(simpleMaxSteps, floor);
+    }
+
+    public float ResolveSimpleEpisodeTimeoutSeconds()
+    {
+        float floor = IsJackSimpleTask() || IsLilySimpleTask() || IsGeorgeSimpleTask() ? 90f : 0f;
+        return Mathf.Max(simpleEpisodeTimeoutSeconds, floor);
+    }
     public int ZombieMaxSteps => zombieMaxSteps;
     public float ZombieEpisodeTimeoutSeconds => zombieEpisodeTimeoutSeconds;
     public bool ZombieEndOnKill => zombieEndOnKill;
@@ -117,9 +131,28 @@ public sealed class EnvTrainingConfig : MonoBehaviour
             case 9: return EnvTrainingTask.GeorgeFood;
             case 10: return EnvTrainingTask.GeorgeWater;
             case 11: return EnvTrainingTask.GeorgeHeat;
+            case 12:
+            case 13:
+            case 14:
+            case 15:
             default:
-                return copyIndex % 2 == 0 ? EnvTrainingTask.JackWood : EnvTrainingTask.JackFood;
+                // w12+: boost — 4 задачи с самым низким SR, слоты циклом.
+                if (copyIndex >= 12)
+                    return TrainingTaskSuccessTracker.GetBoostTaskForSlot((copyIndex - 12) % 4);
+                return EnvTrainingTask.JackWood;
         }
+    }
+
+    /// <summary>Workers 12+: закрепить задачу с низким SR на текущий эпизод.</summary>
+    public void CommitBoostTaskIfNeeded()
+    {
+        int copyIndex = _forcedCopyIndex >= 0
+            ? _forcedCopyIndex
+            : TrainingEnvSpace.GetEnvCopyIndex(transform);
+        if (copyIndex < 12)
+            return;
+
+        TrainingTaskSuccessTracker.CommitBoostSlot((copyIndex - 12) % 4);
     }
 
     public JackTrainingMode ResolveJackMode()
@@ -208,10 +241,86 @@ public sealed class EnvTrainingConfig : MonoBehaviour
 
         _lastSetupFrame = Time.frameCount;
 
+        CommitBoostTaskIfNeeded();
         var resolved = ResolveTask();
         ApplyTrainingCampfire(resolved);
         ApplyAgentVisibility(resolved);
         ApplyAgentRoles(resolved);
+        EnsureJackZombieSpawnersRunning(resolved);
+    }
+
+    /// <summary>
+    /// JackZombie: поднять спавнеры. Иначе — убить зомби и выключить спавнеры
+    /// (иначе при #env_0 / меню K зомби остаются с прошлой среды).
+    /// </summary>
+    void EnsureJackZombieSpawnersRunning(EnvTrainingTask resolved)
+    {
+        if (resolved != EnvTrainingTask.JackZombie)
+        {
+            StopJackZombieSpawnersInThisEnv();
+            return;
+        }
+
+        int immediate = Mathf.Max(1, zombieImmediateSpawnCount);
+        var spawners = GetComponentsInChildren<ZombieSpawner>(true);
+        int started = 0;
+        for (int i = 0; i < spawners.Length; i++)
+        {
+            var spawner = spawners[i];
+            if (spawner == null)
+                continue;
+            if (spawner.gameObject.name.IndexOf("Hills", System.StringComparison.OrdinalIgnoreCase) >= 0)
+                continue;
+
+            if (!spawner.gameObject.activeSelf)
+                spawner.gameObject.SetActive(true);
+
+            int spawned = spawner.StartTrainingEpisode(immediate);
+            started++;
+            if (spawned <= 0)
+            {
+                Debug.LogWarning(
+                    $"[{name}] JackZombie: {spawner.gameObject.name} не создал зомби " +
+                    $"(проверь zombiePrefab / FatZombie.prefab).",
+                    spawner);
+            }
+            else
+            {
+                Debug.Log(
+                    $"[{name}] JackZombie: {spawner.gameObject.name} → зомби +{spawned}",
+                    spawner);
+            }
+        }
+
+        if (started == 0)
+        {
+            Debug.LogError(
+                $"[{name}] JackZombie: нет ZombieSpawner / ZombieSpawner_2 в Env — зомби не появятся.");
+        }
+    }
+
+    void StopJackZombieSpawnersInThisEnv()
+    {
+        var spawners = GetComponentsInChildren<ZombieSpawner>(true);
+        for (int i = 0; i < spawners.Length; i++)
+        {
+            var spawner = spawners[i];
+            if (spawner == null)
+                continue;
+            if (spawner.gameObject.name.IndexOf("Hills", System.StringComparison.OrdinalIgnoreCase) >= 0)
+                continue;
+            spawner.ClearZombies();
+            if (spawner.gameObject.activeSelf)
+                spawner.gameObject.SetActive(false);
+        }
+    }
+
+    /// <summary>Принудительно переприменить задачу (переключение среды в Play).</summary>
+    public void ForceApplyTaskSetup()
+    {
+        _visibilityTaskApplied = (EnvTrainingTask)(-1);
+        _lastSetupFrame = -1;
+        ApplyForEpisodeBegin();
     }
 
     public void ApplyInitialSetup()
@@ -242,6 +351,7 @@ public sealed class EnvTrainingConfig : MonoBehaviour
             return;
         }
 
+        CommitBoostTaskIfNeeded();
         var resolved = ResolveTask();
         ApplyTrainingCampfire(resolved);
         ApplyAgentVisibility(resolved);

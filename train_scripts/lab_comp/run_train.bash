@@ -20,7 +20,7 @@ ARGS=()
 [ "${RESUME}" -eq 1 ] && ARGS+=(--resume)
 [ "${FORCE}" -eq 1 ] && ARGS+=(--force)
 
-echo "[run_train] BUILD=${BUILD} RUN_ID=${RUN_ID} DISPLAY=${DISPLAY} (num-envs=12 headless; stream: run_stream_onnx.bash)"
+echo "[run_train] BUILD=${BUILD} RUN_ID=${RUN_ID} DISPLAY=${DISPLAY} (num-envs=26 headless; stream: run_stream_onnx.bash)"
 exec env BUILD="${BUILD}" RUN_ID="${RUN_ID}" DISPLAY="${DISPLAY}" TRAIN_MODE=presentation \
   FOREST_TRAIN_ALL_HEADLESS=1 \
   bash train_headless_jack_lily_george.bash "${ARGS[@]}"

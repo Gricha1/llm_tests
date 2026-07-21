@@ -34,6 +34,8 @@ public class SheepSpawner : MonoBehaviour
 
     private Vector3 ToWorld(Vector3 localPos)
     {
+        if (_envRoot == null)
+            _envRoot = TrainingEnvSpace.FindRoot(transform);
         return _envRoot != null ? _envRoot.TransformPoint(localPos) : localPos;
     }
 
@@ -159,7 +161,17 @@ public class SheepSpawner : MonoBehaviour
                 Destroy(sheep);
         }
         sheeps.Clear();
+
+        // После Instantiate(Env) остаются «сироты»-дети не в списке — иначе зона забита, новых овец нет.
+        for (int i = transform.childCount - 1; i >= 0; i--)
+        {
+            var child = transform.GetChild(i).gameObject;
+            if (!IsUnityNull(child))
+                Destroy(child);
+        }
     }
+
+    static bool IsUnityNull(GameObject go) => go == null;
 
     /// <summary>Спавн count овец вокруг worldPos (Twitch). Не удаляет существующих.</summary>
     public int SpawnSheepNear(Vector3 worldPos, int count, float radius = 7f)

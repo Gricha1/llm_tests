@@ -129,11 +129,12 @@ public class LilySatietyDisplay : MonoBehaviour
         if (_text == null)
             return;
 
-        if (lily == null || !lily.isActiveAndEnabled)
-            lily = TrainingEnvSpace.FindPresentationLily();
-
-        if (lily == null)
+        lily = TrainingEnvSpace.FindPresentationLily();
+        if (lily == null || !TrainingEnvSpace.ShouldShowHudForRole(EnvTrainingAgentRole.Lily))
+        {
+            _text.enabled = false;
             return;
+        }
 
         if (spriteAsset != null && _text.spriteAsset != spriteAsset)
             _text.spriteAsset = spriteAsset;
@@ -148,5 +149,7 @@ public class LilySatietyDisplay : MonoBehaviour
         {
             _text.text = $"<sprite=0> {lily.Satiety}";
         }
+
+        _text.enabled = true;
     }
 }

@@ -13,21 +13,22 @@ public class LoveDisplay : MonoBehaviour
     {
         text = GetComponent<TMP_Text>();
         if (text != null)
-        {
             text.richText = true;
-        }
     }
 
-    void Update()
+    void LateUpdate()
     {
-        if (lily == null || text == null) return;
+        if (text == null)
+            return;
 
-        if (!show)
+        lily = TrainingEnvSpace.FindPresentationLily();
+        if (lily == null || !TrainingEnvSpace.ShouldShowHudForRole(EnvTrainingAgentRole.Lily) || !show)
         {
-            if (text.enabled) text.enabled = false;
+            text.enabled = false;
             return;
         }
-        if (!text.enabled) text.enabled = true;
+
+        text.enabled = true;
 
         if (spriteAsset != null && text.spriteAsset != spriteAsset)
             text.spriteAsset = spriteAsset;

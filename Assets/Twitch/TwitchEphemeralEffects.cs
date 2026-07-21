@@ -17,14 +17,21 @@ public static class TwitchEphemeralEffects
 
     const int MaxTotalClones = 1;
 
+    /// <summary>Во время SpawnJackClones не даём OnEpisodeBegin оригинала чистить клонов/мир.</summary>
+    public static bool IsSpawningJackClone { get; private set; }
+
     static readonly List<GameObject> Clones = new List<GameObject>();
     static readonly Dictionary<int, ScaleState> ScaleByJackId = new Dictionary<int, ScaleState>();
 
     public static bool IsTwitchClone(Component c) =>
-        c != null && c.GetComponent<TwitchJackCloneMarker>() != null;
+        c != null && (c.GetComponent<TwitchJackCloneMarker>() != null
+            || (c.gameObject != null && c.gameObject.name.StartsWith("Jack_TwitchClone", System.StringComparison.Ordinal)));
 
     public static void OnPresentationJackEpisodeBegin(AgentGoToHouseDiscrete jack)
     {
+        if (IsSpawningJackClone)
+            return;
+
         ClearClones();
         if (jack != null)
         {
@@ -72,68 +79,80 @@ public static class TwitchEphemeralEffects
 
         var sourceBehavior = source.GetComponent<BehaviorParameters>();
         int spawned = 0;
-
-        for (int i = 0; i < count; i++)
+        IsSpawningJackClone = true;
+        try
         {
-            float angle = (Clones.Count + i) * 72f * Mathf.Deg2Rad;
-            var offset = new Vector3(Mathf.Cos(angle) * 1.8f, 0f, Mathf.Sin(angle) * 1.8f);
-            Vector3 spawnPos = source.transform.position + offset;
-            Quaternion spawnRot = source.transform.rotation;
-
-            var cloneGo = Object.Instantiate(
-                source.gameObject,
-                spawnPos,
-                spawnRot,
-                source.transform.parent);
-            cloneGo.SetActive(false);
-            cloneGo.name = $"Jack_TwitchClone_{Clones.Count + 1}";
-
-            if (cloneGo.GetComponent<TwitchJackCloneMarker>() == null)
-                cloneGo.AddComponent<TwitchJackCloneMarker>();
-
-            var cloneBehavior = cloneGo.GetComponent<BehaviorParameters>();
-            var sourceDecision = source.GetComponent<Unity.MLAgents.DecisionRequester>();
-            bool policyFromTrainer = Academy.IsInitialized && Academy.Instance.IsCommunicatorOn;
-            if (sourceBehavior != null && cloneBehavior != null)
+            for (int i = 0; i < count; i++)
             {
-                cloneBehavior.BehaviorName = sourceBehavior.BehaviorName;
-                cloneBehavior.Model = sourceBehavior.Model;
-                cloneBehavior.TeamId = sourceBehavior.TeamId;
-                cloneBehavior.DeterministicInference = false;
-                if (policyFromTrainer)
-                    cloneBehavior.BehaviorType = BehaviorType.Default;
-                else if (sourceBehavior.Model != null)
-                    cloneBehavior.BehaviorType = BehaviorType.InferenceOnly;
-                else
-                    cloneBehavior.BehaviorType = BehaviorType.Default;
-            }
+                float angle = (Clones.Count + i) * 72f * Mathf.Deg2Rad;
+                var offset = new Vector3(Mathf.Cos(angle) * 1.8f, 0f, Mathf.Sin(angle) * 1.8f);
+                Vector3 spawnPos = source.transform.position + offset;
+                Quaternion spawnRot = source.transform.rotation;
 
-            var cloneAgent = cloneGo.GetComponent<Agent>();
-            var cloneJack = cloneGo.GetComponent<AgentGoToHouseDiscrete>();
-            if (cloneAgent != null)
-            {
-                cloneAgent.enabled = true;
-            }
-            if (cloneJack != null)
-            {
-                cloneJack.enabled = true;
-                cloneJack.BootstrapTwitchCloneFrom(source, spawnPos, spawnRot);
-            }
+                // Нельзя SetActive(false) на живом Jack: Agent.OnDisable → Done → при
+                // включениях OnEpisodeBegin сбрасывает мир. Instantiate под неактивный
+                // holder: Awake есть, OnEnable/LazyInitialize — нет.
+                var holder = new GameObject("__TwitchCloneSpawnHolder");
+                holder.SetActive(false);
 
-            cloneGo.SetActive(true);
+                var cloneGo = Object.Instantiate(source.gameObject, holder.transform);
+                cloneGo.SetActive(false);
+                cloneGo.name = $"Jack_TwitchClone_{Clones.Count + 1}";
 
-            if (cloneAgent != null)
-                cloneAgent.LazyInitialize();
+                if (cloneGo.GetComponent<TwitchJackCloneMarker>() == null)
+                    cloneGo.AddComponent<TwitchJackCloneMarker>();
 
-            var cloneDecision = cloneGo.GetComponent<Unity.MLAgents.DecisionRequester>();
-            if (cloneDecision != null)
-            {
-                cloneDecision.enabled = true;
-                if (sourceDecision != null && sourceDecision.DecisionPeriod > 0)
-                    cloneDecision.DecisionPeriod = sourceDecision.DecisionPeriod + (i + 1);
+                cloneGo.transform.SetParent(source.transform.parent, false);
+                cloneGo.transform.SetPositionAndRotation(spawnPos, spawnRot);
+                Object.Destroy(holder);
+
+                var cloneBehavior = cloneGo.GetComponent<BehaviorParameters>();
+                var sourceDecision = source.GetComponent<Unity.MLAgents.DecisionRequester>();
+                bool policyFromTrainer = Academy.IsInitialized && Academy.Instance.IsCommunicatorOn;
+                if (sourceBehavior != null && cloneBehavior != null)
+                {
+                    cloneBehavior.BehaviorName = sourceBehavior.BehaviorName;
+                    cloneBehavior.Model = sourceBehavior.Model;
+                    cloneBehavior.TeamId = sourceBehavior.TeamId;
+                    cloneBehavior.DeterministicInference = false;
+                    if (policyFromTrainer)
+                        cloneBehavior.BehaviorType = BehaviorType.Default;
+                    else if (sourceBehavior.Model != null)
+                        cloneBehavior.BehaviorType = BehaviorType.InferenceOnly;
+                    else
+                        cloneBehavior.BehaviorType = BehaviorType.Default;
+                }
+
+                var cloneAgent = cloneGo.GetComponent<Agent>();
+                var cloneJack = cloneGo.GetComponent<AgentGoToHouseDiscrete>();
+                if (cloneAgent != null)
+                    cloneAgent.enabled = true;
+                if (cloneJack != null)
+                {
+                    cloneJack.enabled = true;
+                    cloneJack.BootstrapTwitchCloneFrom(source, spawnPos, spawnRot);
+                }
+
+                cloneGo.SetActive(true);
+
+                if (cloneAgent != null)
+                    cloneAgent.LazyInitialize();
+
+                var cloneDecision = cloneGo.GetComponent<Unity.MLAgents.DecisionRequester>();
+                if (cloneDecision != null)
+                {
+                    cloneDecision.enabled = true;
+                    if (sourceDecision != null && sourceDecision.DecisionPeriod > 0)
+                        cloneDecision.DecisionPeriod = sourceDecision.DecisionPeriod + (i + 1);
+                }
+
+                Clones.Add(cloneGo);
+                spawned++;
             }
-            Clones.Add(cloneGo);
-            spawned++;
+        }
+        finally
+        {
+            IsSpawningJackClone = false;
         }
 
         return spawned;

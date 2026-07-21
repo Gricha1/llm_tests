@@ -91,8 +91,17 @@ public sealed class JackSurvivalTaskHud : MonoBehaviour
 
         EnsureUi();
 
-        if (_jack == null)
+        if (_jack == null || !_jack.isActiveAndEnabled)
             _jack = TrainingEnvSpace.FindPresentationJack();
+
+        if (_canvas != null)
+        {
+            bool showTaskHud = _jack != null
+                && TrainingEnvSpace.IsPresentationStreamEnv(TrainingEnvSpace.ActiveViewEnvRoot);
+            _canvas.enabled = GlobalEnabled && showHud && showTaskHud;
+            if (!showTaskHud)
+                return;
+        }
 
         if (_jack == null || _greenFillRt == null || _label == null)
             return;

@@ -35,6 +35,36 @@ public sealed class WaterGoalPath : MonoBehaviour
         Initialize();
     }
 
+    void OnEnable()
+    {
+        // UnmuteEnvPresentation снова включает Renderer — прячем GoalWater после фокуса Env.
+        if (_initialized)
+            HideAllGoalVisuals();
+    }
+
+    public static void HideGoalsInEnv(Transform envRoot)
+    {
+        if (envRoot == null)
+            return;
+
+        var path = envRoot.GetComponent<WaterGoalPath>();
+        if (path == null)
+            path = envRoot.GetComponentInChildren<WaterGoalPath>(true);
+        path?.Initialize();
+        path?.HideAllGoalVisuals();
+
+        // На случай если компонент ещё не создан — прячем по имени.
+        var all = envRoot.GetComponentsInChildren<Transform>(true);
+        for (int i = 0; i < all.Length; i++)
+        {
+            var t = all[i];
+            if (t == null)
+                continue;
+            if (t.name.StartsWith("GoalWater", StringComparison.Ordinal))
+                HideGoalVisuals(t);
+        }
+    }
+
     public static WaterGoalPath Get(Transform agent)
     {
         var root = TrainingEnvSpace.FindRoot(agent);
@@ -157,6 +187,15 @@ public sealed class WaterGoalPath : MonoBehaviour
             HideGoalVisuals(_goals[i]);
             _goalColliders[i] = _goals[i].GetComponentInChildren<Collider>(true);
             _goalBounds[i] = BuildGoalBounds(_goals[i]);
+        }
+    }
+
+    void HideAllGoalVisuals()
+    {
+        for (int i = 0; i < _goals.Length; i++)
+        {
+            if (_goals[i] != null)
+                HideGoalVisuals(_goals[i]);
         }
     }
 

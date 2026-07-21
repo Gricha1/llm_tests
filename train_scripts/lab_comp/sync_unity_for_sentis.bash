@@ -6,22 +6,15 @@ set -o pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/../.." && pwd)"
 cd "${ROOT}"
 
-KEY="${SSH_KEY:-${HOME}/.ssh/lab_comp_key}"
-REMOTE="${REMOTE:-reedgern@192.168.194.7}"
-REMOTE_DIR="${REMOTE_DIR:-~/lab_work_space/forest_survival}"
+# shellcheck source=rsync_ssh.bash
+source "${ROOT}/train_scripts/lab_comp/rsync_ssh.bash"
+lab_comp_init_ssh
 
-mkdir -p "${HOME}/.ssh"
-if [ ! -f "${KEY}" ]; then
-  cp /mnt/c/Users/User/.ssh/id_ed25519 "${KEY}" 2>/dev/null || true
-  chmod 600 "${KEY}" 2>/dev/null || true
-fi
+echo "[sync_unity] Assets + ProjectSettings + Packages -> ${LAB_COMP_RSYNC_REMOTE}:${REMOTE_DIR}"
+lab_comp_ssh_mkdir "${REMOTE_DIR}"
 
-RSYNC_SSH="ssh -i ${KEY} -o StrictHostKeyChecking=no"
-
-echo "[sync_unity] Assets + ProjectSettings + Packages -> ${REMOTE}:${REMOTE_DIR}"
-ssh -i "${KEY}" -o StrictHostKeyChecking=no "${REMOTE}" "mkdir -p ${REMOTE_DIR}"
-
-rsync -avz --progress -e "${RSYNC_SSH}" \
+echo "[sync_unity] 1/3 Assets..."
+rsync -avz --progress --info=name2,progress2 -e "${LAB_COMP_RSYNC_SSH}" \
   --exclude 'Library/' \
   --exclude 'Temp/' \
   --exclude 'Logs/' \
@@ -31,16 +24,18 @@ rsync -avz --progress -e "${RSYNC_SSH}" \
   --exclude 'results/' \
   --exclude 'stream_weights/' \
   --exclude '.git/' \
-  Assets/ "${REMOTE}:${REMOTE_DIR}/Assets/"
+  Assets/ "${LAB_COMP_RSYNC_REMOTE}:${REMOTE_DIR}/Assets/"
 
-rsync -avz --progress -e "${RSYNC_SSH}" \
-  ProjectSettings/ "${REMOTE}:${REMOTE_DIR}/ProjectSettings/"
+echo "[sync_unity] 2/3 ProjectSettings..."
+rsync -avz --progress --info=name2,progress2 -e "${LAB_COMP_RSYNC_SSH}" \
+  ProjectSettings/ "${LAB_COMP_RSYNC_REMOTE}:${REMOTE_DIR}/ProjectSettings/"
 
-rsync -avz --progress -e "${RSYNC_SSH}" \
-  Packages/ "${REMOTE}:${REMOTE_DIR}/Packages/"
+echo "[sync_unity] 3/3 Packages..."
+rsync -avz --progress --info=name2,progress2 -e "${LAB_COMP_RSYNC_SSH}" \
+  Packages/ "${LAB_COMP_RSYNC_REMOTE}:${REMOTE_DIR}/Packages/"
 
 echo "[sync_unity] detect Unity Editor on server..."
-ssh -i "${KEY}" -o StrictHostKeyChecking=no "${REMOTE}" \
+"${LAB_COMP_SSH_CMD[@]}" "${LAB_COMP_RSYNC_REMOTE}" \
   "cd ${REMOTE_DIR} && bash train_scripts/lab_comp/detect_unity_editor.bash"
 
 echo "[sync_unity] done"

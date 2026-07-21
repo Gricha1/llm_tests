@@ -42,12 +42,14 @@ rename_pid() {
 
   port="$(read_mlagents_port "${pid}")" || return 0
   worker=$((port - BASE_PORT))
-  if [ "${worker}" -lt 0 ] || [ "${worker}" -gt 11 ]; then
+  if [ "${worker}" -lt 0 ] || [ "${worker}" -gt 63 ]; then
     return 0
   fi
 
   if [ "${worker}" -eq 0 ]; then
     title="forest_survival w${worker} PRESENTATION"
+  elif [ "${worker}" -ge 12 ]; then
+    title="forest_survival w${worker} boost"
   else
     title="forest_survival w${worker} train"
   fi

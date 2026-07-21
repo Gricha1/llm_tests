@@ -6,7 +6,7 @@ using UnityEngine.InputSystem;
 /// <summary>
 /// Горячие клавиши для Play-теста presentation-сцены и Twitch-команд.
 /// Цифры 1–0 — те же команды, что в чате (#add_tree, #zombie, #reset…).
-/// P — показать/скрыть рендер параллельных Env. Z — быстро #zombie=1. V — следующий этап выживания. B — день/ночь.
+/// P — показать/скрыть рендер параллельных Env. K — меню переключения сред. Z — быстро #zombie=1. V — следующий этап выживания. B — день/ночь.
 /// </summary>
 public sealed class PresentationDebugInput : MonoBehaviour
 {
@@ -34,7 +34,8 @@ public sealed class PresentationDebugInput : MonoBehaviour
         if (WasKeyPressed(KeyCode.Alpha5) || WasKeyPressed(KeyCode.Keypad5))
             TwitchChatGameBridge.SimulateCommand("zombie", 2);
         if (WasKeyPressed(KeyCode.Alpha6) || WasKeyPressed(KeyCode.Keypad6))
-            TwitchChatGameBridge.SimulateCommand("clone_jack", 0);
+            TwitchChatGameBridge.SimulateCommand("add_fire", 0);
+        // clone_jack временно отключён (ломал зомби/эпизод)
         if (WasKeyPressed(KeyCode.Alpha7) || WasKeyPressed(KeyCode.Keypad7))
             TwitchChatGameBridge.SimulateCommand("size", 2);
         if (WasKeyPressed(KeyCode.Alpha8) || WasKeyPressed(KeyCode.Keypad8))

@@ -52,6 +52,13 @@ public class ZombieChase : MonoBehaviour
     private float _walkAnimIntent;
     private int _pathIndex;
     private float _pathWaitLeft;
+    private bool _lockWorldY;
+    private float _lockedWorldY;
+    private bool _lockEnvLocalY;
+    private Transform _lockEnvRoot;
+    private float _lockedEnvLocalY;
+    private bool _lockParentLocalY;
+    private float _lockedParentLocalY;
 
     [Header("Stun / Freeze")]
     [Tooltip("Время, до которого зомби не может двигаться (устанавливается через Stun).")]
@@ -119,9 +126,11 @@ public class ZombieChase : MonoBehaviour
         if (candidate == null || !candidate.gameObject.activeInHierarchy)
             return;
 
+        // Только XZ — иначе при «парящем» Y дистанция ломается и зомби не идёт.
         Vector3 p = candidate.position;
-        p.y = 0f;
-        float d = Vector3.Distance(fromPos, p);
+        float dx = p.x - fromPos.x;
+        float dz = p.z - fromPos.z;
+        float d = Mathf.Sqrt(dx * dx + dz * dz);
         if (d < bestDist)
         {
             bestDist = d;
@@ -133,6 +142,128 @@ public class ZombieChase : MonoBehaviour
     {
         followPath = false;
         stayInPlace = false;
+        // Не лочить текущий transform.y — шаблон/клон часто уже на 0 от CC.
+    }
+
+    /// <summary>CityScene: не давать гравитации CC утянуть Y к ~0 (меш тогда «под землёй»).</summary>
+    public void LockWorldY(float worldY)
+    {
+        _lockEnvLocalY = false;
+        _lockEnvRoot = null;
+        _lockParentLocalY = false;
+        _lockWorldY = true;
+        _lockedWorldY = worldY;
+        ApplyLockedWorldY();
+    }
+
+    /// <summary>
+    /// Лес / Env (N): держать локальную высоту земли Env.
+    /// Абсолютный world Y ломается, когда Env двигают (−400 → presentation).
+    /// </summary>
+    public void LockEnvLocalY(Transform envRoot, float localY)
+    {
+        if (envRoot == null)
+        {
+            LockWorldY(transform.position.y);
+            return;
+        }
+
+        _lockWorldY = false;
+        _lockParentLocalY = false;
+        _lockEnvLocalY = true;
+        _lockEnvRoot = envRoot;
+        _lockedEnvLocalY = localY;
+        ApplyLockedEnvLocalY();
+    }
+
+    /// <summary>Лес: ребёнок спавнера — всегда local Y=0 (высота = спавнер = Джек).</summary>
+    public void LockParentLocalY(float localY = 0f)
+    {
+        _lockWorldY = false;
+        _lockEnvLocalY = false;
+        _lockEnvRoot = null;
+        _lockParentLocalY = true;
+        _lockedParentLocalY = localY;
+        ApplyLockedParentLocalY();
+    }
+
+    void ApplyLockedWorldY()
+    {
+        if (!_lockWorldY)
+            return;
+
+        if (controller == null)
+            controller = GetComponent<CharacterController>();
+
+        Vector3 p = transform.position;
+        if (Mathf.Abs(p.y - _lockedWorldY) < 0.0001f)
+            return;
+
+        var cc = controller != null ? controller : GetComponentInChildren<CharacterController>();
+        bool ccOn = cc != null && cc.enabled;
+        if (cc != null)
+            cc.enabled = false;
+
+        p.y = _lockedWorldY;
+        transform.position = p;
+
+        if (cc != null)
+            cc.enabled = ccOn;
+    }
+
+    void ApplyLockedEnvLocalY()
+    {
+        if (!_lockEnvLocalY || _lockEnvRoot == null)
+            return;
+
+        if (controller == null)
+            controller = GetComponent<CharacterController>();
+
+        Vector3 local = _lockEnvRoot.InverseTransformPoint(transform.position);
+        if (Mathf.Abs(local.y - _lockedEnvLocalY) < 0.0001f)
+            return;
+
+        var cc = controller != null ? controller : GetComponentInChildren<CharacterController>();
+        bool ccOn = cc != null && cc.enabled;
+        if (cc != null)
+            cc.enabled = false;
+
+        local.y = _lockedEnvLocalY;
+        transform.position = _lockEnvRoot.TransformPoint(local);
+
+        if (cc != null)
+            cc.enabled = ccOn;
+    }
+
+    void ApplyLockedParentLocalY()
+    {
+        if (!_lockParentLocalY || transform.parent == null)
+            return;
+
+        Vector3 lp = transform.localPosition;
+        if (Mathf.Abs(lp.y - _lockedParentLocalY) < 0.0001f)
+            return;
+
+        var cc = controller != null ? controller : GetComponentInChildren<CharacterController>();
+        bool ccOn = cc != null && cc.enabled;
+        if (cc != null)
+            cc.enabled = false;
+
+        lp.y = _lockedParentLocalY;
+        transform.localPosition = lp;
+
+        if (cc != null)
+            cc.enabled = ccOn;
+    }
+
+    void ApplyHeightLock()
+    {
+        if (_lockParentLocalY)
+            ApplyLockedParentLocalY();
+        else if (_lockEnvLocalY)
+            ApplyLockedEnvLocalY();
+        else if (_lockWorldY)
+            ApplyLockedWorldY();
     }
 
     public void SetMoveSpeedMultiplier(float multiplier)
@@ -205,20 +336,33 @@ public class ZombieChase : MonoBehaviour
         controller = GetComponent<CharacterController>();
         rb = GetComponent<Rigidbody>();
         animator = GetComponent<Animator>() ?? GetComponentInChildren<Animator>();
+        if (animator != null)
+            animator.applyRootMotion = false;
         useRigidbody = (controller == null && rb != null);
         _speedParamResolved = false;
         ResolveWalkSpeedParam();
 
-        var envRoot = TrainingEnvSpace.FindRoot(transform);
-        if (envRoot != null)
-        {
-            if (jackTarget == null || !TrainingEnvSpace.IsDescendantOf(jackTarget, envRoot))
-                ResolveTargetsFromEnv();
-        }
-        else if (jackTarget == null)
-        {
+        // Не трогаем jackTarget, если уже назначен в инспекторе (CityScene: Jack часто вне Env).
+        if (jackTarget == null)
             ResolveTargetsFromEnv();
+        if (jackTarget == null)
+        {
+            var presentationJack = TrainingEnvSpace.FindPresentationJack();
+            if (presentationJack != null)
+                jackTarget = presentationJack.transform;
         }
+
+        // Вне Env (CityScene) — держим текущую высоту, иначе CC провалит Y≈0.
+        // Если спавнер уже вызвал Lock* — не перезаписывать.
+        if (!_lockWorldY && !_lockEnvLocalY && !_lockParentLocalY
+            && TrainingEnvSpace.FindRoot(transform) == null)
+            LockWorldY(transform.position.y);
+    }
+
+    private void LateUpdate()
+    {
+        ApplyWalkAnimatorSpeed();
+        ApplyHeightLock();
     }
 
     private void Update()
@@ -239,13 +383,23 @@ public class ZombieChase : MonoBehaviour
         {
             if (useRigidbody) return; // Rigidbody двигаем в FixedUpdate
             PathStepCharacterController();
+            ApplyHeightLock();
             return;
         }
 
         Transform target = GetClosestTarget();
         if (target == null)
         {
+            // Цель могла появиться позже спавна (Jack ещё не active) — перепривязать.
+            if (jackTarget == null)
+                ResolveTargetsFromEnv();
+            target = GetClosestTarget();
+        }
+
+        if (target == null)
+        {
             _walkAnimIntent = 0f;
+            ApplyHeightLock();
             return;
         }
 
@@ -257,6 +411,7 @@ public class ZombieChase : MonoBehaviour
         if (delta.sqrMagnitude < 0.001f)
         {
             _walkAnimIntent = 0f;
+            ApplyHeightLock();
             return;
         }
 
@@ -274,19 +429,40 @@ public class ZombieChase : MonoBehaviour
         if (dist <= stopAt)
         {
             _walkAnimIntent = 0f;
+            ApplyHeightLock();
             return;
         }
 
         _walkAnimIntent = 1f;
 
-        if (controller != null)
+        bool ccUsable = controller != null && controller.enabled;
+        if (ccUsable)
         {
-            if (controller.isGrounded && verticalVelocity < 0f)
-                verticalVelocity = -2f;
+            if (_lockWorldY || _lockEnvLocalY || _lockParentLocalY)
+            {
+                // Только горизонталь — без гравитации, иначе Y уезжает.
+                controller.Move(dir * (moveSpeed * Time.deltaTime));
+                ApplyHeightLock();
+            }
             else
-                verticalVelocity += gravity * Time.deltaTime;
-            Vector3 move = dir * moveSpeed + Vector3.up * verticalVelocity;
-            controller.Move(move * Time.deltaTime);
+            {
+                if (controller.isGrounded && verticalVelocity < 0f)
+                    verticalVelocity = -2f;
+                else
+                    verticalVelocity += gravity * Time.deltaTime;
+                Vector3 move = dir * moveSpeed + Vector3.up * verticalVelocity;
+                controller.Move(move * Time.deltaTime);
+            }
+        }
+        else if (useRigidbody)
+        {
+            // FixedUpdate
+        }
+        else
+        {
+            Vector3 next = transform.position + dir * (moveSpeed * Time.deltaTime);
+            transform.position = next;
+            ApplyHeightLock();
         }
     }
 
@@ -333,11 +509,6 @@ public class ZombieChase : MonoBehaviour
         vel.y = rb.linearVelocity.y + gravity * Time.fixedDeltaTime;
         if (vel.y < -20f) vel.y = -20f;
         rb.linearVelocity = vel;
-    }
-
-    private void LateUpdate()
-    {
-        ApplyWalkAnimatorSpeed();
     }
 
     private bool TryGetCurrentPathPoint(out Transform point)
@@ -502,7 +673,6 @@ public class ZombieChase : MonoBehaviour
     private Transform GetClosestTarget()
     {
         Vector3 pos = transform.position;
-        pos.y = 0f;
 
         Transform best = null;
         float bestDist = float.MaxValue;

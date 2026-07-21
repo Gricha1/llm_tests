@@ -292,6 +292,7 @@ public sealed class TwitchChatReader : MonoBehaviour
     void TryParseCommandsInMessage(string username, string displayName, string message)
     {
         TryParseShowMetrics(username, displayName, message);
+        TryParseAddFire(username, displayName, message);
 
         int searchFrom = 0;
         while (searchFrom < message.Length)
@@ -309,6 +310,30 @@ public sealed class TwitchChatReader : MonoBehaviour
             DispatchCommand(cmd);
             searchFrom = tokenEnd;
         }
+    }
+
+    static void TryParseAddFire(string username, string displayName, string message)
+    {
+        int idx = message.IndexOf("#add", System.StringComparison.OrdinalIgnoreCase);
+        if (idx < 0)
+            return;
+
+        int pos = idx + 4;
+        while (pos < message.Length && char.IsWhiteSpace(message[pos]))
+            pos++;
+
+        if (pos + 4 > message.Length)
+            return;
+
+        if (!message.Substring(pos, 4).Equals("fire", System.StringComparison.OrdinalIgnoreCase))
+            return;
+
+        if (pos + 4 < message.Length && !char.IsWhiteSpace(message[pos + 4]))
+            return;
+
+        var cmd = new TwitchChatCommand(username, displayName, "#add fire", "add_fire", 0);
+        if (_instance != null)
+            _instance.DispatchCommand(cmd);
     }
 
     static void TryParseShowMetrics(string username, string displayName, string message)
@@ -394,6 +419,9 @@ public sealed class TwitchChatReader : MonoBehaviour
 
     static bool IsCommandWithDefaultValue(string name)
     {
+        if (!string.IsNullOrEmpty(name) && name.StartsWith("env_", System.StringComparison.Ordinal))
+            return true;
+
         switch (name)
         {
             case "add_tree":
@@ -405,6 +433,9 @@ public sealed class TwitchChatReader : MonoBehaviour
             case "size":
             case "speed_up":
             case "reset":
+            case "menu":
+            case "add_fire":
+            case "show_metrics":
                 return true;
             default:
                 return false;

@@ -2,9 +2,12 @@ using System.Collections;
 using System.IO;
 using UnityEngine;
 using UnityEngine.Networking;
+using UnityEngine.SceneManagement;
 
 /// <summary>
-/// Фоновая музыка при Play: loop, DontDestroyOnLoad. Этап 1 — CelticElf, 2 — ZombieCity, 3 — Koshmar.
+/// Фоновая музыка при Play: loop, DontDestroyOnLoad.
+/// Forest: этап 1 — CelticElf, 2 — ZombieCity, 3 — Koshmar.
+/// CityScene: сразу ZombieCitySong.
 /// </summary>
 public sealed class BackgroundMusic : MonoBehaviour
 {
@@ -31,6 +34,14 @@ public sealed class BackgroundMusic : MonoBehaviour
     AudioSource _source;
     int _currentPhase = 1;
     Coroutine _switchRoutine;
+    bool _citySceneMode;
+
+    static bool IsCitySceneActive()
+    {
+        string name = SceneManager.GetActiveScene().name;
+        return name != null
+            && name.IndexOf("City", System.StringComparison.OrdinalIgnoreCase) >= 0;
+    }
 
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
     static void Bootstrap()
@@ -55,6 +66,7 @@ public sealed class BackgroundMusic : MonoBehaviour
 
         _instance = this;
         DontDestroyOnLoad(gameObject);
+        _citySceneMode = IsCitySceneActive();
 
         _source = gameObject.AddComponent<AudioSource>();
         _source.loop = true;
@@ -64,7 +76,10 @@ public sealed class BackgroundMusic : MonoBehaviour
         _source.priority = 0;
 
         EnsureAudioListener();
-        _switchRoutine = StartCoroutine(SwitchPhaseRoutine(1));
+        // CityScene — сразу городской трек (фаза 2), иначе лесная CelticElf.
+        int startPhase = _citySceneMode ? 2 : 1;
+        _currentPhase = startPhase;
+        _switchRoutine = StartCoroutine(SwitchPhaseRoutine(startPhase));
     }
 
     static void EnsureAudioListener()
@@ -84,6 +99,10 @@ public sealed class BackgroundMusic : MonoBehaviour
 
     public static void SetSurvivalPhase(int phase)
     {
+        // В CityScene не переключаем на лесные треки выживания.
+        if (_instance != null && _instance._citySceneMode)
+            return;
+
         phase = Mathf.Clamp(phase, 1, PhaseResourcePaths.Length);
         if (_instance == null)
             return;
@@ -153,7 +172,10 @@ public sealed class BackgroundMusic : MonoBehaviour
 
     static float GetStartTimeForPhase(int phase, AudioClip clip)
     {
+        // В CityScene играем трек с начала; в лесу фаза 2 — со смещением 30с.
         if (phase != 2 || clip == null)
+            return 0f;
+        if (_instance != null && _instance._citySceneMode)
             return 0f;
 
         return Mathf.Clamp(Phase2StartSeconds, 0f, Mathf.Max(0f, clip.length - 0.05f));

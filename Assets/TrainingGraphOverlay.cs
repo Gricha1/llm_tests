@@ -432,6 +432,13 @@ public sealed class TrainingGraphOverlay : MonoBehaviour
         return new List<float>(_instance._jackRewards);
     }
 
+    public static IReadOnlyList<float> GetJackRewardSeriesReadonly()
+    {
+        if (_instance == null)
+            return System.Array.Empty<float>();
+        return _instance._jackRewards;
+    }
+
     public static float GetPresentationJackCumulativeReward()
     {
         var jack = TrainingEnvSpace.FindPresentationJack();

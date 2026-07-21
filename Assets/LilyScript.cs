@@ -24,8 +24,8 @@ public class LilyScript : Agent, IHasHp
     bool IsLilySimpleTraining =>
         _trainingConfig != null && _trainingConfig.IsLilySimpleTask();
 
-    [Header("Option Sampling (Flowers/Kiss)")]
-    [Tooltip("Если true, опция (цветы/поцелуй) выбирается по utility+softmax sampling каждые 20 шагов.")]
+    [Header("Option Sampling")]
+    [Tooltip("Если true, опция выбирается по utility+softmax каждые 20 шагов. На presentation всегда включено.")]
     [SerializeField] private bool useUtilitySoftmaxSampling = false;
     [Tooltip("Температура softmax (0.2 = почти жёстко, 0.7 = заметно случайно).")]
     [SerializeField] [Range(0.05f, 2.0f)] private float tau = 0.2f;
@@ -65,6 +65,8 @@ public class LilyScript : Agent, IHasHp
     [Header("Heat / House (опция «тепло»)")]
     [SerializeField] private Transform houseTarget;
     [SerializeField] private float houseRadius = 1.2f;
+    [Tooltip("Радиус подогрева у костра (больше houseRadius).")]
+    [SerializeField] private float campfireWarmthRadius = 3f;
     [SerializeField] private float moveTowardsHouseWhenColdRewardScale = 1f;
     [SerializeField] private float warmthRewardAtCampfire = 5f;
     [SerializeField] private float warmthGainInterval = 0.5f;
@@ -108,6 +110,7 @@ public class LilyScript : Agent, IHasHp
     [Header("Starving (satiety = 0)")]
     [SerializeField] private float hungerDamageInterval = 0.25f;
     [SerializeField] private int hungerDamageAmount = 1;
+    [SerializeField] private float hungerPenaltyPerTick = -0.5f;
     private float _hungerTimer;
 
     [Header("Heat")]
@@ -121,6 +124,7 @@ public class LilyScript : Agent, IHasHp
     [Header("Freezing (heat = 0)")]
     [SerializeField] private float freezeDamageInterval = 0.25f;
     [SerializeField] private int freezeDamageAmount = 1;
+    [SerializeField] private float freezePenaltyPerTick = -0.5f;
     private float _freezeTimer;
 
     [Header("Dehydrated (water = 0)")]
@@ -133,6 +137,8 @@ public class LilyScript : Agent, IHasHp
     [SerializeField] private string doActionAnimTrigger = "Do";
     [Tooltip("Пауза между срабатываниями DO (сбор цветка или поцелуй).")]
     [SerializeField] private float collectActionCooldownSeconds = 0.45f;
+    [Tooltip("Штраф за DO не рядом с целью (цветок/овца/вода/зомби/человек).")]
+    [SerializeField] private float emptyDoActionPenalty = -5f;
     [Tooltip("Сглаживание параметра Speed в Animator (0 = без сглаживания).")]
     [SerializeField] private float walkAnimSpeedDamp = 0f;
     private int _lastCollectAction;
@@ -219,6 +225,10 @@ public class LilyScript : Agent, IHasHp
     private float prevHouseDist = -1f;
     private Vector3 prevPosition;
     private int stepCount;
+    private float _episodeStartTime;
+    private int _episodeSheepEaten;
+    private int _lastHungerRewardStep = -1;
+    private int _lastFreezeRewardStep = -1;
     private float flowerDecayTimer;
     private float loveDecayTimer;
     private int _pathIndex;
@@ -287,11 +297,16 @@ public class LilyScript : Agent, IHasHp
         UpdateOptionIconVisual();
         AgentFootsteps.EnsureOn(gameObject);
         ResolveSheepSpawner();
+        ResolveFlowerSpawner();
         ResolveHouseTarget();
 
         // Как у Jack: не снимаем HP с агента за его же DO (старые значения в сцене).
         damageOnDoIfZombieNearby = false;
         zombieDamageOnDo = 0;
+        emptyDoActionPenalty = -5f;
+        collectDistance = Mathf.Clamp(collectDistance, 0.5f, 2.5f);
+        freezePenaltyPerTick = -0.5f;
+        hungerPenaltyPerTick = -0.5f;
 
         if (zombieLayer.value == 0)
         {
@@ -302,7 +317,10 @@ public class LilyScript : Agent, IHasHp
     }
 
     bool ShouldShowOptionTaskIcon() =>
-        showOptionTaskIcon && TrainingEnvSpace.IsPresentationTransform(transform);
+        showOptionTaskIcon
+        && (TrainingEnvSpace.IsPresentationTransform(transform)
+            || IsLilySimpleTraining
+            || TrainingEnvSpace.IsDebugEnvFocusActive);
 
     private void EnsureOptionIconRenderer()
     {
@@ -475,6 +493,9 @@ public class LilyScript : Agent, IHasHp
         UpdateFreezing();
         UpdateWarmthAtCampfire();
 
+        if (IsLilySimpleTraining)
+            EnforceLilySimpleOption();
+
         if (showOptionTaskIcon != _lastShowOptionTaskIcon)
         {
             _lastShowOptionTaskIcon = showOptionTaskIcon;
@@ -482,6 +503,33 @@ public class LilyScript : Agent, IHasHp
         }
 
         ProcessManualOptionKeys();
+
+        if (!IsLilySimpleTraining
+            && ShouldUseOptionUtilitySampling()
+            && !AgentGoToHouseDiscrete.AreHeuristicOptionsLocked)
+        {
+            RefreshOptionTierIfNeeded();
+            RefreshSurvivalSubOptionIfNeeded();
+        }
+    }
+
+    void EnforceLilySimpleOption()
+    {
+        if (_trainingConfig == null)
+            _trainingConfig = EnvTrainingConfig.Get(transform);
+        if (_trainingConfig == null || !_trainingConfig.IsLilySimpleTask())
+            return;
+
+        int fixedOption = _trainingConfig.ResolveFixedLilyOption();
+        if (currentOption == fixedOption)
+        {
+            // UnmuteEnv снова включает SpriteRenderer — переприменяем иконку.
+            UpdateOptionIconVisual();
+            return;
+        }
+
+        currentOption = fixedOption;
+        UpdateOptionIconVisual();
     }
 
     void UpdateWaterDecay()
@@ -501,6 +549,11 @@ public class LilyScript : Agent, IHasHp
     void ProcessManualOptionKeys()
     {
         if (!IsManualControlActive(transform))
+            return;
+
+        // Как у Jack: сначала L (ручной режим), потом T — крутить опции Lily.
+        // Без lock utility каждый кадр перезаписывает currentOption.
+        if (!AgentGoToHouseDiscrete.AreHeuristicOptionsLocked)
             return;
 
         if (Input.GetKeyDown(KeyCode.Alpha0))
@@ -545,14 +598,20 @@ public class LilyScript : Agent, IHasHp
 
     public void TakeDamage(int amount)
     {
+        TakeDamage(amount, applyHpLossPenalty: true);
+    }
+
+    public void TakeDamage(int amount, bool applyHpLossPenalty)
+    {
         if (amount <= 0 || _deathSequenceStarted) return;
         hp = Mathf.Max(0, hp - amount);
-        if (hpLossPenaltyPerHit != 0f)
+        if (applyHpLossPenalty && hpLossPenaltyPerHit != 0f)
             AddReward(-hpLossPenaltyPerHit);
         if (hp <= 0)
         {
             _deathSequenceStarted = true;
             EvalEpisodeTracker.NotifyEpisodeEnded();
+            RecordSimpleTrainingFailureIfNeeded();
             AgentDeathOverlay.ShowAndEndEpisode(this, AgentDeathOverlay.GetDeathMessageFor(this));
         }
     }
@@ -561,7 +620,8 @@ public class LilyScript : Agent, IHasHp
 
     public void ForceHardRespawnFromDeath()
     {
-        if (!IsInDeathState)
+        // См. JackScript: повторный OnEpisodeBegin без EndEpisode не сбрасывает GetCumulativeReward().
+        if (!_deathSequenceStarted && hp > 0)
             return;
 
         OnEpisodeBegin();
@@ -580,6 +640,7 @@ public class LilyScript : Agent, IHasHp
 
         stepCount = 0;
         _episodeStartTime = Time.unscaledTime;
+        _episodeSheepEaten = 0;
         prevFlowerDist = -1f;
         prevJackDist = -1f;
         prevWaterDist = -1f;
@@ -603,6 +664,11 @@ public class LilyScript : Agent, IHasHp
         prevHouseDist = -1f;
         WaterGoalPath.Get(transform)?.ResetAgent(transform);
 
+        if (TryGetComponent<CharacterController>(out var cc) && !cc.enabled)
+            cc.enabled = true;
+        if (animator != null)
+            animator.speed = 1f;
+
         ConfigureTrainingControl();
 
         _trainingConfig = EnvTrainingConfig.Get(transform);
@@ -616,23 +682,28 @@ public class LilyScript : Agent, IHasHp
         if (IsLilySimpleTraining)
         {
             currentOption = _trainingConfig.ResolveFixedLilyOption();
-            MaxStep = _trainingConfig.SimpleMaxSteps;
-            if (_trainingConfig.FreezeNeeds)
-            {
-                Satiety = maxSatiety / 2;
-                Heat = startHeat;
-                WaterCount = 6;
-            }
+            MaxStep = _trainingConfig.ResolveSimpleMaxSteps();
+            // FreezeNeeds = не падают со временем; старт уже рандомный в ApplyLilyEpisodeStartNeeds.
         }
-        else if (_resolvedLilyTask == EnvTrainingTask.PresentationFull
-            && TrainingEnvSpace.IsPresentationTransform(transform))
-        {
-            MaxStep = 0;
-        }
-        else if (useUtilitySoftmaxSampling)
-            currentOption = SampleOptionUtilitySoftmax(currentOption);
         else
-            currentOption = Random.Range(0, OptionCount);
+        {
+            if (_resolvedLilyTask == EnvTrainingTask.PresentationFull
+                && TrainingEnvSpace.IsPresentationTransform(transform))
+            {
+                // Стрим: бесконечный эпизод. Обучение: лимит — иначе cumulative reward уходит в -миллионы.
+                if (Academy.Instance.IsCommunicatorOn && !TrainingEnvSpace.IsStreamOnlyMode)
+                    MaxStep = _trainingConfig != null
+                        ? Mathf.Max(4000, _trainingConfig.SimpleMaxSteps * 10)
+                        : 4000;
+                else
+                    MaxStep = 0;
+            }
+
+            if (ShouldUseOptionUtilitySampling())
+                currentOption = SampleOptionUtilitySoftmax(currentOption);
+            else
+                currentOption = Random.Range(0, OptionCount);
+        }
 
         // Локальные координаты относительно корня Env (рядом с домом, как у Jack).
         const float groundY = -5.228786f;
@@ -676,6 +747,7 @@ public class LilyScript : Agent, IHasHp
             }
         }
 
+        ResolveFlowerSpawner();
         if (flowerSpawner != null)
             flowerSpawner.ResetFlowers();
 
@@ -690,18 +762,10 @@ public class LilyScript : Agent, IHasHp
 
     void ApplyLilyEpisodeStartNeeds()
     {
-        if (_resolvedLilyTask == EnvTrainingTask.PresentationFull
-            && TrainingEnvSpace.IsPresentationTransform(transform))
-        {
-            WaterCount = AgentGoToHouseDiscrete.PresentationStartNeedLevel;
-            Satiety = AgentGoToHouseDiscrete.PresentationStartFoodHeatLevel;
-            Heat = AgentGoToHouseDiscrete.PresentationStartFoodHeatLevel;
-            return;
-        }
-
-        WaterCount = 6;
-        Satiety = maxSatiety / 2;
-        Heat = startHeat;
+        // Как у Jack/George: случайные еда/вода/тепло в начале каждого эпизода.
+        Satiety = Random.Range(2, Mathf.Max(3, maxSatiety));
+        WaterCount = Random.Range(2, Mathf.Max(3, maxSatiety + 10));
+        Heat = Random.Range(1, Mathf.Max(2, startHeat > 0 ? startHeat : 20));
     }
 
     void ConfigureTrainingControl()
@@ -764,7 +828,7 @@ public class LilyScript : Agent, IHasHp
 
         _thirstTimer = 0f;
         if (thirstDamageAmount > 0)
-            TakeDamage(thirstDamageAmount);
+            TakeDamage(thirstDamageAmount, applyHpLossPenalty: false);
     }
 
     private bool GetNearestFlower(out GameObject nearestFlower, out float distance)
@@ -772,17 +836,29 @@ public class LilyScript : Agent, IHasHp
         nearestFlower = null;
         distance = float.MaxValue;
 
-        Collider[] hits = Physics.OverlapSphere(transform.position, MaxFlowerDistForObs, flowerLayer);
+        if (flowerLayer.value == 0)
+            ResolveFlowerSpawner();
+
+        Vector3 origin = transform.position;
+        Collider[] hits = Physics.OverlapSphere(origin, MaxFlowerDistForObs, flowerLayer);
         foreach (var hit in hits)
         {
             if (hit == null || !hit.gameObject.activeInHierarchy) continue;
-            float d = Vector3.Distance(transform.position, hit.transform.position);
+            float d = HarvestReachDistance(origin, hit);
             if (d < distance)
             {
                 distance = d;
-                nearestFlower = hit.gameObject;
+                nearestFlower = GetFlowerInstanceRoot(hit);
             }
         }
+
+        if (nearestFlower == null && flowerSpawner != null)
+        {
+            nearestFlower = flowerSpawner.FindNearestFlowerInReach(origin, MaxFlowerDistForObs);
+            if (nearestFlower != null)
+                distance = FlowerSpawner.DistanceToFlowerBounds(origin, nearestFlower);
+        }
+
         return nearestFlower != null;
     }
 
@@ -1116,11 +1192,24 @@ public class LilyScript : Agent, IHasHp
             return;
         }
 
-        // Utility sampling: пересэмпливаем каждые 20 шагов (если включено)
-        if (!IsLilySimpleTraining && useUtilitySoftmaxSampling && stepCount > 0 && (stepCount % 20) == 0)
+        // Сразу меняем уровень задачи, если проголодалась/замёрзла (не ждём 20 шагов).
+        if (!IsLilySimpleTraining
+            && ShouldUseOptionUtilitySampling()
+            && !AgentGoToHouseDiscrete.AreHeuristicOptionsLocked)
+        {
+            RefreshOptionTierIfNeeded();
+            RefreshSurvivalSubOptionIfNeeded();
+        }
+
+        // Внутри уровня — пересэмплируем каждые 20 шагов.
+        if (!IsLilySimpleTraining
+            && ShouldUseOptionUtilitySampling()
+            && !AgentGoToHouseDiscrete.AreHeuristicOptionsLocked
+            && stepCount > 0
+            && (stepCount % 20) == 0)
         {
             int prevOption = currentOption;
-            currentOption = SampleOptionUtilitySoftmax(currentOption);
+            currentOption = SampleWithinCurrentTier(currentOption);
             ResetWaterPathIfEntered(prevOption, currentOption, transform);
             UpdateOptionIconVisual();
         }
@@ -1129,13 +1218,13 @@ public class LilyScript : Agent, IHasHp
         int rotateAction = actions.DiscreteActions[1];
         int collectAction = actions.DiscreteActions[2];
 
-        bool collectJustPressed = collectAction == 1 && _lastCollectAction != 1;
+        bool collectHeld = collectAction == 1;
         bool collectDoRelevant = currentOption == OptionFlower
             || currentOption == OptionKiss
             || currentOption == OptionWater
             || currentOption == OptionFood
             || currentOption == OptionHeat;
-        bool collectReady = collectJustPressed && _doCooldownRemaining <= 0f && collectDoRelevant;
+        bool collectReady = collectHeld && _doCooldownRemaining <= 0f && collectDoRelevant;
 
         if (collectReady && animator != null && doActionAnimTrigger.Length > 0)
             animator.SetTrigger(doActionAnimTrigger);
@@ -1153,6 +1242,9 @@ public class LilyScript : Agent, IHasHp
             }
             if (knockbackZombieOnDo)
                 KnockbackNearbyZombiesOnLilyDo();
+
+            if (emptyDoActionPenalty < 0f && !IsNearAnyDoInteractable())
+                AddReward(emptyDoActionPenalty);
 
             if (TryCollectWater())
             {
@@ -1245,7 +1337,6 @@ public class LilyScript : Agent, IHasHp
 
         if (currentOption == OptionFlower)
         {
-            // Опция: собирать цветы — один раз на фронте DO + кулдаун
             bool collected = false;
             if (collectReady)
                 collected = TryCollectFlower();
@@ -1369,7 +1460,6 @@ public class LilyScript : Agent, IHasHp
                 ateSheepThisStep);
         }
         else if (!IsLilySimpleTraining
-            && _resolvedLilyTask != EnvTrainingTask.PresentationFull
             && MaxStep > 0
             && stepCount >= MaxStep)
         {
@@ -1377,8 +1467,6 @@ public class LilyScript : Agent, IHasHp
             EndEpisode();
         }
     }
-
-    private float _episodeStartTime;
 
     void TryEndLilySimpleTrainingEpisode(bool collectedFlower, bool collectedWater, bool ateSheep)
     {
@@ -1388,28 +1476,40 @@ public class LilyScript : Agent, IHasHp
         if (_trainingConfig.StepPenalty != 0f)
             AddReward(_trainingConfig.StepPenalty);
 
-        if (_trainingConfig.EndOnSuccess)
+        // Как у Jack Food/Water: не рвём эпизод на первом успехе — только MaxStep / timeout.
+        // Награда за овцу/воду/цветок уже даётся в OnActionReceived.
+        if (_trainingConfig.ResolveSimpleEpisodeTimeoutSeconds() > 0f
+            && Time.unscaledTime - _episodeStartTime >= _trainingConfig.ResolveSimpleEpisodeTimeoutSeconds())
         {
-            switch (_trainingConfig.ResolveTask())
+            EvalEpisodeTracker.NotifyEpisodeEnded();
+            EndLilySimpleTrainingEpisode();
+        }
+    }
+
+    void EndLilySimpleTrainingEpisode()
+    {
+        if (_trainingConfig != null)
+        {
+            var task = _trainingConfig.ResolveTask();
+            if (TrainingTaskSuccessTracker.ShouldTrack(task))
             {
-                case EnvTrainingTask.LilyFlower when collectedFlower:
-                case EnvTrainingTask.LilyFood when ateSheep:
-                case EnvTrainingTask.LilyWater when collectedWater || IsLilyWaterPathComplete():
-                case EnvTrainingTask.LilyHeat when IsOnHouse() && IsCampfireBurningInEnv():
-                    if (_trainingConfig.SuccessReward != 0f)
-                        AddReward(_trainingConfig.SuccessReward);
-                    EvalEpisodeTracker.NotifyEpisodeEnded();
-                    EndEpisode();
-                    return;
+                bool success = TrainingTaskSuccessTracker.EvaluateLilySuccess(
+                    task, this, _episodeSheepEaten);
+                TrainingTaskSuccessTracker.Record(task, success);
             }
         }
 
-        if (_trainingConfig.SimpleEpisodeTimeoutSeconds > 0f
-            && Time.unscaledTime - _episodeStartTime >= _trainingConfig.SimpleEpisodeTimeoutSeconds)
-        {
-            EvalEpisodeTracker.NotifyEpisodeEnded();
-            EndEpisode();
-        }
+        EndEpisode();
+    }
+
+    void RecordSimpleTrainingFailureIfNeeded()
+    {
+        if (_trainingConfig == null)
+            return;
+
+        var task = _trainingConfig.ResolveTask();
+        if (TrainingTaskSuccessTracker.ShouldTrack(task))
+            TrainingTaskSuccessTracker.Record(task, false);
     }
 
     bool IsLilyWaterPathComplete()
@@ -1418,22 +1518,186 @@ public class LilyScript : Agent, IHasHp
         return path != null && path.HasCompletedPath(transform);
     }
 
-    private int SampleOptionUtilitySoftmax(int currentOpt)
+    /// <summary>Curriculum train: только цветы/поцелуй. На presentation/stream — полный цикл выживания.</summary>
+    bool UsesLilyCurriculumLeisureOnly()
     {
-        // need: чем меньше прогресс по "цветам/любви", тем выше потребность
+        if (!curriculumNoShootNoZombie)
+            return false;
+        if (_resolvedLilyTask == EnvTrainingTask.PresentationFull
+            && TrainingEnvSpace.IsPresentationTransform(transform))
+            return false;
+        return true;
+    }
+
+    bool ShouldUseOptionUtilitySampling()
+    {
+        if (IsLilySimpleTraining)
+            return false;
+        if (_resolvedLilyTask == EnvTrainingTask.PresentationFull
+            && TrainingEnvSpace.IsPresentationTransform(transform))
+            return true;
+        if (UsesLilyCurriculumLeisureOnly())
+            return useUtilitySoftmaxSampling;
+        return useUtilitySoftmaxSampling;
+    }
+
+    bool IsLeisureOption(int option) =>
+        option == OptionFlower || option == OptionKiss;
+
+    bool IsSurvivalOption(int option) =>
+        option == OptionFood || option == OptionWater || option == OptionHeat;
+
+    bool ShouldUseSurvivalOptions() =>
+        !UsesLilyCurriculumLeisureOnly() && !AreSurvivalNeedsSatisfied();
+
+    void RefreshOptionTierIfNeeded()
+    {
+        bool survivalMode = ShouldUseSurvivalOptions();
+        if (survivalMode && IsLeisureOption(currentOption))
+        {
+            int prevOption = currentOption;
+            currentOption = SampleSurvivalOptionUtilitySoftmax(currentOption);
+            ResetWaterPathIfEntered(prevOption, currentOption, transform);
+            UpdateOptionIconVisual();
+        }
+        else if (!survivalMode && IsSurvivalOption(currentOption))
+        {
+            int prevOption = currentOption;
+            currentOption = SampleLeisureOptionUtilitySoftmax(currentOption);
+            ResetWaterPathIfEntered(prevOption, currentOption, transform);
+            UpdateOptionIconVisual();
+        }
+    }
+
+    bool IsWaterNeedSatisfied() => WaterCount >= 4;
+
+    bool IsFoodNeedSatisfied() => Satiety >= Mathf.Max(1, maxSatiety / 2);
+
+    bool IsHeatNeedSatisfied() => Heat >= Mathf.Max(1, startHeat / 2);
+
+    bool IsSurvivalOptionNeedSatisfied(int option) => option switch
+    {
+        OptionFood => IsFoodNeedSatisfied(),
+        OptionWater => IsWaterNeedSatisfied(),
+        OptionHeat => IsHeatNeedSatisfied(),
+        _ => true
+    };
+
+    void RefreshSurvivalSubOptionIfNeeded()
+    {
+        if (!ShouldUseSurvivalOptions() || !IsSurvivalOption(currentOption))
+            return;
+        if (!IsSurvivalOptionNeedSatisfied(currentOption))
+            return;
+
+        int next = PickMostNeededSurvivalOption();
+        if (next == currentOption)
+            return;
+
+        int prevOption = currentOption;
+        currentOption = next;
+        ResetWaterPathIfEntered(prevOption, currentOption, transform);
+        UpdateOptionIconVisual();
+    }
+
+    int PickMostNeededSurvivalOption()
+    {
+        if (Heat <= 0)
+            return OptionHeat;
+        if (Satiety <= 0)
+            return OptionFood;
+        if (WaterCount <= 0)
+            return OptionWater;
+        if (!IsHeatNeedSatisfied())
+            return OptionHeat;
+        if (!IsFoodNeedSatisfied())
+            return OptionFood;
+        if (!IsWaterNeedSatisfied())
+            return OptionWater;
+        return SampleSurvivalOptionUtilitySoftmax(currentOption);
+    }
+
+    bool AreSurvivalNeedsSatisfied()
+    {
+        return IsWaterNeedSatisfied() && IsFoodNeedSatisfied() && IsHeatNeedSatisfied();
+    }
+
+    float GetNearestWaterDistance()
+    {
+        if (prevWaterDist > 0f)
+            return prevWaterDist;
+
+        var envRoot = TrainingEnvSpace.FindRoot(transform);
+        if (WaterSource.TryFindNearestDistance(transform, envRoot, out float dist))
+            return dist;
+        return 999f;
+    }
+
+    float GetNearestHouseDistance()
+    {
+        ResolveHouseTarget();
+        if (houseTarget == null)
+            return 999f;
+        return Vector3.Distance(transform.position, houseTarget.position);
+    }
+
+    int SampleOptionUtilitySoftmax(int currentOpt)
+    {
+        if (UsesLilyCurriculumLeisureOnly() || AreSurvivalNeedsSatisfied())
+            return SampleLeisureOptionUtilitySoftmax(currentOpt);
+        return SampleSurvivalOptionUtilitySoftmax(currentOpt);
+    }
+
+    int SampleWithinCurrentTier(int currentOpt)
+    {
+        if (ShouldUseSurvivalOptions())
+            return SampleSurvivalOptionUtilitySoftmax(currentOpt);
+        return SampleLeisureOptionUtilitySoftmax(currentOpt);
+    }
+
+    int SampleSurvivalOptionUtilitySoftmax(int currentOpt)
+    {
+        float heatRatio = startHeat > 0 ? (float)Heat / startHeat : 0f;
+        float satietyRatio = maxSatiety > 0 ? (float)Satiety / maxSatiety : 0f;
+        float waterRatio = Mathf.Clamp01(WaterCount / 12f);
+
+        float needHeat = Mathf.Clamp01(1f - heatRatio);
+        float needFood = Mathf.Clamp01(1f - satietyRatio);
+        float needWater = Mathf.Clamp01(1f - waterRatio);
+
+        float accessFood = DistanceToAccess(GetNearestSheep(out _, out float dSheep) ? dSheep : 999f);
+        float accessWater = DistanceToAccess(GetNearestWaterDistance());
+        float accessHouse = DistanceToAccess(GetNearestHouseDistance());
+
+        float stickFood = currentOpt == OptionFood && needFood > 0.15f ? 1f : 0f;
+        float stickWater = currentOpt == OptionWater && needWater > 0.15f ? 1f : 0f;
+        float stickHeat = currentOpt == OptionHeat && needHeat > 0.15f ? 1f : 0f;
+
+        float epsFood = Random.Range(-noise, noise);
+        float epsWater = Random.Range(-noise, noise);
+        float epsHeat = Random.Range(-noise, noise);
+
+        float uFood = 2.5f * needFood + 1.0f * accessFood * needFood + stickinessBonus * stickFood + epsFood;
+        float uWater = 2.5f * needWater + 1.0f * accessWater * needWater + stickinessBonus * stickWater + epsWater;
+        float uHeat = 2.5f * needHeat + 1.0f * accessHouse * needHeat + stickinessBonus * stickHeat + epsHeat;
+
+        return SoftmaxSample3(uFood, uWater, uHeat, OptionFood, OptionWater, OptionHeat, Mathf.Max(0.0001f, tau));
+    }
+
+    int SampleLeisureOptionUtilitySoftmax(int currentOpt)
+    {
         float flowerRatio = maxFlowerCount > 0 ? (float)FlowerCount / maxFlowerCount : 0f;
         float loveRatio = maxLove > 0 ? (float)Love / maxLove : 0f;
         float needFlowers = Mathf.Clamp01(1f - flowerRatio);
         float needKiss = Mathf.Clamp01(1f - loveRatio);
 
-        // access: ближе цель -> больше access
         float distFlower = GetNearestFlower(out _, out float dF) ? dF : 999f;
         float distJack = GetDistanceToJack(out _);
         float accessFlowers = DistanceToAccess(distFlower);
         float accessKiss = DistanceToAccess(distJack);
 
-        float stickFlowers = currentOpt == 0 ? 1f : 0f;
-        float stickKiss = currentOpt == 1 ? 1f : 0f;
+        float stickFlowers = currentOpt == OptionFlower ? 1f : 0f;
+        float stickKiss = currentOpt == OptionKiss ? 1f : 0f;
 
         float eps0 = Random.Range(-noise, noise);
         float eps1 = Random.Range(-noise, noise);
@@ -1441,7 +1705,7 @@ public class LilyScript : Agent, IHasHp
         float u0 = 2.5f * needFlowers + 1.0f * accessFlowers + stickinessBonus * stickFlowers + eps0;
         float u1 = 2.5f * needKiss + 1.0f * accessKiss + stickinessBonus * stickKiss + eps1;
 
-        return SoftmaxSample2(u0, u1, Mathf.Max(0.0001f, tau));
+        return SoftmaxSample2(u0, u1, Mathf.Max(0.0001f, tau)) == 0 ? OptionFlower : OptionKiss;
     }
 
     private float DistanceToAccess(float distance)
@@ -1463,9 +1727,89 @@ public class LilyScript : Agent, IHasHp
         return Random.value < p0 ? 0 : 1;
     }
 
+    static int SoftmaxSample3(float u0, float u1, float u2, int opt0, int opt1, int opt2, float temperature)
+    {
+        float a0 = u0 / temperature;
+        float a1 = u1 / temperature;
+        float a2 = u2 / temperature;
+        float m = Mathf.Max(a0, Mathf.Max(a1, a2));
+        float e0 = Mathf.Exp(a0 - m);
+        float e1 = Mathf.Exp(a1 - m);
+        float e2 = Mathf.Exp(a2 - m);
+        float sum = e0 + e1 + e2;
+        float r = Random.value * sum;
+        if (r < e0) return opt0;
+        if (r < e0 + e1) return opt1;
+        return opt2;
+    }
+
     private static float HarvestReachDistance(Vector3 from, Collider c)
     {
+        // Non-convex MeshCollider: ClosestPoint врёт (часто ≈0) → «сбор с любой дистанции».
+        if (c is MeshCollider mesh && !mesh.convex)
+            return Vector3.Distance(from, c.bounds.ClosestPoint(from));
         return Vector3.Distance(from, c.ClosestPoint(from));
+    }
+
+    bool IsNearAnyDoInteractable()
+    {
+        Vector3 origin = transform.position;
+        if (flowerLayer.value == 0)
+            ResolveFlowerSpawner();
+
+        if (flowerLayer.value != 0)
+        {
+            Collider[] flowers = Physics.OverlapSphere(origin, collectDistance, flowerLayer);
+            for (int i = 0; i < flowers.Length; i++)
+            {
+                if (flowers[i] == null || !flowers[i].gameObject.activeInHierarchy)
+                    continue;
+                if (HarvestReachDistance(origin, flowers[i]) <= collectDistance)
+                    return true;
+            }
+        }
+
+        float sheepR = eatDistance * 2f;
+        Collider[] sheepHits = Physics.OverlapSphere(origin, sheepR, sheepLayer);
+        for (int i = 0; i < sheepHits.Length; i++)
+        {
+            if (sheepHits[i] == null)
+                continue;
+            if (HarvestReachDistance(origin, sheepHits[i]) <= sheepR)
+                return true;
+        }
+
+        var envRoot = TrainingEnvSpace.FindRoot(transform);
+        if (WaterSource.TryFindNearestDistance(transform, envRoot, out float waterDist)
+            && waterDist <= waterCollectDistance)
+            return true;
+
+        float zombieR = Mathf.Max(zombieNearbyRadiusOnDo, zombieKnockbackRadiusOnDo);
+        if (zombieR > 0f && zombieLayer.value != 0)
+        {
+            Collider[] zombies = Physics.OverlapSphere(origin, zombieR, zombieLayer);
+            for (int i = 0; i < zombies.Length; i++)
+            {
+                if (zombies[i] == null)
+                    continue;
+                if (zombies[i].GetComponentInParent<ZombieChase>() != null
+                    || zombies[i].GetComponentInParent<ZombieAttack>() != null)
+                    return true;
+            }
+        }
+
+        float personR = Mathf.Max(zombieKnockbackRadiusOnDo, 1.6f);
+        foreach (var jack in Object.FindObjectsOfType<AgentGoToHouseDiscrete>())
+        {
+            if (jack == null || !jack.isActiveAndEnabled)
+                continue;
+            if (envRoot != null && !TrainingEnvSpace.IsDescendantOf(jack.transform, envRoot))
+                continue;
+            if (Vector3.Distance(origin, jack.transform.position) <= personR)
+                return true;
+        }
+
+        return false;
     }
 
     private GameObject GetFlowerInstanceRoot(Collider hit)
@@ -1485,17 +1829,21 @@ public class LilyScript : Agent, IHasHp
 
     private bool TryCollectFlower()
     {
+        if (flowerLayer.value == 0)
+            ResolveFlowerSpawner();
+
         Vector3 origin = transform.position;
-        Collider[] hits = Physics.OverlapSphere(origin, collectDistance, flowerLayer);
+        float reach = Mathf.Clamp(collectDistance, 0.5f, 2.5f);
+        Collider[] hits = Physics.OverlapSphere(origin, reach, flowerLayer);
 
         GameObject bestRoot = null;
         float bestDist = float.MaxValue;
         foreach (var c in hits)
         {
             if (c == null || !c.gameObject.activeInHierarchy) continue;
-            float d = HarvestReachDistance(origin, c);
-            if (d > collectDistance) continue;
             GameObject root = GetFlowerInstanceRoot(c);
+            float d = FlowerSpawner.DistanceToFlowerBounds(origin, root != null ? root : c.gameObject);
+            if (d > reach) continue;
             if (d < bestDist)
             {
                 bestDist = d;
@@ -1503,9 +1851,18 @@ public class LilyScript : Agent, IHasHp
             }
         }
 
+        if (bestRoot == null && flowerSpawner != null)
+            bestRoot = flowerSpawner.FindNearestFlowerInReach(origin, reach);
+
         if (bestRoot == null)
             return false;
 
+        // Финальная проверка по pivot+bounds — не собирать «через карту».
+        float finalDist = FlowerSpawner.DistanceToFlowerBounds(origin, bestRoot);
+        if (finalDist > reach)
+            return false;
+
+        flowerSpawner?.NotifyFlowerCollected(bestRoot);
         Destroy(bestRoot);
         return true;
     }
@@ -1552,6 +1909,23 @@ public class LilyScript : Agent, IHasHp
         }
     }
 
+    void ResolveFlowerSpawner()
+    {
+        if (flowerSpawner != null)
+            return;
+
+        var envRoot = TrainingEnvSpace.FindRoot(transform);
+        if (envRoot != null)
+            flowerSpawner = envRoot.GetComponentInChildren<FlowerSpawner>(true);
+
+        if (flowerLayer.value == 0)
+        {
+            int flowerLayerId = LayerMask.NameToLayer("Flower");
+            if (flowerLayerId >= 0)
+                flowerLayer = 1 << flowerLayerId;
+        }
+    }
+
     void ResolveHouseTarget()
     {
         if (houseTarget != null)
@@ -1569,8 +1943,33 @@ public class LilyScript : Agent, IHasHp
             return;
 
         var home = envRoot.Find("HomeSpot");
+        if (home == null)
+        {
+            foreach (var t in envRoot.GetComponentsInChildren<Transform>(true))
+            {
+                if (t != null && t.name == "HomeSpot")
+                {
+                    home = t;
+                    break;
+                }
+            }
+        }
+
         if (home != null)
+        {
             houseTarget = home;
+            return;
+        }
+
+        // CityScene и т.п.: создать точку дома, иначе Jack/Lily падают на houseTarget.
+        var go = new GameObject("HomeSpot");
+        go.tag = "House";
+        go.transform.SetParent(envRoot, false);
+        go.transform.position = transform.position;
+        houseTarget = go.transform;
+        Debug.LogWarning(
+            $"[Lily] HomeSpot не найден — создан runtime в {envRoot.name}",
+            this);
     }
 
     AgentGoToHouseDiscrete FindJackInEnv()
@@ -1669,8 +2068,12 @@ public class LilyScript : Agent, IHasHp
         if (houseTarget == null)
             return false;
 
-        return Vector3.Distance(transform.position, houseTarget.position) <= houseRadius;
+        return Vector3.Distance(transform.position, houseTarget.position) <= campfireWarmthRadius;
     }
+
+    public bool IsOnHousePublic() => IsOnHouse();
+
+    public bool IsCampfireBurningInEnvPublic() => IsCampfireBurningInEnv();
 
     bool IsOnHouse()
     {
@@ -1765,6 +2168,7 @@ public class LilyScript : Agent, IHasHp
         Satiety = Mathf.Min(maxSatiety, Satiety + 2);
         Destroy(bestRoot);
         sheepSpawner?.NotifySheepEaten();
+        _episodeSheepEaten++;
         return true;
     }
 
@@ -1795,8 +2199,14 @@ public class LilyScript : Agent, IHasHp
             return;
 
         _hungerTimer = 0f;
+        if (hungerPenaltyPerTick != 0f && stepCount != _lastHungerRewardStep)
+        {
+            _lastHungerRewardStep = stepCount;
+            AddReward(hungerPenaltyPerTick);
+            FloatingRewardPopup.ShowHungry(transform, hungerPenaltyPerTick);
+        }
         if (hungerDamageAmount > 0)
-            TakeDamage(hungerDamageAmount);
+            TakeDamage(hungerDamageAmount, applyHpLossPenalty: false);
     }
 
     void UpdateHeatDecay()
@@ -1826,8 +2236,14 @@ public class LilyScript : Agent, IHasHp
             return;
 
         _freezeTimer = 0f;
+        if (freezePenaltyPerTick != 0f && stepCount != _lastFreezeRewardStep)
+        {
+            _lastFreezeRewardStep = stepCount;
+            AddReward(freezePenaltyPerTick);
+            FloatingRewardPopup.ShowFreezing(transform, freezePenaltyPerTick);
+        }
         if (freezeDamageAmount > 0)
-            TakeDamage(freezeDamageAmount);
+            TakeDamage(freezeDamageAmount, applyHpLossPenalty: false);
     }
 
     bool TryCollectWater()

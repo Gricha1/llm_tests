@@ -151,14 +151,19 @@ public class RewardDisplay : MonoBehaviour
 
     void Update()
     {
-        if (IsGeorgeDisplay())
+        EnvTrainingAgentRole role = IsGeorgeDisplay()
+            ? EnvTrainingAgentRole.George
+            : (IsLilyDisplay() ? EnvTrainingAgentRole.Lily : EnvTrainingAgentRole.Jack);
+
+        if (role == EnvTrainingAgentRole.George)
             agent = FindActiveGeorge();
         else
             agent = IsLilyDisplay() ? FindActiveLily() : FindActiveJack();
+
         if (_text == null)
             return;
 
-        if (agent == null)
+        if (agent == null || !TrainingEnvSpace.ShouldShowHudForRole(role))
         {
             _text.gameObject.SetActive(false);
             return;

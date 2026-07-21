@@ -2,9 +2,10 @@
 set -eu
 set -o pipefail
 
-# Jack+Lily+George: 12 Unity headless (num-envs=12) + стрим отдельно (run_stream_onnx.bash).
+# Jack+Lily+George: 26 Unity headless (num-envs=26) + стрим отдельно (run_stream_onnx.bash).
 # worker 0  = PresentationFull (все трое, headless train)
 # workers 1–11 = узкие задачи (headless)
+# workers 12–25 = boost: 4 задачи с самым низким success rate (по ~3–4 копии каждой)
 #
 #   RUN_ID=run_72 bash train_headless_jack_lily_george.bash --resume
 #   RUN_ID=run_72 bash train_scripts/lab_comp/run_stream_onnx.bash
@@ -39,7 +40,7 @@ export FOREST_TRAIN_ALL_HEADLESS=1
 if [ "${TRAIN_MODE}" = "multi" ]; then
   NUM_ENVS="${NUM_ENVS:-11}"
 else
-  NUM_ENVS="${NUM_ENVS:-12}"
+  NUM_ENVS="${NUM_ENVS:-26}"
 fi
 
 CONFIG="custom_configs/Jack_Lily_George.yaml"
@@ -47,6 +48,13 @@ BUILD_PATH="build_versions/${BUILD%.x86_64}.x86_64"
 LAUNCHER="${ROOT}/train_scripts/lab_comp/launch_forest_env.bash"
 export FOREST_BUILD_PATH="${ROOT}/${BUILD_PATH}"
 export FOREST_TRAIN_MODE="${TRAIN_MODE}"
+
+if [ -f "build_versions/${BUILD%.x86_64}.BUILD_STAMP" ]; then
+  echo "[train] BUILD_STAMP:"
+  sed 's/^/[train]   /' "build_versions/${BUILD%.x86_64}.BUILD_STAMP"
+else
+  echo "[train] WARN: нет BUILD_STAMP — билд могли не обновить через sync_build" >&2
+fi
 
 if [ -f "${HOME}/anaconda3/etc/profile.d/conda.sh" ]; then
   # shellcheck source=/dev/null
@@ -122,6 +130,7 @@ ML_ARGS=(
   --num-envs "${NUM_ENVS}"
   --time-scale "${TIME_SCALE}"
   --torch-device "${TORCH_DEVICE}"
+  --timeout-wait "${TIMEOUT_WAIT:-300}"
 )
 
 # Важно: --resume/--force ДО --env-args, иначе mlagents съест их как аргументы Unity.
@@ -129,7 +138,7 @@ ML_ARGS=(
 [ "${FORCE}" -eq 1 ] && ML_ARGS+=(--force)
 
 if [ "${TRAIN_MODE}" = "multi" ]; then
-  ML_ARGS+=(--env-args -forestSingleEnvByPort -forestBasePort "${TRAIN_PORT}" -forestTrainAllHeadless)
+  ML_ARGS+=(--env-args -forestSingleEnvByPort -forestBasePort "${TRAIN_PORT}" -forestTrainAllHeadless -forestResultsDir "${ROOT}/results/${RUN_ID}")
 else
   ML_ARGS+=(
     --env-args
@@ -137,15 +146,17 @@ else
     -forestPresentationWorker0
     -forestBasePort "${TRAIN_PORT}"
     -forestTrainAllHeadless
+    -forestResultsDir "${ROOT}/results/${RUN_ID}"
   )
 fi
 
 export FOREST_BASE_PORT="${TRAIN_PORT}"
+export FOREST_RESULTS_DIR="${ROOT}/results/${RUN_ID}"
 
 echo "[train] mode=${TRAIN_MODE} DISPLAY=${DISPLAY} run-id=${RUN_ID} num-envs=${NUM_ENVS} port=${TRAIN_PORT} time-scale=${TIME_SCALE} resume=${RESUME}"
 echo "[train] CPU affinity: train=${FOREST_TRAIN_CPUS} (stream reserved=${FOREST_STREAM_CPUS})"
 if [ "${TRAIN_MODE}" = "presentation" ]; then
-  echo "[train] 12 headless: w0=PresentationFull, w1-11=узкие задачи"
+  echo "[train] 26 headless: w0=PresentationFull, w1-11=узкие, w12+=boost(low SR)"
   echo "[train] Стрим отдельно: RUN_ID=${RUN_ID} bash train_scripts/lab_comp/run_stream_onnx.bash"
 fi
 if command -v taskset >/dev/null 2>&1; then

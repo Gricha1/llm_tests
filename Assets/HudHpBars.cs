@@ -108,6 +108,15 @@ public sealed class HudHpBars : MonoBehaviour
         _lily = FindActiveLily();
         _george = FindActiveGeorge();
 
+        if (_jack != null && !TrainingEnvSpace.ShouldShowHudForRole(EnvTrainingAgentRole.Jack))
+            _jack = null;
+        if (_lily != null && !TrainingEnvSpace.ShouldShowHudForRole(EnvTrainingAgentRole.Lily))
+            _lily = null;
+        if (_george != null && !TrainingEnvSpace.ShouldShowHudForRole(EnvTrainingAgentRole.George))
+            _george = null;
+
+        if (_jackRow != null)
+            _jackRow.gameObject.SetActive(_jack != null);
         if (_lilyRow != null)
             _lilyRow.gameObject.SetActive(_lily != null);
         if (_georgeRow != null)
@@ -115,7 +124,8 @@ public sealed class HudHpBars : MonoBehaviour
 
         LayoutRoot();
 
-        UpdateBar(_jack, _jackFillRt, _jackText, "Джек");
+        if (_jack != null)
+            UpdateBar(_jack, _jackFillRt, _jackText, "Джек");
         if (_lily != null)
             UpdateBar(_lily, _lilyFillRt, _lilyText, "Лили");
         if (_george != null)
@@ -135,11 +145,15 @@ public sealed class HudHpBars : MonoBehaviour
         if (_topLeftRoot == null)
             return;
 
-        int rows = 1;
+        int rows = 0;
+        if (_jackRow != null && _jackRow.gameObject.activeSelf)
+            rows++;
         if (_lilyRow != null && _lilyRow.gameObject.activeSelf)
             rows++;
         if (_georgeRow != null && _georgeRow.gameObject.activeSelf)
             rows++;
+        if (rows < 1)
+            rows = 1;
         _topLeftRoot.sizeDelta = new Vector2(barWidth + 110f, (barHeight + rowSpacing) * rows + 10f);
     }
 
