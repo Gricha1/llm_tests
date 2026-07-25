@@ -5,7 +5,7 @@ using UnityEngine;
 
 /// <summary>
 /// Профиль задачи на корне Env. Auto + copyIndex 0…N.
-/// Workers 12+ = boost: задачи с самым низким success rate (цикл по 4 слотам).
+/// Workers 12+: фиксированный буст (2× wood/water/zombie Jack, 2× water Lily/George).
 /// </summary>
 public enum EnvTrainingTask
 {
@@ -115,44 +115,97 @@ public sealed class EnvTrainingConfig : MonoBehaviour
         return ResolveAutoTaskForCopyIndex(copyIndex);
     }
 
+    /// <summary>
+    /// w12+: 3× JackWood, 3× JackWater, 3× JackZombie, 3× LilyWater, 3× GeorgeWater (далее цикл).
+    /// </summary>
+    static readonly EnvTrainingTask[] FixedBoostTasks =
+    {
+        EnvTrainingTask.JackWood,
+        EnvTrainingTask.JackWood,
+        EnvTrainingTask.JackWood,
+        EnvTrainingTask.JackWater,
+        EnvTrainingTask.JackWater,
+        EnvTrainingTask.JackWater,
+        EnvTrainingTask.JackZombie,
+        EnvTrainingTask.JackZombie,
+        EnvTrainingTask.JackZombie,
+        EnvTrainingTask.LilyWater,
+        EnvTrainingTask.LilyWater,
+        EnvTrainingTask.LilyWater,
+        EnvTrainingTask.GeorgeWater,
+        EnvTrainingTask.GeorgeWater,
+        EnvTrainingTask.GeorgeWater,
+    };
+
+    /// <summary>
+    /// Jack-only: wood:food:water:zombie ≈ 2:1:2:2.
+    /// На 30 слотах: 9 wood, 4 food, 9 water, 8 zombie.
+    /// </summary>
+    public static bool IsJackOnlyTasksMode()
+    {
+        if (IsTruthyEnv(System.Environment.GetEnvironmentVariable("FOREST_JACK_ONLY_TASKS")))
+            return true;
+
+        foreach (var arg in System.Environment.GetCommandLineArgs())
+        {
+            if (arg == "-forestJackOnlyTasks" || arg == "--forest-jack-only-tasks")
+                return true;
+        }
+
+        return false;
+    }
+
+    static bool IsTruthyEnv(string value) =>
+        value == "1" || string.Equals(value, "true", System.StringComparison.OrdinalIgnoreCase);
+
+    public static EnvTrainingTask ResolveJackOnlyTaskForCopyIndex(int copyIndex)
+    {
+        // Период 30: 9+4+9+8 — ровно 2:1:2:2 при NUM_ENVS=30.
+        int i = copyIndex < 0 ? 0 : copyIndex % 30;
+        if (i < 9)
+            return EnvTrainingTask.JackWood;
+        if (i < 13)
+            return EnvTrainingTask.JackFood;
+        if (i < 22)
+            return EnvTrainingTask.JackWater;
+        return EnvTrainingTask.JackZombie;
+    }
+
     public static EnvTrainingTask ResolveAutoTaskForCopyIndex(int copyIndex)
     {
+        if (IsJackOnlyTasksMode())
+            return ResolveJackOnlyTaskForCopyIndex(copyIndex);
+
+        // 0 — стрим PresentationFull; 1 — train PresentationFull (все трое);
+        // 2–12 — узкие; 13+ — буст.
         switch (copyIndex)
         {
             case 0: return EnvTrainingTask.PresentationFull;
-            case 1: return EnvTrainingTask.JackWood;
-            case 2: return EnvTrainingTask.JackFood;
-            case 3: return EnvTrainingTask.JackWater;
-            case 4: return EnvTrainingTask.JackZombie;
-            case 5: return EnvTrainingTask.LilyFood;
-            case 6: return EnvTrainingTask.LilyWater;
-            case 7: return EnvTrainingTask.LilyHeat;
-            case 8: return EnvTrainingTask.LilyFlower;
-            case 9: return EnvTrainingTask.GeorgeFood;
-            case 10: return EnvTrainingTask.GeorgeWater;
-            case 11: return EnvTrainingTask.GeorgeHeat;
-            case 12:
-            case 13:
-            case 14:
-            case 15:
+            case 1: return EnvTrainingTask.PresentationFull;
+            case 2: return EnvTrainingTask.JackWood;
+            case 3: return EnvTrainingTask.JackFood;
+            case 4: return EnvTrainingTask.JackWater;
+            case 5: return EnvTrainingTask.JackZombie;
+            case 6: return EnvTrainingTask.LilyFood;
+            case 7: return EnvTrainingTask.LilyWater;
+            case 8: return EnvTrainingTask.LilyHeat;
+            case 9: return EnvTrainingTask.LilyFlower;
+            case 10: return EnvTrainingTask.GeorgeFood;
+            case 11: return EnvTrainingTask.GeorgeWater;
+            case 12: return EnvTrainingTask.GeorgeHeat;
             default:
-                // w12+: boost — 4 задачи с самым низким SR, слоты циклом.
-                if (copyIndex >= 12)
-                    return TrainingTaskSuccessTracker.GetBoostTaskForSlot((copyIndex - 12) % 4);
+                if (copyIndex >= 13)
+                {
+                    int i = (copyIndex - 13) % FixedBoostTasks.Length;
+                    return FixedBoostTasks[i];
+                }
                 return EnvTrainingTask.JackWood;
         }
     }
 
-    /// <summary>Workers 12+: закрепить задачу с низким SR на текущий эпизод.</summary>
+    /// <summary>Раньше фиксировал dynamic boost на эпизод; сейчас w12+ заданы жёстко в FixedBoostTasks.</summary>
     public void CommitBoostTaskIfNeeded()
     {
-        int copyIndex = _forcedCopyIndex >= 0
-            ? _forcedCopyIndex
-            : TrainingEnvSpace.GetEnvCopyIndex(transform);
-        if (copyIndex < 12)
-            return;
-
-        TrainingTaskSuccessTracker.CommitBoostSlot((copyIndex - 12) % 4);
     }
 
     public JackTrainingMode ResolveJackMode()
@@ -199,6 +252,11 @@ public sealed class EnvTrainingConfig : MonoBehaviour
 
     public static bool ShouldAgentTrain(EnvTrainingTask task, EnvTrainingAgentRole role)
     {
+        // Jack-only train: в yaml только JackLowLevelAgent — Lily/George не должны
+        // регистрироваться как Default, иначе TrainerConfigError.
+        if (IsJackOnlyTasksMode())
+            return role == EnvTrainingAgentRole.Jack;
+
         switch (task)
         {
             case EnvTrainingTask.PresentationFull:
@@ -244,8 +302,14 @@ public sealed class EnvTrainingConfig : MonoBehaviour
         CommitBoostTaskIfNeeded();
         var resolved = ResolveTask();
         ApplyTrainingCampfire(resolved);
+        // Сначала роли (HeuristicOnly / Agent.enabled), потом visibility:
+        // иначе спрятанных агентов пропускают и они остаются Default → TrainerConfigError.
+        bool applyRoles = TrainingEnvSpace.IsMlAgentsTrainingActive()
+            || IsJackOnlyTasksMode()
+            || TrainingEnvSpace.IsDebugEnvFocusActive;
+        if (applyRoles)
+            ApplyAgentRoles(resolved);
         ApplyAgentVisibility(resolved);
-        ApplyAgentRoles(resolved);
         EnsureJackZombieSpawnersRunning(resolved);
     }
 
@@ -258,6 +322,30 @@ public sealed class EnvTrainingConfig : MonoBehaviour
         if (resolved != EnvTrainingTask.JackZombie)
         {
             StopJackZombieSpawnersInThisEnv();
+            return;
+        }
+
+        // Меню K: оба домовых спавнера active; hills off. Спавн — ForceStart (по 1 из дома).
+        if (TrainingEnvSpace.IsDebugEnvFocusActive)
+        {
+            var debugSpawners = GetComponentsInChildren<ZombieSpawner>(true);
+            for (int i = 0; i < debugSpawners.Length; i++)
+            {
+                var spawner = debugSpawners[i];
+                if (spawner == null)
+                    continue;
+                string n = spawner.gameObject.name;
+                if (n.IndexOf("Hills", System.StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    spawner.ClearZombies(scanOrphanRoots: false);
+                    if (spawner.gameObject.activeSelf)
+                        spawner.gameObject.SetActive(false);
+                    continue;
+                }
+
+                if (!spawner.gameObject.activeSelf)
+                    spawner.gameObject.SetActive(true);
+            }
             return;
         }
 
@@ -339,6 +427,14 @@ public sealed class EnvTrainingConfig : MonoBehaviour
 
         if (TrainingEnvSpace.IsStreamOnlyMode && TrainingEnvSpace.IsPresentationEnv(transform))
         {
+            // Jack-only stream: не показывать/не регистрировать Lily/George.
+            if (IsJackOnlyTasksMode())
+            {
+                var jackTask = ResolveTask();
+                ApplyAgentRoles(jackTask);
+                ApplyAgentVisibility(jackTask);
+                return;
+            }
             ApplyAgentVisibility(EnvTrainingTask.PresentationFull);
             return;
         }
@@ -354,9 +450,10 @@ public sealed class EnvTrainingConfig : MonoBehaviour
         CommitBoostTaskIfNeeded();
         var resolved = ResolveTask();
         ApplyTrainingCampfire(resolved);
-        ApplyAgentVisibility(resolved);
-        if (TrainingEnvSpace.IsMlAgentsTrainingActive())
+        bool applyRoles = TrainingEnvSpace.IsMlAgentsTrainingActive() || IsJackOnlyTasksMode();
+        if (applyRoles)
             ApplyAgentRoles(resolved);
+        ApplyAgentVisibility(resolved);
     }
 
     void EnsureHeroCache()
@@ -519,19 +616,24 @@ public sealed class EnvTrainingConfig : MonoBehaviour
 
     void ApplyAgentRoles(EnvTrainingTask resolved)
     {
-        if (!TrainingEnvSpace.IsMlAgentsTrainingActive())
+        bool debugView = TrainingEnvSpace.IsDebugEnvFocusActive;
+        bool mlTraining = TrainingEnvSpace.IsMlAgentsTrainingActive();
+        bool jackOnly = IsJackOnlyTasksMode();
+        // Play без mlagents: всё равно HeuristicOnly + DecisionRequester для ручного WASD.
+        if (!mlTraining && !debugView && !jackOnly)
             return;
         // Presentation worker тоже Default+train (пока нет sentis hot reload на сервере).
         if (TrainingEnvSpace.IsPresentationWorkerProcess
-            && resolved != EnvTrainingTask.PresentationFull)
+            && resolved != EnvTrainingTask.PresentationFull
+            && !jackOnly)
             return;
 
         var agents = GetComponentsInChildren<AgentGoToHouseDiscrete>(true);
         for (int i = 0; i < agents.Length; i++)
         {
             var agent = agents[i];
-            if (agent == null || !agent.gameObject.activeInHierarchy
-                || TwitchEphemeralEffects.IsTwitchClone(agent))
+            // Включая неактивных: иначе после Hide ролей Default так и остаётся.
+            if (agent == null || TwitchEphemeralEffects.IsTwitchClone(agent))
                 continue;
 
             var role = TrainingEnvSpace.IsGeorgeAgent(agent)
@@ -539,19 +641,26 @@ public sealed class EnvTrainingConfig : MonoBehaviour
                 : EnvTrainingAgentRole.Jack;
             if (agent.gameObject.name == "Jack" || agent.gameObject.name == "George")
                 continue;
-            SetAgentTrainingEnabled(agent, ShouldAgentTrain(resolved, role));
+            bool should = ShouldAgentTrain(resolved, role);
+            if (debugView && !mlTraining && !jackOnly)
+                SetAgentHeuristicPlayEnabled(agent, should);
+            else
+                SetAgentTrainingEnabled(agent, should);
         }
 
         var lilies = GetComponentsInChildren<LilyScript>(true);
         for (int i = 0; i < lilies.Length; i++)
         {
             var lily = lilies[i];
-            if (lily == null || !lily.gameObject.activeInHierarchy
-                || TwitchEphemeralEffects.IsTwitchClone(lily)
+            if (lily == null || TwitchEphemeralEffects.IsTwitchClone(lily)
                 || lily.gameObject.name == "Lily")
                 continue;
 
-            SetAgentTrainingEnabled(lily, ShouldAgentTrain(resolved, EnvTrainingAgentRole.Lily));
+            bool should = ShouldAgentTrain(resolved, EnvTrainingAgentRole.Lily);
+            if (debugView && !mlTraining && !jackOnly)
+                SetAgentHeuristicPlayEnabled(lily, should);
+            else
+                SetAgentTrainingEnabled(lily, should);
         }
     }
 
@@ -562,9 +671,23 @@ public sealed class EnvTrainingConfig : MonoBehaviour
             return;
 
         bp.BehaviorType = train ? BehaviorType.Default : BehaviorType.HeuristicOnly;
+        agent.enabled = train;
         var dr = agent.GetComponent<DecisionRequester>();
         if (dr != null)
             dr.enabled = train;
+    }
+
+    /// <summary>Play + меню K: HeuristicOnly и DecisionRequester, иначе WASD не доходит до OnActionReceived.</summary>
+    static void SetAgentHeuristicPlayEnabled(Agent agent, bool enableControl)
+    {
+        var bp = agent.GetComponent<BehaviorParameters>();
+        if (bp != null)
+            bp.BehaviorType = BehaviorType.HeuristicOnly;
+        var dr = agent.GetComponent<DecisionRequester>();
+        if (dr == null)
+            return;
+        dr.enabled = enableControl;
+        dr.DecisionPeriod = 1;
     }
 
     void ApplyTrainingCampfire(EnvTrainingTask resolved)

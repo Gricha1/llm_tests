@@ -23,7 +23,7 @@ public sealed class ZombieAmbienceAudio : MonoBehaviour
         if (!TrainingEnvSpace.ShouldPlayAmbientAudio())
             return;
 
-        if (FindObjectOfType<ZombieAmbienceAudio>() != null)
+        if (FindFirstObjectByType<ZombieAmbienceAudio>() != null)
             return;
 
         var go = new GameObject(nameof(ZombieAmbienceAudio));

@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using UnityEngine;
+using UnityEngine.EventSystems;
 using UnityEngine.SceneManagement;
 
 /// <summary>
@@ -46,6 +47,33 @@ public static class TrainingEnvSpace
 
     public static bool IsStreamOnlyMode => _runMode == EnvRunMode.StreamOnly;
     public static string StreamWeightsDirectory => _streamWeightsDirectory;
+
+    /// <summary>
+    /// Validate / mlagents --inference: PresentationFull без MaxStep (бесконечный эпизод для видео).
+    /// Train — наоборот, с лимитом шагов.
+    /// </summary>
+    public static bool IsValidateOrInferenceMode
+    {
+        get
+        {
+            if (IsTruthyEnv(System.Environment.GetEnvironmentVariable("FOREST_INFERENCE")))
+                return true;
+            if (IsTruthyEnv(System.Environment.GetEnvironmentVariable("FOREST_VALIDATE")))
+                return true;
+            foreach (var arg in System.Environment.GetCommandLineArgs())
+            {
+                if (arg == "-forestValidate" || arg == "--forest-validate"
+                    || arg == "-forestInference" || arg == "--forest-inference")
+                    return true;
+            }
+            return false;
+        }
+    }
+
+    /// <summary>Стрим или validate: PresentationFull без обрыва по MaxStep.</summary>
+    public static bool AllowInfinitePresentationEpisode =>
+        IsStreamOnlyMode || IsValidateOrInferenceMode;
+
     public static bool IsTrainCopiesOnlyMode => _runMode == EnvRunMode.TrainCopiesOnly;
     public static bool IsSingleEnvByPortMode => _runMode == EnvRunMode.SingleEnvByPort;
     public static int SingleEnvWorkerCopyIndex => _singleEnvTaskCopyIndex;
@@ -226,10 +254,19 @@ public static class TrainingEnvSpace
         if (worker < 0)
             return -1;
 
+        // Jack-only: worker = слот задачи (0…29 → wood/food/water/zombie 2:1:2:2).
+        if (EnvTrainingConfig.IsJackOnlyTasksMode())
+        {
+            const int MaxJackWorker = 63;
+            if (worker > MaxJackWorker)
+                return -1;
+            return worker;
+        }
+
         if (_presentationWorkerZero)
         {
-            // Train: worker 0 = PresentationFull, 1–11 = узкие,
-            // 12+ = boost (низкий SR, слоты циклом по 4 слабым задачам).
+            // Train: worker 0 = PresentationFull (как стрим), 1 = PresentationFull train,
+            // 2–12 = узкие, 13+ = фиксированный буст.
             // Stream — отдельный процесс (не в num-envs).
             const int MaxTrainWorker = 63;
             if (worker < 0 || worker > MaxTrainWorker)
@@ -301,6 +338,8 @@ public static class TrainingEnvSpace
                 var cfg = presentation.GetComponent<EnvTrainingConfig>();
                 if (cfg == null)
                     cfg = presentation.gameObject.AddComponent<EnvTrainingConfig>();
+                // До первого шага Academy: выключить Lily/George (Jack-only yaml).
+                cfg.ForceApplyTaskSetup();
                 Debug.Log($"[TrainingEnvSpace] SingleEnvByPort worker={_singleEnvWorkerIndex} copyIndex={_singleEnvTaskCopyIndex} presentation={IsPresentationWorkerProcess} fullTrain={IsPresentationFullTrainWorker} task={cfg.ResolveTask()} weightsDir={_streamWeightsDirectory ?? "(none)"}");
             }
 
@@ -383,19 +422,50 @@ public static class TrainingEnvSpace
         SetParallelEnvsVisible(!_parallelEnvsVisible);
     }
 
+    /// <summary>
+    /// Меню K / #menu / #env_N: Editor, train+presentation и стрим OBS.
+    /// В StreamOnly раньше было выключено — из‑за этого #add_fire работал, а #menu/#env_N нет.
+    /// </summary>
     public static bool IsEnvViewSwitcherAllowed() =>
-        _runMode == EnvRunMode.All || _runMode == EnvRunMode.TrainWithPresentation;
+        _runMode == EnvRunMode.All
+        || _runMode == EnvRunMode.TrainWithPresentation
+        || _runMode == EnvRunMode.StreamOnly;
 
     public static bool IsDebugEnvFocusActive => _debugFocusedCopyIndex >= 0;
 
     public static int DebugFocusedCopyIndex => _debugFocusedCopyIndex;
+
+    /// <summary>Меню K смотрит JackZombie (#env_5) — домовые спавнеры могут досыпать.</summary>
+    public static bool IsJackZombieDebugFocus =>
+        IsDebugEnvFocusActive && IsJackZombieCopyIndex(_debugFocusedCopyIndex);
+
+    /// <summary>Корень Env под фокусом меню K / #env_N, иначе null.</summary>
+    public static Transform GetDebugFocusedEnvRoot()
+    {
+        if (_debugFocusedCopyIndex < 0)
+            return null;
+        return FindEnvByCopyIndex(_debugFocusedCopyIndex);
+    }
 
     public static Transform FindEnvByCopyIndex(int copyIndex)
     {
         if (copyIndex <= 0)
             return PresentationRoot;
 
+        // Env 1 = PresentationFull — тот же мир, что Env 0. Клон только жрёт FPS.
+        if (IsPresentationFullViewIndex(copyIndex))
+            return PresentationRoot;
+
         return FindEnvRootByName($"Env ({copyIndex})");
+    }
+
+    /// <summary>Просмотр PresentationFull без Instantiation полной копии Env.</summary>
+    public static bool IsPresentationFullViewIndex(int copyIndex)
+    {
+        if (copyIndex < 0)
+            return false;
+        return EnvTrainingConfig.ResolveAutoTaskForCopyIndex(copyIndex)
+            == EnvTrainingTask.PresentationFull;
     }
 
     public static void EnsureTrainEnvCopiesForViewing(int trainCopyCount = 11)
@@ -415,6 +485,8 @@ public static class TrainingEnvSpace
     {
         if (!IsEnvViewSwitcherAllowed() || copyIndex <= 0)
             return;
+        if (IsPresentationFullViewIndex(copyIndex))
+            return;
 
         var presentation = ResolvePresentationRoot();
         if (presentation == null)
@@ -424,11 +496,12 @@ public static class TrainingEnvSpace
         if (FindEnvRootByName(copyName) != null)
             return;
 
-        const float spacing = 300f;
+        // Сразу на месте presentation: иначе овцы спавнятся на +300*N и после переноса
+        // бегут «вправо» к старому spawnCenter.
         var clone = InstantiateEnvCopy(
             presentation,
             copyName,
-            presentation.position + new Vector3(copyIndex * spacing, -400f, 0f));
+            presentation.position);
         if (clone == null)
             return;
 
@@ -448,21 +521,30 @@ public static class TrainingEnvSpace
         if (!IsEnvViewSwitcherAllowed())
             return;
 
-        // Сменить среду → убрать зомби со всех Env (иначе остаются с JackZombie).
+        // Сменить среду → убрать зомби только если уходим/заходим в JackZombie
+        // (иначе Clear+FindObjects на каждом #env_1 = лишний hitch).
         PresentationEnvSwitcher.CancelDelayedZombieSpawnerStart();
-        ZombieSpawner.ClearZombiesInAllEnvs();
+        int prevFocus = _debugFocusedCopyIndex;
+        // Смена среды: сбросить #size/#speed (иначе «прилипает» к presentation Jack).
+        if (prevFocus != copyIndex)
+            TwitchEphemeralEffects.ResetAllJackBodyFx();
 
-        if (copyIndex > 0)
+        bool clearZombies =
+            IsJackZombieCopyIndex(prevFocus) || IsJackZombieCopyIndex(copyIndex);
+        if (clearZombies)
+            ZombieSpawner.ClearZombiesInAllEnvs();
+
+        bool viewOnPresentation = IsPresentationFullViewIndex(copyIndex);
+        if (copyIndex > 0 && !viewOnPresentation)
             EnsureSingleTrainEnvCopyForViewing(copyIndex);
 
-        // Сначала вернуть все Env в active — иначе Find/Setup не найдут выключенные.
-        if (_debugFocusedCopyIndex >= 0 || copyIndex < 0)
+        // Не поднимаем ВСЕ Env: массовый SetActive → OnEnable/Update всех копий = hitch.
+        // Достаточно целевой (и presentation при выходе из фокуса).
+        if (copyIndex < 0 || viewOnPresentation)
         {
-            foreach (var envRoot in FindAllEnvRoots())
-            {
-                if (envRoot != null && !envRoot.gameObject.activeSelf)
-                    envRoot.gameObject.SetActive(true);
-            }
+            var presentation = PresentationRoot;
+            if (presentation != null && !presentation.gameObject.activeSelf)
+                presentation.gameObject.SetActive(true);
         }
 
         _debugFocusedCopyIndex = copyIndex;
@@ -472,44 +554,301 @@ public static class TrainingEnvSpace
             var env = FindEnvByCopyIndex(copyIndex);
             var presentation = PresentationRoot;
             // Просмотр: копия на месте presentation, иначе камера/мир «пустые», а Env (N) уезжает на -400Y.
-            if (copyIndex > 0 && env != null && presentation != null)
-                env.position = presentation.position;
+            // CharacterController не следует за parent.position — без Resync Jack «пропадает».
+            if (!viewOnPresentation && copyIndex > 0 && env != null && presentation != null)
+            {
+                MoveEnvRootKeepingCharacterControllers(env, presentation.position);
+                RepairDetachedHeroesInEnv(env);
+                // Старые клоны с offset + овцы с world-центром справа.
+                var sheepFix = env.GetComponentInChildren<SheepSpawner>(true);
+                sheepFix?.RefreshSpawnAreas();
+            }
 
             if (env != null)
             {
                 if (!env.gameObject.activeSelf)
                     env.gameObject.SetActive(true);
                 var cfg = env.GetComponent<EnvTrainingConfig>();
-                cfg?.ForceApplyTaskSetup();
-                JointEpisodeReset.EndAllAgentEpisodes(env);
-                var trees = env.GetComponentInChildren<TreeSpawner>(true);
-                var sheep = env.GetComponentInChildren<SheepSpawner>(true);
-                trees?.ResetTrees();
-                sheep?.ResetSheep();
 
-                // JackZombie: спавнеры в сцене выключены — явно поднять оба после фокуса.
-                // EndEpisode у ML-Agents часто откладывает OnEpisodeBegin на следующий шаг —
-                // поэтому ещё раз через кадр (иначе Stop/Clear успевает снести спавн).
-                if (cfg != null && cfg.ResolveJackMode() == JackTrainingMode.ZombieOnly)
+                // Env 0/1 = один и тот же PresentationRoot: без EndEpisode/ResetTrees (это и есть лаг).
+                if (viewOnPresentation && env == presentation)
                 {
-                    ForceStartJackZombieSpawners(env);
-                    var switcher = Object.FindObjectOfType<PresentationEnvSwitcher>();
-                    if (switcher != null)
-                        switcher.RequestDelayedZombieSpawnerStart(env);
+                    cfg?.ForceApplyTaskSetup();
+                    Debug.Log(
+                        $"[EnvSwitcher] focus={copyIndex} task={cfg?.ResolveTask()} " +
+                        $"(presentation, без клона)");
                 }
+                else
+                {
+                    cfg?.ForceApplyTaskSetup();
+                    // JackZombie: без ResetTrees/Sheep — лишний hitch, деревья для задачи не нужны.
+                    if (cfg == null || cfg.ResolveJackMode() != JackTrainingMode.ZombieOnly)
+                    {
+                        var trees = env.GetComponentInChildren<TreeSpawner>(true);
+                        var sheep = env.GetComponentInChildren<SheepSpawner>(true);
+                        if (trees != null && trees.AliveCount <= 0)
+                            trees.ResetTrees();
+                        if (sheep != null && sheep.AliveCount <= 0)
+                            sheep.ResetSheep();
+                    }
 
-                Debug.Log(
-                    $"[EnvSwitcher] focus={copyIndex} task={cfg?.ResolveTask()} " +
-                    $"jackMode={cfg?.ResolveJackMode()} " +
-                    $"trees={trees?.AliveCount}/{trees?.TargetCount} " +
-                    $"sheep={sheep?.AliveCount}/{sheep?.TargetCount}");
+                    Debug.Log(
+                        $"[EnvSwitcher] focus={copyIndex} task={cfg?.ResolveTask()} " +
+                        $"jackMode={cfg?.ResolveJackMode()}");
+                }
             }
         }
 
         InvalidateEnvCountsCache();
         CacheEnvCounts();
         ApplyParallelEnvPresentation();
-        SetCamAbSwitcherEnabled(copyIndex <= 0);
+        // CamAbSwitcher только на env 0 (валидация/стрим со звуком).
+        SetCamAbSwitcherEnabled(copyIndex == 0);
+        EnsureSingleActiveEventSystem();
+
+        // Не копить Env (2)+Env (3)+… в памяти — отсюда лаги после нескольких переключений.
+        if (copyIndex > 1)
+            UnloadOtherTrainEnvCopies(copyIndex);
+
+        // Зомби — ПОСЛЕ ApplyParallel (Env активен).
+        if (IsJackZombieCopyIndex(copyIndex))
+        {
+            var zombieEnv = FindEnvByCopyIndex(copyIndex);
+            ForceStartJackZombieSpawners(zombieEnv);
+        }
+
+        EnsureActiveViewCamera();
+    }
+
+    /// <summary>Удалить чужие train-копии Env (N), кроме focused — меньше RAM/CPU.</summary>
+    static void UnloadOtherTrainEnvCopies(int keepCopyIndex)
+    {
+        foreach (var envRoot in FindAllEnvRoots())
+        {
+            if (envRoot == null)
+                continue;
+            int idx = GetEnvCopyIndex(envRoot);
+            if (idx <= 1)
+                continue;
+            if (idx == keepCopyIndex)
+                continue;
+            Object.Destroy(envRoot.gameObject);
+        }
+
+        InvalidateEnvCountsCache();
+    }
+
+    /// <summary>
+    /// Сдвиг Env: CharacterController (enabled) не едет с родителем.
+    /// Только выключаем CC → двигаем Env → включаем обратно.
+    /// Нельзя SetPositionAndRotation по InverseTransform — при «отлипших» CC
+    /// получаются огромные координаты → Invalid localAABB / worldAABB.
+    /// </summary>
+    static void MoveEnvRootKeepingCharacterControllers(Transform env, Vector3 worldPos)
+    {
+        if (env == null)
+            return;
+        if ((env.position - worldPos).sqrMagnitude < 0.0001f)
+            return;
+
+        var ccs = env.GetComponentsInChildren<CharacterController>(true);
+        var wasEnabled = new bool[ccs.Length];
+        for (int i = 0; i < ccs.Length; i++)
+        {
+            if (ccs[i] == null)
+                continue;
+            wasEnabled[i] = ccs[i].enabled;
+            ccs[i].enabled = false;
+        }
+
+        env.position = worldPos;
+
+        for (int i = 0; i < ccs.Length; i++)
+        {
+            if (ccs[i] == null)
+                continue;
+            ccs[i].enabled = wasEnabled[i];
+        }
+    }
+
+    /// <summary>Если герой уже «отлип» от Env (после старого бага) — вернуть в зону спавна.</summary>
+    static void RepairDetachedHeroesInEnv(Transform env)
+    {
+        if (env == null)
+            return;
+
+        const float maxDist = 80f;
+        float maxDistSq = maxDist * maxDist;
+        // Как в OnEpisodeBegin у Jack — центр поляны.
+        var jackLocal = new Vector3(6f, -5.228786f, 13.5f);
+
+        void Snap(Transform agent, Vector3 local)
+        {
+            if (agent == null || !agent.gameObject.activeInHierarchy)
+                return;
+            if ((agent.position - env.position).sqrMagnitude <= maxDistSq
+                && IsFinite(agent.position))
+                return;
+
+            var cc = agent.GetComponent<CharacterController>();
+            bool on = cc != null && cc.enabled;
+            if (cc != null)
+                cc.enabled = false;
+            var world = env.TransformPoint(local);
+            if (!IsFinite(world))
+                world = env.position + Vector3.up;
+            agent.SetPositionAndRotation(world, env.rotation);
+            if (cc != null)
+                cc.enabled = on;
+        }
+
+        var agents = env.GetComponentsInChildren<AgentGoToHouseDiscrete>(true);
+        for (int i = 0; i < agents.Length; i++)
+        {
+            var a = agents[i];
+            if (a == null || TwitchEphemeralEffects.IsTwitchClone(a)
+                || a.gameObject.name == "Jack" || a.gameObject.name == "George")
+                continue;
+            Snap(a.transform, jackLocal);
+        }
+
+        var lilies = env.GetComponentsInChildren<LilyScript>(true);
+        for (int i = 0; i < lilies.Length; i++)
+        {
+            var lily = lilies[i];
+            if (lily == null || TwitchEphemeralEffects.IsTwitchClone(lily)
+                || lily.gameObject.name == "Lily")
+                continue;
+            Snap(lily.transform, jackLocal);
+        }
+    }
+
+    static bool IsFinite(Vector3 v) =>
+        !(float.IsNaN(v.x) || float.IsNaN(v.y) || float.IsNaN(v.z)
+          || float.IsInfinity(v.x) || float.IsInfinity(v.y) || float.IsInfinity(v.z)
+          || Mathf.Abs(v.x) > 100000f || Mathf.Abs(v.y) > 100000f || Mathf.Abs(v.z) > 100000f);
+
+    /// <summary>
+    /// Ровно одна камера в focused Env.
+    /// AudioListener — только для env 0 (валидация); train env 1+ без звука.
+    /// </summary>
+    static void EnsureSingleCameraAndListener(Transform envRoot, bool enableAudio)
+    {
+        if (envRoot == null)
+            return;
+
+        Camera keepCam = null;
+        var cams = envRoot.GetComponentsInChildren<Camera>(true);
+        for (int i = 0; i < cams.Length; i++)
+        {
+            var cam = cams[i];
+            if (cam == null)
+                continue;
+            string n = cam.gameObject.name;
+            if (n.IndexOf("CamA", System.StringComparison.OrdinalIgnoreCase) >= 0
+                || n.IndexOf("Main Camera", System.StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                keepCam = cam;
+                break;
+            }
+        }
+
+        if (keepCam == null)
+        {
+            for (int i = 0; i < cams.Length; i++)
+            {
+                if (cams[i] != null)
+                {
+                    keepCam = cams[i];
+                    break;
+                }
+            }
+        }
+
+        for (int i = 0; i < cams.Length; i++)
+        {
+            var cam = cams[i];
+            if (cam == null)
+                continue;
+            bool keep = keepCam != null && cam == keepCam;
+            if (keep && !cam.gameObject.activeSelf)
+                cam.gameObject.SetActive(true);
+            cam.enabled = keep;
+        }
+
+        // Все слушатели в сцене сначала гасим — иначе при смене Env остаются 0 или 2+.
+        var allListeners = Object.FindObjectsByType<AudioListener>(
+            FindObjectsInactive.Include, FindObjectsSortMode.None);
+        for (int i = 0; i < allListeners.Length; i++)
+        {
+            if (allListeners[i] != null)
+                allListeners[i].enabled = false;
+        }
+
+        // Всегда ровно один AudioListener (иначе Unity спамит «no audio listeners»).
+        // Train env 1+: listener есть, volume=0 + mute источников.
+        AudioListener keepListener = null;
+        if (keepCam != null)
+        {
+            keepListener = keepCam.GetComponent<AudioListener>();
+            if (keepListener == null)
+                keepListener = keepCam.gameObject.AddComponent<AudioListener>();
+        }
+        else
+        {
+            keepListener = envRoot.GetComponent<AudioListener>();
+            if (keepListener == null)
+                keepListener = envRoot.gameObject.AddComponent<AudioListener>();
+        }
+
+        keepListener.enabled = true;
+        // Headless: volume=0 и pause — иначе следующий кадр снова слышно до LateUpdate silence.
+        if (IsHeadlessTrainWorkerProcess)
+            enableAudio = false;
+        AudioListener.volume = enableAudio ? 1f : 0f;
+        AudioListener.pause = !enableAudio;
+    }
+
+    /// <summary>Камера+listener на текущей среде просмотра (после #reset / если Display пустой).</summary>
+    public static void EnsureActiveViewCamera()
+    {
+        var root = ActiveViewEnvRoot ?? PresentationRoot;
+        if (root == null)
+            return;
+        if (!root.gameObject.activeSelf)
+            root.gameObject.SetActive(true);
+        EnsureSingleCameraAndListener(root, enableAudio: WantAudioForFocusedEnv());
+        if (WantAudioForFocusedEnv())
+            UnmuteFocusedEnvAudioSources(root);
+        else
+            MuteFocusedEnvAudioSources(root);
+    }
+
+    /// <summary>Jack для hotkeys/#команд: сначала текущая среда меню K, иначе presentation.</summary>
+    public static AgentGoToHouseDiscrete FindViewJack(bool preferActiveInHierarchy = true)
+    {
+        var env = ActiveViewEnvRoot ?? PresentationRoot;
+        var jack = FindPrimaryJackInEnv(env);
+        if (jack != null)
+        {
+            if (!preferActiveInHierarchy || jack.gameObject.activeInHierarchy)
+                return jack;
+        }
+
+        jack = FindPresentationPrimaryJack();
+        if (jack != null && (!preferActiveInHierarchy || jack.gameObject.activeInHierarchy))
+            return jack;
+
+        return FindPresentationJack();
+    }
+
+    /// <summary>Звук только на env 0 (валидация/стрим). Headless train — никогда.</summary>
+    public static bool WantAudioForFocusedEnv()
+    {
+        if (IsHeadlessTrainWorkerProcess)
+            return false;
+        return _debugFocusedCopyIndex == 0
+            || (_debugFocusedCopyIndex < 0 && !IsMlAgentsTrainingActive());
     }
 
     public static void ForceStartJackZombieSpawners(Transform env)
@@ -517,34 +856,108 @@ public static class TrainingEnvSpace
         if (env == null)
             return;
 
-        var cfg = env.GetComponent<EnvTrainingConfig>();
-        int immediate = cfg != null ? Mathf.Max(1, cfg.ZombieImmediateSpawnCount) : 2;
-
-        var jacks = env.GetComponentsInChildren<AgentGoToHouseDiscrete>(true);
-        for (int i = 0; i < jacks.Length; i++)
+        if (!IsDebugEnvFocusActive)
         {
-            var jack = jacks[i];
-            if (jack == null || IsGeorgeAgent(jack) || TwitchEphemeralEffects.IsTwitchClone(jack))
-                continue;
-            if (!jack.gameObject.activeInHierarchy)
-                continue;
-            jack.ForceStartZombieSpawnersForDebug();
-            break;
+            var jacks = env.GetComponentsInChildren<AgentGoToHouseDiscrete>(true);
+            for (int i = 0; i < jacks.Length; i++)
+            {
+                var jack = jacks[i];
+                if (jack == null || IsGeorgeAgent(jack) || TwitchEphemeralEffects.IsTwitchClone(jack))
+                    continue;
+                if (!jack.gameObject.activeInHierarchy)
+                    continue;
+                jack.ForceStartZombieSpawnersForDebug();
+                break;
+            }
+            return;
         }
 
-        // Всегда дожимаем спавнеры в Env (на случай если Jack ещё не в ZombieOnly).
-        var spawners = env.GetComponentsInChildren<ZombieSpawner>(true);
-        for (int i = 0; i < spawners.Length; i++)
+        // Меню K: оба домовых спавнера (ZombieSpawner + ZombieSpawner_2), по 1 зомби из дома.
+        // Hills не трогаем. Не спавним «у Jack» — точка спавна = дом.
+        var houseSpawners = FindHouseZombieSpawners(env);
+        if (houseSpawners.Count == 0)
         {
-            var spawner = spawners[i];
+            Debug.LogError($"[JackZombie] в {env.name} нет домовых ZombieSpawner — зомби не появятся.");
+            return;
+        }
+
+        int total = 0;
+        for (int i = 0; i < houseSpawners.Count; i++)
+        {
+            var spawner = houseSpawners[i];
             if (spawner == null)
-                continue;
-            if (spawner.gameObject.name.IndexOf("Hills", System.StringComparison.OrdinalIgnoreCase) >= 0)
                 continue;
             if (!spawner.gameObject.activeSelf)
                 spawner.gameObject.SetActive(true);
-            spawner.StartTrainingEpisode(immediate);
+            if (spawner.AliveCount > 0)
+            {
+                total += spawner.AliveCount;
+                continue;
+            }
+
+            int spawned = spawner.StartTrainingEpisode(1);
+            total += spawner.AliveCount;
+            if (spawned <= 0)
+                Debug.LogWarning($"[JackZombie] {spawner.name} не создал зомби (prefab?)", spawner);
         }
+
+        Debug.Log(
+            $"[JackZombie] {env.name}: домов={houseSpawners.Count}, зомби={total} (по 1 из каждого дома)");
+    }
+
+    /// <summary>ZombieSpawner + ZombieSpawner_2 у домов; без hills.</summary>
+    static System.Collections.Generic.List<ZombieSpawner> FindHouseZombieSpawners(Transform env)
+    {
+        var list = new System.Collections.Generic.List<ZombieSpawner>(2);
+        if (env == null)
+            return list;
+
+        var spawners = env.GetComponentsInChildren<ZombieSpawner>(true);
+        ZombieSpawner primary = null;
+        ZombieSpawner secondary = null;
+        for (int i = 0; i < spawners.Length; i++)
+        {
+            var s = spawners[i];
+            if (s == null)
+                continue;
+            string n = s.gameObject.name;
+            if (n.IndexOf("Hills", System.StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                s.ClearZombies(scanOrphanRoots: false);
+                if (s.gameObject.activeSelf)
+                    s.gameObject.SetActive(false);
+                continue;
+            }
+
+            if (string.Equals(n, "ZombieSpawner", System.StringComparison.OrdinalIgnoreCase))
+                primary = s;
+            else if (string.Equals(n, "ZombieSpawner_2", System.StringComparison.OrdinalIgnoreCase)
+                     || string.Equals(n, "zombie_spawner_2", System.StringComparison.OrdinalIgnoreCase))
+                secondary = s;
+        }
+
+        if (primary != null)
+            list.Add(primary);
+        if (secondary != null)
+            list.Add(secondary);
+
+        // Fallback: любые не-hills, если имена другие.
+        if (list.Count == 0)
+        {
+            for (int i = 0; i < spawners.Length; i++)
+            {
+                var s = spawners[i];
+                if (s == null)
+                    continue;
+                if (s.gameObject.name.IndexOf("Hills", System.StringComparison.OrdinalIgnoreCase) >= 0)
+                    continue;
+                list.Add(s);
+                if (list.Count >= 2)
+                    break;
+            }
+        }
+
+        return list;
     }
 
     /// <summary>Env, на которую смотрим: фокус из меню K, иначе presentation.</summary>
@@ -582,6 +995,14 @@ public static class TrainingEnvSpace
     }
 
     public static void ClearDebugFocusedEnv() => SetDebugFocusedEnv(-1);
+
+    static bool IsJackZombieCopyIndex(int copyIndex)
+    {
+        if (copyIndex < 0)
+            return false;
+        return EnvTrainingConfig.ResolveAutoTaskForCopyIndex(copyIndex)
+            == EnvTrainingTask.JackZombie;
+    }
 
     static void SetCamAbSwitcherEnabled(bool enabled)
     {
@@ -672,19 +1093,44 @@ public static class TrainingEnvSpace
         if (_debugFocusedCopyIndex >= 0 && IsEnvViewSwitcherAllowed())
         {
             var focused = FindEnvByCopyIndex(_debugFocusedCopyIndex);
+            // Копия удалена (Unload) / сброс — иначе все Env выключатся → No cameras rendering.
+            if (focused == null)
+            {
+                _debugFocusedCopyIndex = 0;
+                focused = PresentationRoot;
+                if (focused != null && !focused.gameObject.activeSelf)
+                    focused.gameObject.SetActive(true);
+            }
+
+            bool anyCamera = false;
             foreach (var envRoot in FindAllEnvRoots())
             {
                 if (envRoot == null)
                     continue;
 
                 bool isFocused = envRoot == focused;
-                // Полностью выключаем чужие Env — иначе Mute гасит рендереры,
-                // а TreeSpawner/агенты продолжают Update и жрут FPS.
                 if (envRoot.gameObject.activeSelf != isFocused)
                     envRoot.gameObject.SetActive(isFocused);
 
                 if (isFocused)
-                    UnmuteEnvPresentation(envRoot, enableCameraAndAudio: true);
+                {
+                    bool wantAudio = WantAudioForFocusedEnv();
+                    EnsureSingleCameraAndListener(envRoot, enableAudio: wantAudio);
+                    if (!wantAudio)
+                        MuteFocusedEnvAudioSources(envRoot);
+                    else
+                        UnmuteFocusedEnvAudioSources(envRoot);
+                    anyCamera = true;
+                }
+            }
+
+            if (!anyCamera && PresentationRoot != null)
+            {
+                _debugFocusedCopyIndex = 0;
+                if (!PresentationRoot.gameObject.activeSelf)
+                    PresentationRoot.gameObject.SetActive(true);
+                EnsureSingleCameraAndListener(PresentationRoot, enableAudio: true);
+                UnmuteFocusedEnvAudioSources(PresentationRoot);
             }
 
             return;
@@ -804,6 +1250,10 @@ public static class TrainingEnvSpace
 
     public static bool IsPresentationTransform(Transform t)
     {
+        // Jack-only / all-headless: Env = PresentationRoot по слоту, но это train — не стрим.
+        if (IsHeadlessTrainWorkerProcess)
+            return false;
+
         if (t == null)
             return !IsMlAgentsTrainingActive();
 
@@ -833,6 +1283,8 @@ public static class TrainingEnvSpace
     {
         if (IsHeadlessTrainWorkerProcess)
             return false;
+        if (!WantAudioForFocusedEnv())
+            return false;
 
         if ((IsTrainCopiesOnlyMode || IsSingleEnvByPortMode) && !IsPresentationWorkerProcess)
             return false;
@@ -847,14 +1299,17 @@ public static class TrainingEnvSpace
 
     public static bool ShouldPlayAmbientAudio() =>
         !IsHeadlessTrainWorkerProcess
-        && (IsPresentationWorkerProcess
+        && WantAudioForFocusedEnv()
+        && (IsStreamOnlyMode
+            || IsPresentationWorkerProcess
+            || IsLivePresentationForObs
             || (!IsTrainCopiesOnlyMode && !IsSingleEnvByPortMode));
 
     public static T FindInPresentation<T>() where T : Component
     {
         var root = PresentationRoot;
         if (root == null)
-            return Object.FindObjectOfType<T>();
+            return Object.FindFirstObjectByType<T>();
 
         T inactiveFallback = null;
         foreach (var c in root.GetComponentsInChildren<T>(true))
@@ -891,8 +1346,8 @@ public static class TrainingEnvSpace
         var root = ActiveViewEnvRoot;
         if (root == null)
         {
-            _cachedLily = Object.FindObjectOfType<LilyScript>();
-            var anyJack = Object.FindObjectOfType<AgentGoToHouseDiscrete>();
+            _cachedLily = Object.FindFirstObjectByType<LilyScript>();
+            var anyJack = Object.FindFirstObjectByType<AgentGoToHouseDiscrete>();
             if (anyJack != null && !IsGeorgeAgent(anyJack))
                 _cachedFallbackJack = anyJack;
             return;
@@ -992,13 +1447,34 @@ public static class TrainingEnvSpace
         return null;
     }
 
+    /// <summary>Оригинальный Jack в указанном Env (включая inactive).</summary>
+    public static AgentGoToHouseDiscrete FindPrimaryJackInEnv(Transform envRoot)
+    {
+        if (envRoot == null)
+            return null;
+
+        var jacks = envRoot.GetComponentsInChildren<AgentGoToHouseDiscrete>(true);
+        for (int i = 0; i < jacks.Length; i++)
+        {
+            var jack = jacks[i];
+            if (jack == null || TwitchEphemeralEffects.IsTwitchClone(jack) || IsGeorgeAgent(jack))
+                continue;
+            if (jack.gameObject.name == "Jack")
+                continue;
+            return jack;
+        }
+
+        return FindFirstJackAgent(jacks);
+    }
+
     /// <summary>Оригинальный Jack (не Twitch-клон) в presentation Env.</summary>
     public static AgentGoToHouseDiscrete FindPresentationPrimaryJack()
     {
         var root = PresentationRoot;
         if (root == null)
         {
-            var all = Object.FindObjectsOfType<AgentGoToHouseDiscrete>();
+            var all = Object.FindObjectsByType<AgentGoToHouseDiscrete>(
+                FindObjectsInactive.Include, FindObjectsSortMode.None);
             for (int i = 0; i < all.Length; i++)
             {
                 if (all[i] != null && !TwitchEphemeralEffects.IsTwitchClone(all[i]) && !IsGeorgeAgent(all[i]))
@@ -1008,14 +1484,7 @@ public static class TrainingEnvSpace
             return FindFirstJackAgent(all);
         }
 
-        var jacks = root.GetComponentsInChildren<AgentGoToHouseDiscrete>(false);
-        for (int i = 0; i < jacks.Length; i++)
-        {
-            if (jacks[i] != null && !TwitchEphemeralEffects.IsTwitchClone(jacks[i]) && !IsGeorgeAgent(jacks[i]))
-                return jacks[i];
-        }
-
-        return FindFirstJackAgent(jacks);
+        return FindPrimaryJackInEnv(root);
     }
 
     public static AgentGoToHouseDiscrete FindPresentationGeorge()
@@ -1185,6 +1654,10 @@ public static class TrainingEnvSpace
             return null;
 
         var source = presentation.gameObject;
+        // Missing (Mono Script) на Env → при Instantiate сыпется
+        // "The referenced script ... Game Object '<null>'". Чистим источник в Editor.
+        StripMissingScriptsRecursive(source, "presentation Env before clone");
+
         bool sourceWasActive = source.activeSelf;
         source.SetActive(false);
 
@@ -1193,9 +1666,152 @@ public static class TrainingEnvSpace
         clone.transform.SetParent(null, true);
         clone.transform.position = worldPos;
 
+        StripMissingScriptsRecursive(clone, copyName);
+        // Клон Env тащит свой EventSystem → "There can be only one active Event System".
+        DisableEventSystemsUnder(clone.transform, destroy: true);
+
         source.SetActive(sourceWasActive);
         clone.SetActive(true);
+        EnsureSingleActiveEventSystem();
         return clone;
+    }
+
+    /// <summary>Оставляет один EventSystem (предпочтительно под presentation Env).</summary>
+    public static void EnsureSingleActiveEventSystem()
+    {
+        var systems = Object.FindObjectsByType<EventSystem>(FindObjectsInactive.Include, FindObjectsSortMode.None);
+        if (systems == null || systems.Length <= 1)
+            return;
+
+        EventSystem keep = null;
+        var presentation = PresentationRoot;
+        for (int i = 0; i < systems.Length; i++)
+        {
+            var es = systems[i];
+            if (es == null)
+                continue;
+            if (presentation != null && es.transform.IsChildOf(presentation))
+            {
+                keep = es;
+                break;
+            }
+        }
+
+        if (keep == null)
+        {
+            for (int i = 0; i < systems.Length; i++)
+            {
+                if (systems[i] != null && systems[i].isActiveAndEnabled)
+                {
+                    keep = systems[i];
+                    break;
+                }
+            }
+        }
+
+        if (keep == null)
+            keep = systems[0];
+
+        for (int i = 0; i < systems.Length; i++)
+        {
+            var es = systems[i];
+            if (es == null || es == keep)
+                continue;
+
+            // Копии Env: выключаем целиком GO, чтобы SetActive родителя не поднимал второй ES.
+            if (presentation != null && !es.transform.IsChildOf(presentation))
+            {
+                es.gameObject.SetActive(false);
+                es.enabled = false;
+            }
+            else
+            {
+                es.enabled = false;
+                es.gameObject.SetActive(false);
+            }
+        }
+
+        if (keep != null)
+        {
+            if (!keep.gameObject.activeSelf)
+                keep.gameObject.SetActive(true);
+            keep.enabled = true;
+        }
+    }
+
+    static void DisableEventSystemsUnder(Transform root, bool destroy)
+    {
+        if (root == null)
+            return;
+
+        var systems = root.GetComponentsInChildren<EventSystem>(true);
+        for (int i = 0; i < systems.Length; i++)
+        {
+            var es = systems[i];
+            if (es == null)
+                continue;
+            if (destroy)
+                Object.Destroy(es.gameObject);
+            else
+            {
+                es.enabled = false;
+                es.gameObject.SetActive(false);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Логирует объекты с missing script; в Editor ещё и снимает битые MonoBehaviour.
+    /// </summary>
+    static void StripMissingScriptsRecursive(GameObject root, string context)
+    {
+        if (root == null)
+            return;
+
+        var transforms = root.GetComponentsInChildren<Transform>(true);
+        for (int i = 0; i < transforms.Length; i++)
+        {
+            var t = transforms[i];
+            if (t == null)
+                continue;
+
+            var comps = t.GetComponents<Component>();
+            bool hasMissing = false;
+            for (int c = 0; c < comps.Length; c++)
+            {
+                if (comps[c] != null)
+                    continue;
+                hasMissing = true;
+                break;
+            }
+
+            if (!hasMissing)
+                continue;
+
+#if UNITY_EDITOR
+            int removed = UnityEditor.GameObjectUtility.RemoveMonoBehavioursWithMissingScript(t.gameObject);
+            if (removed > 0)
+                Debug.Log($"[TrainingEnvSpace] снято missing scripts×{removed} с '{GetTransformPath(t)}' ({context})");
+#else
+            Debug.LogWarning(
+                $"[TrainingEnvSpace] missing script на '{GetTransformPath(t)}' ({context}) — почини в Editor и пересобери билд.");
+#endif
+        }
+    }
+
+    static string GetTransformPath(Transform t)
+    {
+        if (t == null)
+            return "<null>";
+        var sb = new System.Text.StringBuilder(t.name);
+        var p = t.parent;
+        while (p != null)
+        {
+            sb.Insert(0, '/');
+            sb.Insert(0, p.name);
+            p = p.parent;
+        }
+        return sb.ToString();
     }
 
     static Transform FindEnvRootByName(string objectName)
@@ -1314,6 +1930,35 @@ public static class TrainingEnvSpace
         }
 
         WaterGoalPath.HideGoalsInEnv(envRoot);
+    }
+
+    /// <summary>Train-просмотр (env 1+): камера есть, источники звука молчат.</summary>
+    static void MuteFocusedEnvAudioSources(Transform envRoot)
+    {
+        if (envRoot == null)
+            return;
+
+        foreach (var audio in envRoot.GetComponentsInChildren<AudioSource>(true))
+        {
+            if (audio == null)
+                continue;
+            audio.mute = true;
+            if (audio.isPlaying)
+                audio.Stop();
+        }
+    }
+
+    static void UnmuteFocusedEnvAudioSources(Transform envRoot)
+    {
+        if (envRoot == null)
+            return;
+
+        foreach (var audio in envRoot.GetComponentsInChildren<AudioSource>(true))
+        {
+            if (audio == null)
+                continue;
+            audio.mute = false;
+        }
     }
 
     static bool IsWaterGoalRenderer(Transform t)

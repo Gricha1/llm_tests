@@ -149,6 +149,10 @@ public static class JointEpisodeReset
     {
         try
         {
+            if (agent is AgentGoToHouseDiscrete jack)
+                jack.NotifyEpisodeEndingForStats();
+            else if (agent is LilyScript lily)
+                lily.NotifyEpisodeEndingForStats();
             agent.EndEpisode();
         }
         catch (System.Exception ex)
@@ -160,9 +164,9 @@ public static class JointEpisodeReset
     static T[] FindAgentsIncludingInactive<T>() where T : Component
     {
 #if UNITY_2020_1_OR_NEWER
-        return Object.FindObjectsOfType<T>(true);
+        return Object.FindObjectsByType<T>(FindObjectsInactive.Include, FindObjectsSortMode.None);
 #else
-        return Object.FindObjectsOfType<T>();
+        return Object.FindObjectsByType<T>(FindObjectsSortMode.None);
 #endif
     }
 
@@ -179,7 +183,7 @@ public static class JointEpisodeReset
 
     public static void SetAgentsMovementEnabled(bool enabled, Transform envScope)
     {
-        foreach (var jack in Object.FindObjectsOfType<AgentGoToHouseDiscrete>())
+        foreach (var jack in Object.FindObjectsByType<AgentGoToHouseDiscrete>(FindObjectsSortMode.None))
         {
             if (envScope != null && !TrainingEnvSpace.IsDescendantOf(jack.transform, envScope))
                 continue;
@@ -187,7 +191,7 @@ public static class JointEpisodeReset
                 jackCc.enabled = enabled;
         }
 
-        foreach (var lily in Object.FindObjectsOfType<LilyScript>())
+        foreach (var lily in Object.FindObjectsByType<LilyScript>(FindObjectsSortMode.None))
         {
             if (envScope != null && !TrainingEnvSpace.IsDescendantOf(lily.transform, envScope))
                 continue;
@@ -205,28 +209,28 @@ public static class JointEpisodeReset
     {
         SetAgentsMovementEnabled(enabled, envScope);
 
-        foreach (var z in Object.FindObjectsOfType<ZombieChase>())
+        foreach (var z in Object.FindObjectsByType<ZombieChase>(FindObjectsSortMode.None))
         {
             if (envScope != null && !TrainingEnvSpace.IsDescendantOf(z.transform, envScope))
                 continue;
             if (z != null) z.enabled = enabled;
         }
 
-        foreach (var z in Object.FindObjectsOfType<ZombieAttack>())
+        foreach (var z in Object.FindObjectsByType<ZombieAttack>(FindObjectsSortMode.None))
         {
             if (envScope != null && !TrainingEnvSpace.IsDescendantOf(z.transform, envScope))
                 continue;
             if (z != null) z.enabled = enabled;
         }
 
-        foreach (var s in Object.FindObjectsOfType<SheepWander>())
+        foreach (var s in Object.FindObjectsByType<SheepWander>(FindObjectsSortMode.None))
         {
             if (envScope != null && !TrainingEnvSpace.IsDescendantOf(s.transform, envScope))
                 continue;
             if (s != null) s.enabled = enabled;
         }
 
-        foreach (var a in Object.FindObjectsOfType<Animator>())
+        foreach (var a in Object.FindObjectsByType<Animator>(FindObjectsSortMode.None))
         {
             if (a == null)
                 continue;

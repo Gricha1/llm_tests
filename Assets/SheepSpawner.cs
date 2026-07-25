@@ -121,8 +121,28 @@ public class SheepSpawner : MonoBehaviour
     private void SetSheepSpawnArea(GameObject sheepObj)
     {
         var wander = sheepObj.GetComponent<SheepWander>();
-        if (wander != null)
+        if (wander == null)
+            return;
+
+        if (_envRoot == null)
+            _envRoot = TrainingEnvSpace.FindRoot(transform);
+
+        if (_envRoot != null)
+            wander.SetSpawnAreaLocal(_envRoot, SpawnCenterLocal, maxDistanceFromSpawn);
+        else
             wander.SetSpawnArea(ToWorld(SpawnCenterLocal), maxDistanceFromSpawn);
+    }
+
+    /// <summary>После сдвига Env (N) на место presentation — зоны возврата овец.</summary>
+    public void RefreshSpawnAreas()
+    {
+        _envRoot = TrainingEnvSpace.FindRoot(transform);
+        RemoveDestroyedSheep();
+        for (int i = 0; i < sheeps.Count; i++)
+        {
+            if (IsAlive(sheeps[i]))
+                SetSheepSpawnArea(sheeps[i]);
+        }
     }
 
     public int TargetCount => sheepCount;

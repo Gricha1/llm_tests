@@ -113,7 +113,9 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
 
     [Header("Wood")]
     [SerializeField] private float chopDistance = 1.5f;
+#pragma warning disable CS0414 // оставлено для тюнинга в Inspector / старых сцен
     [SerializeField] private float chopReward = 200.0f;
+#pragma warning restore CS0414
     [SerializeField] private LayerMask treeLayer;
     public int wood;
 
@@ -165,10 +167,13 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     [Tooltip("If true, Jack is frozen in place (no movement/rotation). Useful for training setups.")]
     [SerializeField] private bool frozen_jack = false;
     float _movementStunUntilTime;
+    /// <summary>GetCumulativeReward() на старте эпизода — для TB, если EndEpisode пропустили.</summary>
+    float _episodeRewardAnchor;
 
     [Header("Reward")]
+#pragma warning disable CS0414
     [SerializeField] private float reachDistance = 1.2f;
-    [SerializeField] private float reachReward = 10f;
+#pragma warning restore CS0414
 
     [SerializeField] private int maxWood = 10; // цель для задачи «идти к огню», не лимит инвентаря
     [SerializeField] private int maxHeat = 30;
@@ -350,6 +355,8 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     private float _episodeStartTime;
     int _episodeSheepEaten;
     int _episodeZombiesKilled;
+    int _episodeWaterCollected;
+    public int EpisodeWaterCollected => _episodeWaterCollected;
     private int _survivalPhase = 1;
     private float _nextNightmareBossSpawnTime = float.PositiveInfinity;
 
@@ -572,7 +579,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
             bp.BehaviorName = GeorgeBehaviorName;
     }
 
-    private void Awake()
+    private new void Awake()
     {
         ResolveCampfireVfxReference();
         ResolveHouseTarget();
@@ -772,7 +779,17 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     void ApplyEpisodeStepLimit()
     {
         if (IsFullTrainingMode && survivalGoalSeconds > 0f)
-            MaxStep = 0;
+        {
+            // Train PresentationFull — с MaxStep. Стрим/validate — бесконечный эпизод.
+            bool presentationTrain = Academy.IsInitialized
+                && Academy.Instance.IsCommunicatorOn
+                && !TrainingEnvSpace.AllowInfinitePresentationEpisode
+                && _trainingConfig != null
+                && _trainingConfig.ResolveTask() == EnvTrainingTask.PresentationFull;
+            MaxStep = presentationTrain
+                ? Mathf.Max(4000, _trainingConfig.SimpleMaxSteps * 10)
+                : 0;
+        }
         else if (IsZombieTrainingMode)
             MaxStep = _trainingConfig != null ? _trainingConfig.ZombieMaxSteps : 3000;
         else if (IsWoodFoodSwitchMode)
@@ -1219,15 +1236,57 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     /// <summary>
     /// Принудительный респавн. Не только «если ещё мёртв»: после EndEpisode с External Brain
     /// OnEpisodeBegin часто не вызывается, а hp уже могли «съесть» до EnsureAgentsRespawned.
-    /// Не вызывать поверх живого эпизода после EndEpisode — иначе OnEpisodeBegin сбросит мир,
-    /// но GetCumulativeReward() останется со старого эпизода.
+    /// Если EndEpisode не было — сначала закрываем эпизод (иначе cumulative растёт в −миллионы).
     /// </summary>
     public void ForceHardRespawnFromDeath()
     {
         if (!_deathSequenceStarted && hp > 0)
             return;
 
+        // Тиммейт/фейл EndEpisode: мир «респавнят» через OnEpisodeBegin, а reward у ML-Agents ещё старый.
+        if (Mathf.Abs(GetCumulativeReward()) > 0.01f)
+        {
+            NotifyEpisodeEndingForStats();
+            try
+            {
+                EndEpisode();
+            }
+            catch (System.Exception ex)
+            {
+                Debug.LogWarning($"[Jack/George] EndEpisode before hard respawn: {ex.Message}", this);
+            }
+
+            if (!_deathSequenceStarted && hp > 0)
+                return;
+        }
+
         OnEpisodeBegin();
+    }
+
+    /// <summary>
+    /// #reset / клавиша 0: полный новый эпизод. EndEpisode с External Brain часто
+    /// не вызывает OnEpisodeBegin — HP и needs остаются старыми, если не форсировать.
+    /// </summary>
+    public void ForceFullEpisodeRestart()
+    {
+        NotifyEpisodeEndingForStats();
+        try
+        {
+            EndEpisode();
+        }
+        catch (System.Exception ex)
+        {
+            Debug.LogWarning($"[Jack/George] EndEpisode on full restart: {ex.Message}", this);
+        }
+
+        OnEpisodeBegin();
+    }
+
+    /// <summary>EpisodeReward в TensorBoard = return текущего эпизода (с учётом anchor).</summary>
+    public void NotifyEpisodeEndingForStats()
+    {
+        TrainingTaskSuccessTracker.ReportAgentEpisodeReward(
+            GetCumulativeReward() - _episodeRewardAnchor);
     }
 
     public override void OnEpisodeBegin()
@@ -1310,6 +1369,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         _woodOnlyCompletedCycle = false;
         _episodeSheepEaten = 0;
         _episodeZombiesKilled = 0;
+        _episodeWaterCollected = 0;
         ApplyEpisodeStartNeeds(isTwitchClone);
         satietyTimer = 0f;
         waterTimer = 0f;
@@ -1444,6 +1504,9 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
             if (IsZombieTrainingMode)
                 StartZombieSpawnerForEpisode(ShouldIncludeSecondaryZombieSpawner());
         }
+
+        // После корректного EndEpisode это 0; после «голого» OnEpisodeBegin — база для дельты в TB.
+        _episodeRewardAnchor = GetCumulativeReward();
     }
 
     void EnsureSpawners()
@@ -1571,7 +1634,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         Vector3 origin = transform.position;
         var envRoot = TrainingEnvSpace.FindRoot(transform);
 
-        foreach (var lily in Object.FindObjectsOfType<LilyScript>())
+        foreach (var lily in Object.FindObjectsByType<LilyScript>(FindObjectsSortMode.None))
         {
             if (lily == null || !lily.isActiveAndEnabled)
                 continue;
@@ -1581,7 +1644,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
                 return true;
         }
 
-        foreach (var other in Object.FindObjectsOfType<AgentGoToHouseDiscrete>())
+        foreach (var other in Object.FindObjectsByType<AgentGoToHouseDiscrete>(FindObjectsSortMode.None))
         {
             if (other == null || other == this || !other.isActiveAndEnabled)
                 continue;
@@ -1955,7 +2018,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         ref GameObject nearestZombie,
         ref float distance)
     {
-        var chases = Object.FindObjectsOfType<ZombieChase>();
+        var chases = Object.FindObjectsByType<ZombieChase>(FindObjectsSortMode.None);
 
         for (int i = 0; i < chases.Length; i++)
         {
@@ -2021,14 +2084,25 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     }
 
     /// <summary>
+    /// ClosestPoint только для Box/Sphere/Capsule/convex Mesh — иначе bounds (зомби часто non-convex Mesh).
+    /// </summary>
+    private static Vector3 SafeClosestPointOnCollider(Collider c, Vector3 from)
+    {
+        if (c == null)
+            return from;
+        if (c is MeshCollider mesh && !mesh.convex)
+            return c.bounds.ClosestPoint(from);
+        if (c is BoxCollider || c is SphereCollider || c is CapsuleCollider || c is MeshCollider)
+            return c.ClosestPoint(from);
+        return c.bounds.ClosestPoint(from);
+    }
+
+    /// <summary>
     /// Дистанция добычи: до ближайшей точки на коллайдере, а не до pivot (центр дерева недостижим).
-    /// Non-convex MeshCollider: ClosestPoint бесполезен (отдаёт ту же точку) — берём bounds.
     /// </summary>
     private static float HarvestReachDistance(Vector3 from, Collider c)
     {
-        if (c is MeshCollider mesh && !mesh.convex)
-            return Vector3.Distance(from, c.bounds.ClosestPoint(from));
-        return Vector3.Distance(from, c.ClosestPoint(from));
+        return Vector3.Distance(from, SafeClosestPointOnCollider(c, from));
     }
 
     private bool TryEatSheep()
@@ -2068,6 +2142,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
             return false;
 
         water += Mathf.Max(1, waterPerCollect > 0 ? waterPerCollect : amount);
+        _episodeWaterCollected++;
         return true;
     }
 
@@ -2112,6 +2187,8 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         sensor.AddObservation(Mathf.Clamp01((float)wood / Mathf.Max(1, maxWood)));
         sensor.AddObservation((float)heat / maxHeat); // [0,1]
         sensor.AddObservation(Mathf.Clamp01((float)satiety / Mathf.Max(1, maxSatiety))); // сытость [0,1]
+        // Запас воды [0,1] — как сытость; шкала maxSatiety+10 (старт/сбор в том же диапазоне).
+        sensor.AddObservation(Mathf.Clamp01((float)water / Mathf.Max(1, maxSatiety + 10)));
 
         bool onHouse = houseTarget != null
             && Vector3.Distance(transform.position, houseTarget.position) <= HouseReach;
@@ -2180,18 +2257,34 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         float moveInput = 0f;
         float rotateInput = 0f;
 
-        // --- Движение ---
-        if (CanMoveThisStep)
+        // BranchSizes Jack/George: move=2, rotate=3, chop=2 (для ML).
+        // Ручной WASD: S назад вне action space — иначе назад недоступен.
+        bool manualWasd = IsManualWasdControlActive() && !TwitchEphemeralEffects.IsTwitchClone(this);
+        if (manualWasd)
         {
-            if (moveAction == 1) moveInput = 1f;
-            else if (moveAction == 3) moveInput = -1f;
+            if (CanMoveThisStep)
+            {
+                if (Input.GetKey(KeyCode.W)) moveInput = 1f;
+                else if (Input.GetKey(KeyCode.S)) moveInput = -1f;
+            }
+            if (CanRotateThisStep)
+            {
+                if (Input.GetKey(KeyCode.D)) rotateInput = 1f;
+                else if (Input.GetKey(KeyCode.A)) rotateInput = -1f;
+            }
         }
-
-        // --- Поворот ---
-        if (CanRotateThisStep)
+        else
         {
-            if (rotateAction == 1) rotateInput = 1f;
-            else if (rotateAction == 3) rotateInput = -1f;
+            if (CanMoveThisStep)
+            {
+                if (moveAction == 1) moveInput = 1f;
+            }
+
+            if (CanRotateThisStep)
+            {
+                if (rotateAction == 0) rotateInput = -1f;
+                else if (rotateAction == 1) rotateInput = 1f;
+            }
         }
 
         if (CanRotateThisStep)
@@ -2498,6 +2591,15 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         if (!_deathSequenceStarted && !IsWoodFoodSwitchMode && survivalGoalSeconds > 0f
             && SurvivalElapsedSeconds >= SurvivalTotalSeconds)
         {
+            NotifyEpisodeEndingForStats();
+            EndEpisode();
+            return;
+        }
+
+        // PresentationFull train MaxStep: Agent сам режет эпизод — репортим return до обрыва.
+        if (!_deathSequenceStarted && MaxStep > 0 && stepCount >= MaxStep)
+        {
+            NotifyEpisodeEndingForStats();
             EndEpisode();
             return;
         }
@@ -2617,12 +2719,13 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
             }
         }
 
-        if (_trainingConfig != null
+        // MaxStep часто раньше timeout при time_scale>1 — без Record SR на #show metrics = n=0.
+        bool hitMaxStep = MaxStep > 0 && stepCount >= MaxStep;
+        bool hitTimeout = _trainingConfig != null
             && GetSimpleEpisodeTimeoutSeconds() > 0f
-            && SurvivalElapsedSeconds >= GetSimpleEpisodeTimeoutSeconds())
-        {
+            && SurvivalElapsedSeconds >= GetSimpleEpisodeTimeoutSeconds();
+        if (hitMaxStep || hitTimeout)
             EndSimpleTrainingEpisode();
-        }
     }
 
     void EndSimpleTrainingEpisode()
@@ -2638,6 +2741,8 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
             }
         }
 
+        TrainingTaskSuccessTracker.ReportAgentEpisodeReward(
+            GetCumulativeReward() - _episodeRewardAnchor);
         EndEpisode();
     }
 
@@ -2678,9 +2783,11 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
             currentStepReward += penalty;
         }
 
-        // Как у Jack: не рвём эпизод на 1 овце / 1 воде / первом прогреве — только MaxStep / timeout.
-        if (_trainingConfig.ResolveSimpleEpisodeTimeoutSeconds() > 0f
-            && SurvivalElapsedSeconds >= _trainingConfig.ResolveSimpleEpisodeTimeoutSeconds())
+        // Как у Jack: не рвём на 1 успехе — MaxStep / timeout; MaxStep тоже пишет SR.
+        bool hitMaxStep = MaxStep > 0 && stepCount >= MaxStep;
+        bool hitTimeout = _trainingConfig.ResolveSimpleEpisodeTimeoutSeconds() > 0f
+            && SurvivalElapsedSeconds >= _trainingConfig.ResolveSimpleEpisodeTimeoutSeconds();
+        if (hitMaxStep || hitTimeout)
             EndSimpleTrainingEpisode();
     }
 
@@ -2695,6 +2802,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         if (!IsZombieTrainingMode)
             return;
 
+        // Оба домовых спавнера (не hills).
         StartZombieSpawnerForEpisode(includeSecondarySpawner: true);
         Debug.Log(
             $"[JackZombie] spawners active primary={zombieSpawner != null} secondary={zombieSpawnerSecondary != null} " +
@@ -2764,7 +2872,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
 
     void EnsureCitySceneZombieSpawners()
     {
-        var all = Object.FindObjectsOfType<ZombieSpawner>(true);
+        var all = Object.FindObjectsByType<ZombieSpawner>(FindObjectsInactive.Include, FindObjectsSortMode.None);
         ZombieSpawner primary = null;
         ZombieSpawner secondary = null;
 
@@ -2973,6 +3081,11 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     void StartZombieSpawnerForEpisode(bool includeSecondarySpawner)
     {
         EnsureZombieSpawners();
+
+        // Меню K: спавн из обоих домов делает ForceStartJackZombieSpawners.
+        if (TrainingEnvSpace.IsDebugEnvFocusActive)
+            return;
+
         int immediate = _trainingConfig != null ? _trainingConfig.ZombieImmediateSpawnCount : 2;
         bool trainingBurst = IsZombieTrainingMode;
         // CityScene presentation: сразу пару зомби, не ждать spawnInterval.
@@ -3246,7 +3359,8 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         if (envRoot == null)
             return null;
 
-        var agents = envRoot.GetComponentsInChildren<AgentGoToHouseDiscrete>(false);
+        // true: в GeorgeHeat Jack выключен (SetActive false), но костёр горит на нём.
+        var agents = envRoot.GetComponentsInChildren<AgentGoToHouseDiscrete>(true);
         for (int i = 0; i < agents.Length; i++)
         {
             var agent = agents[i];
@@ -3266,10 +3380,24 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     public bool IsGeorgeNearBurningCampfirePublic()
     {
         var jack = FindCampfireJackInEnv();
-        if (jack == null || jack.CampfireBurnSecondsRemaining <= 0f || houseTarget == null)
+        if (jack == null || jack.CampfireBurnSecondsRemaining <= 0f)
             return false;
 
-        return Vector3.Distance(transform.position, houseTarget.position) <= CampfireWarmthReach;
+        // Якорь — огонь, не центр дома: Гера у костра могла быть >3м от houseTarget.
+        Vector3 warmthPos = jack.GetCampfireWarmthWorldPosition();
+        return Vector3.Distance(transform.position, warmthPos) <= CampfireWarmthReach;
+    }
+
+    /// <summary>Точка тепла для Геры/Лили: VFX костра, иначе дом.</summary>
+    public Vector3 GetCampfireWarmthWorldPosition()
+    {
+        ResolveCampfireVfxReference();
+        if (fireVfx != null)
+            return fireVfx.transform.position;
+        ResolveHouseTarget();
+        if (houseTarget != null)
+            return houseTarget.position;
+        return transform.position;
     }
 
     void UpdateGeorgeWarmthAtCampfire()
@@ -3338,7 +3466,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     private bool IsZombieColliderInFrontForDo(Vector3 origin, Collider c)
     {
         if (c == null) return false;
-        Vector3 toTarget = c.ClosestPoint(origin) - origin;
+        Vector3 toTarget = SafeClosestPointOnCollider(c, origin) - origin;
         toTarget.y = 0f;
         if (toTarget.sqrMagnitude < 1e-6f) return true;
 
@@ -3399,7 +3527,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
             {
                 if (envRoot != null && !TrainingEnvSpace.IsDescendantOf(lily.transform, envRoot))
                     continue;
-                float d = Vector3.Distance(origin, c.ClosestPoint(origin));
+                float d = Vector3.Distance(origin, SafeClosestPointOnCollider(c, origin));
                 if (d < bestDist)
                 {
                     bestDist = d;
@@ -3416,7 +3544,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
             if (envRoot != null && !TrainingEnvSpace.IsDescendantOf(ally.transform, envRoot))
                 continue;
 
-            float dist = Vector3.Distance(origin, c.ClosestPoint(origin));
+            float dist = Vector3.Distance(origin, SafeClosestPointOnCollider(c, origin));
             if (dist < bestDist)
             {
                 bestDist = dist;
@@ -3510,7 +3638,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
             if (z == null) continue;
             if (!IsZombieColliderInFrontForDo(origin, c)) continue;
 
-            float d = Vector3.Distance(origin, c.ClosestPoint(origin));
+            float d = Vector3.Distance(origin, SafeClosestPointOnCollider(c, origin));
             if (d < bestDist)
             {
                 bestDist = d;
@@ -3730,12 +3858,12 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
                 return false;
 
             bool isGeorge = TrainingEnvSpace.IsGeorgeAgent(this);
-            // 9–11 George; 1–4 Jack; 0 стрим — P как раньше (GeorgeManualActive).
-            if (idx >= 9 && idx <= 11)
+            // Актуальная карта: 0/1 — все герои (P); 2–5 Jack; 6–9 Lily; 10–12 George.
+            if (idx >= 10 && idx <= 12)
                 return isGeorge;
-            if (idx >= 1 && idx <= 4)
+            if (idx >= 2 && idx <= 5)
                 return !isGeorge;
-            if (idx == 0)
+            if (idx == 0 || idx == 1)
             {
                 if (isGeorge)
                     return ManualPlayControl.GeorgeManualActive;
@@ -3759,7 +3887,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         // Клоны не читают клавиатуру — иначе повторяют каждое действие оригинала.
         if (TwitchEphemeralEffects.IsTwitchClone(this))
         {
-            discreteActions[0] = 2;
+            discreteActions[0] = 0;
             discreteActions[1] = 2;
             discreteActions[2] = 0;
             return;
@@ -3767,25 +3895,22 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
 
         if (!IsManualWasdControlActive())
         {
-            discreteActions[0] = 2;
+            discreteActions[0] = 0;
             discreteActions[1] = 2;
             discreteActions[2] = 0;
             return;
         }
 
-        // --- Движение только W / S (не стрелки) ---
-        int moveAction = 2; // стоять
+        // move 0/1 (ветка size 2); rotate 0/1/2 (ветка size 3). S назад нет в action space.
+        int moveAction = 0;
         if (Input.GetKey(KeyCode.W))
-            moveAction = 1;   // вперёд
-        else if (Input.GetKey(KeyCode.S))
-            moveAction = 3;   // назад
+            moveAction = 1;
 
-        // --- Поворот только A / D (не стрелки) ---
-        int rotateAction = 2; // не крутиться
+        int rotateAction = 2;
         if (Input.GetKey(KeyCode.D))
-            rotateAction = 1; // вправо
+            rotateAction = 1;
         else if (Input.GetKey(KeyCode.A))
-            rotateAction = 3; // влево
+            rotateAction = 0;
 
         int chopAction = GetHeuristicChopPressed() ? 1 : 0;
 

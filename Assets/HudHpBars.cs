@@ -20,7 +20,7 @@ public sealed class HudHpBars : MonoBehaviour
     public static void SetGlobalEnabled(bool enabled)
     {
         GlobalEnabled = enabled;
-        var inst = FindObjectOfType<HudHpBars>();
+        var inst = FindFirstObjectByType<HudHpBars>();
         if (inst != null)
             inst.ApplyVisibility();
     }
@@ -265,7 +265,7 @@ public sealed class HudHpBars : MonoBehaviour
         text.color = Color.white;
         text.alignment = TextAlignmentOptions.Left;
         text.text = $"{title}: --/--";
-        text.enableWordWrapping = false;
+        text.textWrappingMode = TextWrappingModes.NoWrap;
         return row;
     }
 }

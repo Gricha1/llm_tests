@@ -131,7 +131,7 @@ public sealed class FloatingRewardPopup : MonoBehaviour
         tmp.color = color;
         tmp.alignment = TextAlignmentOptions.Center;
         tmp.fontStyle = FontStyles.Bold;
-        tmp.enableWordWrapping = false;
+        tmp.textWrappingMode = TextWrappingModes.NoWrap;
         if (TMP_Settings.defaultFontAsset != null)
             tmp.font = TMP_Settings.defaultFontAsset;
 

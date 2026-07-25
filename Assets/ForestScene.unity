@@ -11159,9 +11159,9 @@ GameObject:
   - component: {fileID: 468881843}
   - component: {fileID: 468881842}
   - component: {fileID: 468881841}
-  m_Layer: 0
+  m_Layer: 13
   m_Name: GoalWater3
-  m_TagString: Untagged
+  m_TagString: Water
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
@@ -14431,7 +14431,7 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: 
   m_BrainParameters:
-    VectorObservationSize: 14
+    VectorObservationSize: 15
     NumStackedVectorObservations: 1
     m_ActionSpec:
       m_NumContinuousActions: 0
@@ -20813,9 +20813,9 @@ GameObject:
   - component: {fileID: 831906516}
   - component: {fileID: 831906515}
   - component: {fileID: 831906514}
-  m_Layer: 0
+  m_Layer: 13
   m_Name: GoalWater2
-  m_TagString: Untagged
+  m_TagString: Water
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
@@ -25885,7 +25885,7 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: 
   m_BrainParameters:
-    VectorObservationSize: 14
+    VectorObservationSize: 15
     NumStackedVectorObservations: 1
     m_ActionSpec:
       m_NumContinuousActions: 0
@@ -27784,7 +27784,7 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: 
   m_BrainParameters:
-    VectorObservationSize: 16
+    VectorObservationSize: 17
     NumStackedVectorObservations: 1
     m_ActionSpec:
       m_NumContinuousActions: 0
@@ -38389,9 +38389,6 @@ PrefabInstance:
       addedObject: {fileID: 1493148599}
     - targetCorrespondingSourceObject: {fileID: 6660184903045082040, guid: 970a0e0414fa8be4695cbe8c3d95afd7, type: 3}
       insertIndex: -1
-      addedObject: {fileID: 1493148597}
-    - targetCorrespondingSourceObject: {fileID: 6660184903045082040, guid: 970a0e0414fa8be4695cbe8c3d95afd7, type: 3}
-      insertIndex: -1
       addedObject: {fileID: 1493148596}
   m_SourcePrefab: {fileID: 100100000, guid: 970a0e0414fa8be4695cbe8c3d95afd7, type: 3}
 --- !u!1001 &1483448890
@@ -38656,18 +38653,6 @@ MonoBehaviour:
   attackCheckInterval: 0.2
   attackLeftTrigger: AttackL
   attackRightTrigger: AttackR
---- !u!114 &1493148597
-MonoBehaviour:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 1493148595}
-  m_Enabled: 1
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: ec301fe1513ceef4c9ae0cb598c403f1, type: 3}
-  m_Name: 
-  m_EditorClassIdentifier: 
 --- !u!114 &1493148599
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -40342,9 +40327,6 @@ PrefabInstance:
       addedObject: {fileID: 1542854175}
     - targetCorrespondingSourceObject: {fileID: 6660184903045082040, guid: 970a0e0414fa8be4695cbe8c3d95afd7, type: 3}
       insertIndex: -1
-      addedObject: {fileID: 1542854174}
-    - targetCorrespondingSourceObject: {fileID: 6660184903045082040, guid: 970a0e0414fa8be4695cbe8c3d95afd7, type: 3}
-      insertIndex: -1
       addedObject: {fileID: 1542854173}
   m_SourcePrefab: {fileID: 100100000, guid: 970a0e0414fa8be4695cbe8c3d95afd7, type: 3}
 --- !u!1 &1542854172 stripped
@@ -40370,18 +40352,6 @@ MonoBehaviour:
   attackCheckInterval: 0.2
   attackLeftTrigger: AttackL
   attackRightTrigger: AttackR
---- !u!114 &1542854174
-MonoBehaviour:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 1542854172}
-  m_Enabled: 1
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: ec301fe1513ceef4c9ae0cb598c403f1, type: 3}
-  m_Name: 
-  m_EditorClassIdentifier: 
 --- !u!114 &1542854175
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -45621,7 +45591,7 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 5016354465868146490, guid: 2f0b04bbc5c346843a2b7b4b9765ea30, type: 3}
       propertyPath: m_BrainParameters.VectorObservationSize
-      value: 16
+      value: 17
       objectReference: {fileID: 0}
     - target: {fileID: 5016354465868146490, guid: 2f0b04bbc5c346843a2b7b4b9765ea30, type: 3}
       propertyPath: m_BrainParameters.VectorActionSize.Array.size
@@ -46775,9 +46745,9 @@ GameObject:
   - component: {fileID: 1797777679}
   - component: {fileID: 1797777678}
   - component: {fileID: 1797777677}
-  m_Layer: 0
+  m_Layer: 13
   m_Name: GoalWater1
-  m_TagString: Untagged
+  m_TagString: Water
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0

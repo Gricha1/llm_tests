@@ -73,34 +73,13 @@ if [ ! -f "build_versions/${BUILD}.x86_64" ]; then
   exit 1
 fi
 
-echo "[deploy] === sync to ${REMOTE}:${REMOTE_DIR} ==="
-
-"${SSH_CMD[@]}" "mkdir -p ${REMOTE_DIR}/build_versions"
-
+echo "[deploy] === sync to lab_comp ==="
 if [ "${SYNC_CODE}" -eq 1 ]; then
-  echo "[deploy] sync train_scripts + custom_configs..."
-  rsync -avz --progress -e "${RSYNC_SSH}" \
-    train_scripts/ "${REMOTE}:${REMOTE_DIR}/train_scripts/"
-  rsync -avz --progress -e "${RSYNC_SSH}" \
-    custom_configs/ "${REMOTE}:${REMOTE_DIR}/custom_configs/"
-
-  echo "[deploy] sync Assets (C# правки для следующей сборки; текущий run = билд)..."
-  rsync -avz --progress -e "${RSYNC_SSH}" \
-    --exclude 'Library/' --exclude 'Temp/' \
-    Assets/ \
-    "${REMOTE}:${REMOTE_DIR}/Assets/"
+  bash train_scripts/lab_comp/sync.bash
+else
+  # Только билд: sync.bash всегда льёт скрипты — вызов с build-only через полный sync проще.
+  bash train_scripts/lab_comp/sync.bash
 fi
-
-echo "[deploy] sync build ${BUILD}.x86_64 + _Data..."
-rsync -avz --progress -e "${RSYNC_SSH}" \
-  "build_versions/${BUILD}.x86_64" \
-  "${REMOTE}:${REMOTE_DIR}/build_versions/"
-rsync -avz --progress -e "${RSYNC_SSH}" \
-  "build_versions/${BUILD}_Data/" \
-  "${REMOTE}:${REMOTE_DIR}/build_versions/${BUILD}_Data/"
-
-echo "[deploy] verify on server:"
-"${SSH_CMD[@]}" "ls -la ${REMOTE_DIR}/build_versions/${BUILD}.x86_64 && du -sh ${REMOTE_DIR}/build_versions/${BUILD}_Data"
 
 if [ "${DO_TRAIN}" -eq 0 ]; then
   echo "[deploy] sync done (--no-train)."

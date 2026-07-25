@@ -49,7 +49,7 @@ public sealed class BackgroundMusic : MonoBehaviour
         if (!TrainingEnvSpace.ShouldPlayAmbientAudio())
             return;
 
-        if (FindObjectOfType<BackgroundMusic>() != null)
+        if (FindFirstObjectByType<BackgroundMusic>() != null)
             return;
 
         var go = new GameObject(nameof(BackgroundMusic));

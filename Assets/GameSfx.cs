@@ -102,7 +102,7 @@ public static class GameSfx
         Play(FoodShort != null ? FoodShort : Food, volume, 1f);
     }
 
-    public static void PlayWood(float volume = 0.8f, Transform source = null)
+    public static void PlayWood(float volume = 0.4f, Transform source = null)
     {
         if (!TrainingEnvSpace.ShouldPlayFeedback(source))
             return;

@@ -27,6 +27,8 @@ public sealed class CampfireLoopAudio : MonoBehaviour
 
     void OnEnable()
     {
+        if (TrainingEnvSpace.IsHeadlessTrainWorkerProcess)
+            return;
         if (!TrainingEnvSpace.IsPresentationTransform(transform))
             return;
 

@@ -131,7 +131,7 @@ public static class BossArenaNightLighting
 
     static void ExcludeBossLayerFromSceneSun(Transform bossRoot, int bossMask)
     {
-        var allLights = Object.FindObjectsOfType<Light>();
+        var allLights = Object.FindObjectsByType<Light>(FindObjectsSortMode.None);
         for (int i = 0; i < allLights.Length; i++)
         {
             var light = allLights[i];

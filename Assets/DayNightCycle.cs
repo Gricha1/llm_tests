@@ -55,7 +55,7 @@ public sealed class DayNightCycle : MonoBehaviour
                 return onSun;
         }
 
-        return Object.FindObjectOfType<DayNightCycle>();
+        return Object.FindFirstObjectByType<DayNightCycle>();
     }
 
     public static void ToggleDayNightGlobal()
@@ -74,6 +74,28 @@ public sealed class DayNightCycle : MonoBehaviour
         _manualOverride = true;
         _manualIsNight = isCurrentlyDay;
         _time01 = _manualIsNight ? 0f : 0.5f;
+        ApplyLighting();
+    }
+
+    /// <summary>Стрим-бот / Twitch: принудительная ночь на N секунд, затем день.</summary>
+    public static void ForceNightForSeconds(float seconds)
+    {
+        var cycle = FindInstance();
+        if (cycle == null)
+            return;
+        cycle.StartCoroutine(cycle.ForceNightRoutine(Mathf.Max(1f, seconds)));
+    }
+
+    System.Collections.IEnumerator ForceNightRoutine(float seconds)
+    {
+        _manualOverride = true;
+        _manualIsNight = true;
+        _time01 = 0f;
+        ApplyLighting();
+        yield return new WaitForSecondsRealtime(seconds);
+        _manualOverride = true;
+        _manualIsNight = false;
+        _time01 = 0.5f;
         ApplyLighting();
     }
 

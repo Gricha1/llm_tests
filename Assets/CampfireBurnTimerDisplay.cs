@@ -51,7 +51,7 @@ public sealed class CampfireBurnTimerDisplay : MonoBehaviour
         _text.alignment = TextAlignmentOptions.Center;
         _text.fontSize = fontSize;
         _text.color = textColor;
-        _text.enableWordWrapping = false;
+        _text.textWrappingMode = TextWrappingModes.NoWrap;
         _text.overflowMode = TextOverflowModes.Overflow;
         _text.fontStyle = FontStyles.Bold;
         if (TMP_Settings.defaultFontAsset != null)

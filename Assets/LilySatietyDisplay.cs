@@ -79,7 +79,7 @@ public class LilySatietyDisplay : MonoBehaviour
             tmp.font = TMP_Settings.defaultFontAsset;
 
         var display = go.AddComponent<LilySatietyDisplay>();
-        var jackHud = FindObjectOfType<SatietyDisplay>();
+        var jackHud = FindFirstObjectByType<SatietyDisplay>();
         if (jackHud != null)
             display.spriteAsset = jackHud.FoodSpriteAsset;
         display.EnsureHudVisible();
@@ -94,7 +94,7 @@ public class LilySatietyDisplay : MonoBehaviour
 
         if (spriteAsset == null)
         {
-            var jackHud = FindObjectOfType<SatietyDisplay>();
+            var jackHud = FindFirstObjectByType<SatietyDisplay>();
             if (jackHud != null)
                 spriteAsset = jackHud.FoodSpriteAsset;
         }

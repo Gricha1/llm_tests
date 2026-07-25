@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
-# Стрим OBS: Unity с графикой + Python onnxruntime (отдельно от mlagents-learn).
+# Стрим OBS: Unity + onnxruntime (отдельно от mlagents-learn).
 #
-#   RUN_ID=run_72 bash train_scripts/lab_comp/run_stream_onnx.bash
+#   RUN_ID=run_75 bash train_scripts/lab_comp/run_stream_onnx.bash
+#
+# По умолчанию — супервизор: #restart_stream пишет .stream_restart_request,
+# этот скрипт убивает ТОЛЬКО стрим (не train) и поднимает заново.
+# Стоп без рестарта: Ctrl+C  или  touch .stream_stop_request
+# Без супервизора: FOREST_STREAM_SUPERVISE=0 bash ...
 #
 set -eu
 set -o pipefail
@@ -9,6 +14,114 @@ set -o pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/../.." && pwd)"
 cd "${ROOT}"
 
+FLAG="${ROOT}/.stream_restart_request"
+STREAM_RESTART_POLL_SEC="${STREAM_RESTART_POLL_SEC:-1}"
+COOLDOWN_SEC="${STREAM_RESTART_COOLDOWN_SEC:-5}"
+# stream_onnx_infer выходит с 75 при флаге #restart_stream
+RESTART_EXIT=75
+
+# --- супервизор (внешний цикл) ---
+if [ "${FOREST_STREAM_SUPERVISE:-1}" = "1" ] && [ "${FOREST_STREAM_INNER:-0}" != "1" ]; then
+  # shellcheck source=lab_comp_env.bash
+  if [ -f "${ROOT}/train_scripts/lab_comp/lab_comp_env.bash" ]; then
+    # shellcheck disable=SC1091
+    source "${ROOT}/train_scripts/lab_comp/lab_comp_env.bash"
+  fi
+
+  STOP_FLAG="${ROOT}/.stream_stop_request"
+  child=""
+  stopping=0
+
+  kill_stream_only() {
+    echo "[stream_onnx] kill STREAM only (не train)..."
+    pkill -9 -f 'stream_onnx_infer\.py' 2>/dev/null || true
+    pkill -9 -f 'forestStreamOnly' 2>/dev/null || true
+    sleep 1
+  }
+
+  stop_supervisor() {
+    stopping=1
+    echo "[stream_onnx] STOP (Ctrl+C / SIGTERM) — супервизор не перезапускает"
+    rm -f "${FLAG}" "${STOP_FLAG}"
+    kill_stream_only
+    if [ -n "${child}" ]; then
+      kill -TERM "${child}" 2>/dev/null || true
+      wait "${child}" 2>/dev/null || true
+    fi
+    exit 0
+  }
+  trap stop_supervisor INT TERM
+
+  echo "[stream_onnx] SUPERVISE=1 flag=${FLAG} RUN_ID=${RUN_ID:-?}"
+  echo "[stream_onnx] стоп: Ctrl+C  или  touch ${STOP_FLAG}"
+  rm -f "${FLAG}" "${STOP_FLAG}"
+
+  while true; do
+    if [ -f "${STOP_FLAG}" ]; then
+      echo "[stream_onnx] найден ${STOP_FLAG} — выход"
+      rm -f "${STOP_FLAG}"
+      exit 0
+    fi
+
+    echo "[stream_onnx] старт inner..."
+    set +e
+    # Не пробрасываем POLL_SEC в inner: иначе onnx получит 1с reload вместо 0.
+    FOREST_STREAM_INNER=1 env -u POLL_SEC \
+      bash "${ROOT}/train_scripts/lab_comp/run_stream_onnx.bash" "$@" &
+    child=$!
+    set -e
+
+    restarted=0
+    while kill -0 "${child}" 2>/dev/null; do
+      if [ -f "${STOP_FLAG}" ]; then
+        echo "[stream_onnx] ${STOP_FLAG} — останавливаем"
+        rm -f "${STOP_FLAG}"
+        kill_stream_only
+        wait "${child}" 2>/dev/null || true
+        exit 0
+      fi
+      if [ -f "${FLAG}" ]; then
+        echo "[stream_onnx] флаг ${FLAG} — #restart_stream"
+        cat "${FLAG}" 2>/dev/null | sed 's/^/[stream_onnx]   /' || true
+        rm -f "${FLAG}"
+        kill_stream_only
+        wait "${child}" 2>/dev/null || true
+        restarted=1
+        break
+      fi
+      sleep "${STREAM_RESTART_POLL_SEC}"
+    done
+
+    if [ "${stopping}" -ne 0 ]; then
+      exit 0
+    fi
+
+    if [ "${restarted}" -eq 0 ]; then
+      set +e
+      wait "${child}"
+      code=$?
+      set -e
+      # 130=SIGINT, 143=SIGTERM, 0=нормальный выход — не рестартим
+      if [ "${code}" -eq "${RESTART_EXIT}" ]; then
+        echo "[stream_onnx] python exit ${RESTART_EXIT} (#restart_stream)"
+        restarted=1
+      elif [ "${code}" -eq 130 ] || [ "${code}" -eq 143 ] || [ "${code}" -eq 0 ]; then
+        echo "[stream_onnx] остановлен code=${code} — супервизор выходит (не рестарт)"
+        kill_stream_only
+        exit 0
+      else
+        echo "[stream_onnx] стрим упал code=${code} — рестарт через ${COOLDOWN_SEC}с"
+      fi
+    fi
+
+    # Иначе после падения старый python держит :7000 → UnityWorkerInUseException.
+    kill_stream_only
+    rm -f "${FLAG}"
+    sleep "${COOLDOWN_SEC}"
+  done
+fi
+
+# --- один запуск (INNER) ---
 # shellcheck source=lab_comp_env.bash
 if [ -f "${ROOT}/train_scripts/lab_comp/lab_comp_env.bash" ]; then
   # shellcheck disable=SC1091
@@ -19,15 +132,25 @@ BUILD="${BUILD:-stream_forest_survival_2_12_07_2026}"
 RUN_ID="${RUN_ID:?задайте RUN_ID=run_XX}"
 STREAM_PORT="${STREAM_PORT:-7000}"
 TIME_SCALE="${TIME_SCALE:-1}"
-# 0 = веса только когда закончился эпизод Jack.
-POLL_SEC="${POLL_SEC:-0}"
+# Только явный ONNX_POLL_SEC / POLL_SEC_ONNX (не общий POLL_SEC — его ставит супервизор).
+POLL_SEC_ONNX="${ONNX_POLL_SEC:-${POLL_SEC_ONNX:-0}}"
 TARGET_FPS="${TARGET_FPS:-30}"
 QUALITY_LEVEL="${QUALITY_LEVEL:-1}"
 STREAM_WIDTH="${STREAM_WIDTH:-1920}"
 STREAM_HEIGHT="${STREAM_HEIGHT:-1080}"
-# Unity иногда долго молчит (хитч / death / тяжёлый ResetTrees) — не рвать стрим.
 TIMEOUT_WAIT="${TIMEOUT_WAIT:-300}"
 export DISPLAY="${DISPLAY:-:1}"
+# Из tmux часто нет XAUTHORITY → Unity не создаёт окно, OBS чёрный.
+if [ -z "${XAUTHORITY:-}" ] || [ ! -f "${XAUTHORITY}" ]; then
+  if [ -f "/run/user/$(id -u)/gdm/Xauthority" ]; then
+    export XAUTHORITY="/run/user/$(id -u)/gdm/Xauthority"
+  elif [ -f "${HOME}/.Xauthority" ]; then
+    export XAUTHORITY="${HOME}/.Xauthority"
+  else
+    unset XAUTHORITY || true
+  fi
+fi
+echo "[stream_onnx] DISPLAY=${DISPLAY} XAUTHORITY=${XAUTHORITY:-none}"
 
 BUILD_PATH="build_versions/${BUILD%.x86_64}.x86_64"
 BUILD_STAMP="build_versions/${BUILD%.x86_64}.BUILD_STAMP"
@@ -41,7 +164,7 @@ if [ -f "${BUILD_STAMP}" ]; then
   echo "[stream_onnx] BUILD_STAMP:"
   sed 's/^/  /' "${BUILD_STAMP}"
 else
-  echo "WARN: нет ${BUILD_STAMP} — билд могли не заливать через sync_build (возможна старая версия)" >&2
+  echo "WARN: нет ${BUILD_STAMP} — билд могли не заливать через sync.bash (возможна старая версия)" >&2
 fi
 
 PY=""
@@ -73,14 +196,47 @@ echo "[stream_onnx] python=${PY}"
   exit 1
 }
 
-# Старые стрим-Unity часто остаются после Ctrl+C — убиваем перед стартом.
+# Stale Unity + чужие stream_onnx (не этот bash/parent).
 pkill -9 -f 'forestStreamOnly' 2>/dev/null || true
-pkill -9 -f stream_onnx_infer 2>/dev/null || true
-sleep 1
+my_pid=$$
+while read -r pid; do
+  [ -z "${pid}" ] && continue
+  [ "${pid}" = "${my_pid}" ] && continue
+  # не убивать предков (супервизор / tmux)
+  if [ "${pid}" -eq "${PPID}" ] 2>/dev/null; then
+    continue
+  fi
+  kill -9 "${pid}" 2>/dev/null || true
+done < <(pgrep -f 'stream_onnx_infer\.py' 2>/dev/null || true)
+sleep 2
 
-while netstat -tuln 2>/dev/null | grep -q ":${STREAM_PORT} "; do
-  STREAM_PORT=$((STREAM_PORT + 1))
+port_in_use() {
+  local p="$1"
+  if command -v ss >/dev/null 2>&1; then
+    ss -tuln 2>/dev/null | grep -qE "[:.]${p}[[:space:]]"
+    return $?
+  fi
+  netstat -tuln 2>/dev/null | grep -qE "[:.]${p}[[:space:]]"
+}
+
+# Ждём освобождения порта, иначе ML-Agents падает с UnityWorkerInUseException.
+for _ in $(seq 1 20); do
+  if ! port_in_use "${STREAM_PORT}"; then
+    break
+  fi
+  echo "[stream_onnx] порт ${STREAM_PORT} занят — жду..."
+  # добиваем слушателя на этом порту (только stream python)
+  if command -v fuser >/dev/null 2>&1; then
+    fuser -k "${STREAM_PORT}/tcp" 2>/dev/null || true
+  fi
+  sleep 1
 done
+if port_in_use "${STREAM_PORT}"; then
+  echo "[stream_onnx] WARN: ${STREAM_PORT} всё ещё занят, ищем свободный"
+  while port_in_use "${STREAM_PORT}"; do
+    STREAM_PORT=$((STREAM_PORT + 1))
+  done
+fi
 
 echo "[stream_onnx] RUN_ID=${RUN_ID} DISPLAY=${DISPLAY} port=${STREAM_PORT}"
 echo "[stream_onnx] build=${BUILD_PATH} ${STREAM_WIDTH}x${STREAM_HEIGHT} q=${QUALITY_LEVEL}"
@@ -89,17 +245,15 @@ echo "[stream_onnx] OBS: захват окна Unity (forest_survival)"
 export FOREST_STREAM_EXTERNAL_BRAIN=1
 export FOREST_TIME_SCALE="${TIME_SCALE}"
 export FOREST_RESULTS_DIR="${ROOT}/results/${RUN_ID}"
-# Меньше пауз рендера / VSync — Unity не ждёт дисплей между env.step.
+export FOREST_STREAM_RESTART_FLAG="${FLAG}"
 export __GL_SYNC_TO_VBLANK="${__GL_SYNC_TO_VBLANK:-0}"
 export vblank_mode="${vblank_mode:-0}"
 
-# Стрим+OBS на одном ядре (по умолчанию 5); train — на 0-4.
 # shellcheck source=cpu_affinity.env.bash
 source "${ROOT}/train_scripts/lab_comp/cpu_affinity.env.bash"
 echo "[stream_onnx] CPU affinity: stream=${FOREST_STREAM_CPUS} train=${FOREST_TRAIN_CPUS} obs=${FOREST_OBS_CPUS}"
 renice -n -10 $$ >/dev/null 2>&1 || renice -n -5 $$ >/dev/null 2>&1 || true
 
-# OBS не должен сидеть на ядрах Unity-стрима
 if pgrep -x obs >/dev/null 2>&1; then
   for pid in $(pgrep -x obs); do
     taskset -cp "${FOREST_OBS_CPUS}" "${pid}" >/dev/null 2>&1 || true
@@ -113,7 +267,7 @@ STREAM_CMD=(
   --env "${ROOT}/${BUILD_PATH}"
   --port "${STREAM_PORT}"
   --results-dir "${ROOT}/results"
-  --poll-sec "${POLL_SEC}"
+  --poll-sec "${POLL_SEC_ONNX}"
   --time-scale "${TIME_SCALE}"
   --target-fps "${TARGET_FPS}"
   --quality-level "${QUALITY_LEVEL}"
@@ -123,6 +277,21 @@ STREAM_CMD=(
 )
 
 if command -v taskset >/dev/null 2>&1; then
+  # После старта Unity: только mute явного train + unmute стрима (не глушим FMOD «по умолчанию»).
+  (
+    sleep 12
+    bash "${ROOT}/train_scripts/lab_comp/mute_train_pulse_audio.bash" >/tmp/forest_mute_audio.log 2>&1 || true
+    sleep 8
+    bash "${ROOT}/train_scripts/lab_comp/mute_train_pulse_audio.bash" >>/tmp/forest_mute_audio.log 2>&1 || true
+  ) &
+  disown
   exec taskset -c "${FOREST_STREAM_CPUS}" "${STREAM_CMD[@]}"
 fi
+(
+  sleep 12
+  bash "${ROOT}/train_scripts/lab_comp/mute_train_pulse_audio.bash" >/tmp/forest_mute_audio.log 2>&1 || true
+  sleep 8
+  bash "${ROOT}/train_scripts/lab_comp/mute_train_pulse_audio.bash" >>/tmp/forest_mute_audio.log 2>&1 || true
+) &
+disown
 exec "${STREAM_CMD[@]}"

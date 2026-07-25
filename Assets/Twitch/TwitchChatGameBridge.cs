@@ -34,7 +34,7 @@ public sealed class TwitchChatGameBridge : MonoBehaviour
         if (!TrainingEnvSpace.ShouldRunPresentationOnlyServices())
             return;
 
-        if (FindObjectOfType<TwitchChatGameBridge>() != null)
+        if (FindFirstObjectByType<TwitchChatGameBridge>() != null)
             return;
 
         var reader = TwitchChatReader.Instance;
@@ -49,7 +49,7 @@ public sealed class TwitchChatGameBridge : MonoBehaviour
     /// <summary>Тест в Play: те же обработчики, что для Twitch IRC.</summary>
     public static void SimulateCommand(string commandName, int intValue = 1)
     {
-        var bridge = FindObjectOfType<TwitchChatGameBridge>();
+        var bridge = FindFirstObjectByType<TwitchChatGameBridge>();
         if (bridge == null)
         {
             Debug.LogWarning("[TwitchChat] SimulateCommand: TwitchChatGameBridge не найден");
@@ -77,8 +77,9 @@ public sealed class TwitchChatGameBridge : MonoBehaviour
             case "forward":
                 HandleForward(cmd);
                 break;
-            case "zombie":
-                HandleZombie(cmd);
+            case "add_zombie":
+            case "zombie": // старый чат #zombie=
+                HandleAddZombie(cmd);
                 break;
             case "clone_jack":
                 // Временно отключено: клон сбрасывает зомби/среду.
@@ -91,6 +92,9 @@ public sealed class TwitchChatGameBridge : MonoBehaviour
                 HandleSpeedUp(cmd);
                 break;
             case "show_metrics":
+            case "show_metrics_jack":
+            case "show_metrics_lily":
+            case "show_metrics_george":
                 HandleShowMetrics(cmd);
                 break;
             case "add_fire":
@@ -98,6 +102,9 @@ public sealed class TwitchChatGameBridge : MonoBehaviour
                 break;
             case "reset":
                 HandleReset(cmd);
+                break;
+            case "restart_stream":
+                HandleRestartStream(cmd);
                 break;
             case "menu":
                 PresentationEnvSwitcher.ToggleMenu();
@@ -161,10 +168,10 @@ public sealed class TwitchChatGameBridge : MonoBehaviour
     void HandleUp(TwitchChatCommand cmd)
     {
         int height = Mathf.Clamp(cmd.IntValue, 1, MaxUpHeight);
-        var jack = TrainingEnvSpace.FindPresentationJack();
+        var jack = TrainingEnvSpace.FindViewJack();
         if (jack == null)
         {
-            Debug.LogWarning("[TwitchChat] up: Jack не найден в presentation Env");
+            Debug.Log($"[TwitchChat] up: нет активного Jack в текущей среде (на задаче Lily/George его нет)");
             return;
         }
 
@@ -175,10 +182,10 @@ public sealed class TwitchChatGameBridge : MonoBehaviour
     void HandleForward(TwitchChatCommand cmd)
     {
         int strength = Mathf.Clamp(cmd.IntValue, 1, MaxForwardStrength);
-        var jack = TrainingEnvSpace.FindPresentationJack();
+        var jack = TrainingEnvSpace.FindViewJack();
         if (jack == null)
         {
-            Debug.LogWarning("[TwitchChat] forward: Jack не найден в presentation Env");
+            Debug.Log($"[TwitchChat] forward: нет активного Jack в текущей среде");
             return;
         }
 
@@ -186,29 +193,53 @@ public sealed class TwitchChatGameBridge : MonoBehaviour
         Debug.Log($"[TwitchChat] {cmd.DisplayName}: #forward={strength}");
     }
 
-    void HandleZombie(TwitchChatCommand cmd)
+    void HandleAddZombie(TwitchChatCommand cmd)
     {
         int count = Mathf.Clamp(cmd.IntValue, 1, MaxZombiesPerCommand);
-        var jack = TrainingEnvSpace.FindPresentationJack();
-        var spawner = ZombieSpawner.FindPresentationZombieSpawner();
+        var envRoot = TrainingEnvSpace.ActiveViewEnvRoot ?? TrainingEnvSpace.PresentationRoot;
+        var jack = TrainingEnvSpace.FindViewJack();
+        ZombieSpawner spawner = null;
+
+        if (envRoot != null)
+        {
+            var focusedSpawners = envRoot.GetComponentsInChildren<ZombieSpawner>(true);
+            for (int i = 0; i < focusedSpawners.Length; i++)
+            {
+                if (focusedSpawners[i] != null
+                    && string.Equals(focusedSpawners[i].gameObject.name, "ZombieSpawner",
+                        System.StringComparison.OrdinalIgnoreCase))
+                {
+                    spawner = focusedSpawners[i];
+                    break;
+                }
+            }
+            if (spawner == null && focusedSpawners.Length > 0)
+                spawner = focusedSpawners[0];
+        }
+
+        if (spawner == null)
+            spawner = ZombieSpawner.FindPresentationZombieSpawner();
 
         if (spawner == null)
         {
-            Debug.LogWarning("[TwitchChat] zombie: ZombieSpawner не найден");
+            Debug.LogWarning("[TwitchChat] add zombie: ZombieSpawner не найден");
             return;
         }
 
         if (jack == null)
         {
-            Debug.LogWarning("[TwitchChat] zombie: Jack не найден в presentation Env");
-            return;
+            Debug.Log("[TwitchChat] add zombie: нет активного Jack — спавн у спавнера");
         }
 
-        int spawned = spawner.SpawnZombiesNear(jack.transform.position, count, zombieSpawnRadius);
+        if (!spawner.gameObject.activeSelf)
+            spawner.gameObject.SetActive(true);
+
+        Vector3 near = jack != null ? jack.transform.position : spawner.transform.position;
+        int spawned = spawner.SpawnZombiesNear(near, count, zombieSpawnRadius);
         if (spawned == 0)
-            Debug.LogWarning("[TwitchChat] zombie: не создано (проверьте zombiePrefab на ZombieSpawner)");
+            Debug.LogWarning("[TwitchChat] add zombie: не создано (проверьте zombiePrefab на ZombieSpawner)");
         else
-            Debug.Log($"[TwitchChat] {cmd.DisplayName}: #zombie={count} → зомби +{spawned} рядом с Jack");
+            Debug.Log($"[TwitchChat] {cmd.DisplayName}: #add zombie={count} → зомби +{spawned}");
     }
 
     void HandleCloneJack(TwitchChatCommand cmd)
@@ -236,36 +267,53 @@ public sealed class TwitchChatGameBridge : MonoBehaviour
     void HandleSize(TwitchChatCommand cmd)
     {
         int sizeLevel = Mathf.Clamp(cmd.IntValue, 1, MaxSizeLevel);
-        var jack = TrainingEnvSpace.FindPresentationPrimaryJack();
+        var jack = TrainingEnvSpace.FindViewJack();
         if (jack == null)
         {
-            Debug.LogWarning("[TwitchChat] size: оригинальный Jack не найден в presentation Env");
+            Debug.Log(
+                "[TwitchChat] size: нет активного Jack (на среде Lily/George герой скрыт — " +
+                "переключись на Jack-среду или #env_0)");
             return;
         }
 
         TwitchEphemeralEffects.ApplyJackSize(jack, sizeLevel);
         float mult = TwitchEphemeralEffects.SizeLevelToMultiplier(sizeLevel);
-        Debug.Log($"[TwitchChat] {cmd.DisplayName}: #size={sizeLevel} (×{mult:0.#})");
+        Debug.Log(
+            $"[TwitchChat] {cmd.DisplayName}: #size={sizeLevel} (×{mult:0.#}) " +
+            $"env={TrainingEnvSpace.FindRoot(jack.transform)?.name}");
     }
 
     void HandleSpeedUp(TwitchChatCommand cmd)
     {
         int mult = Mathf.Clamp(cmd.IntValue, 1, MaxSpeedMultiplier);
-        var jack = TrainingEnvSpace.FindPresentationPrimaryJack();
+        var jack = TrainingEnvSpace.FindViewJack();
         if (jack == null)
         {
-            Debug.LogWarning("[TwitchChat] speed_up: оригинальный Jack не найден в presentation Env");
+            Debug.Log("[TwitchChat] speed_up: нет активного Jack в текущей среде");
             return;
         }
 
         TwitchEphemeralEffects.ApplyJackSpeed(jack, mult);
-        Debug.Log($"[TwitchChat] {cmd.DisplayName}: #speed_up={mult} (скорость ×{mult})");
+        Debug.Log(
+            $"[TwitchChat] {cmd.DisplayName}: #speed_up={mult} (скорость ×{mult}) " +
+            $"env={TrainingEnvSpace.FindRoot(jack.transform)?.name}");
     }
 
     void HandleShowMetrics(TwitchChatCommand cmd)
     {
-        TrainingMetricsBurstOverlay.Toggle();
-        Debug.Log($"[TwitchChat] {cmd.DisplayName}: #show metrics → переключить графики");
+        var hero = TrainingMetricsBurstOverlay.MetricsHero.None;
+        if (cmd.CommandName.EndsWith("_jack", System.StringComparison.Ordinal)
+            || cmd.IntValue == 1)
+            hero = TrainingMetricsBurstOverlay.MetricsHero.Jack;
+        else if (cmd.CommandName.EndsWith("_lily", System.StringComparison.Ordinal)
+            || cmd.IntValue == 2)
+            hero = TrainingMetricsBurstOverlay.MetricsHero.Lily;
+        else if (cmd.CommandName.EndsWith("_george", System.StringComparison.Ordinal)
+            || cmd.IntValue == 3)
+            hero = TrainingMetricsBurstOverlay.MetricsHero.George;
+
+        TrainingMetricsBurstOverlay.Show(hero);
+        Debug.Log($"[TwitchChat] {cmd.DisplayName}: #show metrics {(hero == TrainingMetricsBurstOverlay.MetricsHero.None ? "(скрыть)" : hero.ToString())}");
     }
 
     void HandleAddFire(TwitchChatCommand cmd)
@@ -283,30 +331,71 @@ public sealed class TwitchChatGameBridge : MonoBehaviour
 
     void HandleReset(TwitchChatCommand cmd)
     {
-        var jack = TrainingEnvSpace.FindPresentationPrimaryJack();
-        if (jack == null)
+        var envRoot = TrainingEnvSpace.ActiveViewEnvRoot;
+        if (envRoot == null)
+            envRoot = TrainingEnvSpace.PresentationRoot;
+
+        if (envRoot == null)
         {
-            Debug.LogWarning("[TwitchChat] reset: Jack не найден в presentation Env");
+            Debug.LogWarning("[TwitchChat] reset: нет Env");
             return;
         }
 
-        var envRoot = TrainingEnvSpace.FindRoot(jack.transform);
+        if (!envRoot.gameObject.activeSelf)
+            envRoot.gameObject.SetActive(true);
+
         AgentDeathOverlay.Hide();
         DeathFreeze.EnsureEnvSimulationRunning();
         DeathFreeze.UnfreezeWorld();
         BackgroundMusic.ResumeMusic();
-        TwitchEphemeralEffects.OnPresentationJackEpisodeBegin(jack);
+
+        var primaryJack = TrainingEnvSpace.FindPrimaryJackInEnv(envRoot);
+        if (primaryJack != null)
+            TwitchEphemeralEffects.OnPresentationJackEpisodeBegin(primaryJack);
 
         PresentationWorldReset.ResetSpawners(envRoot, force: true);
 
-        jack.EndEpisode();
+        // EndEpisode без OnEpisodeBegin (External Brain) не поднимает HP — форсируем полный рестарт.
+        foreach (var jack in envRoot.GetComponentsInChildren<AgentGoToHouseDiscrete>(true))
+        {
+            if (jack == null || !jack.gameObject.activeInHierarchy)
+                continue;
+            if (TwitchEphemeralEffects.IsTwitchClone(jack))
+                continue;
+            string n = jack.gameObject.name;
+            if (n == "Jack" || n == "George")
+                continue;
+            jack.ForceFullEpisodeRestart();
+        }
 
-        var lily = envRoot != null ? envRoot.GetComponentInChildren<LilyScript>(false) : null;
-        if (lily != null)
-            lily.EndEpisode();
+        foreach (var lily in envRoot.GetComponentsInChildren<LilyScript>(true))
+        {
+            if (lily == null || !lily.gameObject.activeInHierarchy)
+                continue;
+            if (TwitchEphemeralEffects.IsTwitchClone(lily))
+                continue;
+            if (lily.gameObject.name == "Lily")
+                continue;
+            lily.ForceFullEpisodeRestart();
+        }
+
+        TrainingEnvSpace.EnsureActiveViewCamera();
 
         Debug.Log(
-            $"[TwitchChat] {cmd.DisplayName}: #reset → новый эпизод. {PresentationWorldReset.DescribeState(envRoot)}");
+            $"[TwitchChat] {cmd.DisplayName}: #reset → {envRoot.name}. " +
+            $"{PresentationWorldReset.DescribeState(envRoot)}");
     }
 
+    void HandleRestartStream(TwitchChatCommand cmd)
+    {
+        if (!StreamRestartRequest.TryRequest(cmd.DisplayName, out string detail))
+        {
+            Debug.LogWarning($"[TwitchChat] #restart_stream отказано: {detail}");
+            return;
+        }
+
+        Debug.Log(
+            $"[TwitchChat] {cmd.DisplayName}: #restart_stream → флаг {detail} " +
+            "(run_stream_supervised перезапустит только стрим, train не трогает)");
+    }
 }

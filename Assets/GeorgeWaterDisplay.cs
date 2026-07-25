@@ -18,7 +18,7 @@ public sealed class GeorgeWaterDisplay : MonoBehaviour
             _text.richText = true;
         if (spriteAsset == null)
         {
-            var jackHud = Object.FindObjectOfType<WaterDisplay>();
+            var jackHud = Object.FindFirstObjectByType<WaterDisplay>();
             if (jackHud != null)
                 spriteAsset = jackHud.WaterSpriteAsset;
         }
@@ -29,7 +29,7 @@ public sealed class GeorgeWaterDisplay : MonoBehaviour
 
     internal void BindWaterSpriteFromJack()
     {
-        var jackHud = Object.FindObjectOfType<WaterDisplay>();
+        var jackHud = Object.FindFirstObjectByType<WaterDisplay>();
         if (jackHud != null)
             spriteAsset = jackHud.WaterSpriteAsset;
         if (_text != null && spriteAsset != null)
@@ -61,7 +61,7 @@ public sealed class GeorgeWaterDisplay : MonoBehaviour
             _text.spriteAsset = spriteAsset;
         else if (spriteAsset == null)
         {
-            var jackHud = Object.FindObjectOfType<WaterDisplay>();
+            var jackHud = Object.FindFirstObjectByType<WaterDisplay>();
             if (jackHud != null && jackHud.WaterSpriteAsset != null)
             {
                 spriteAsset = jackHud.WaterSpriteAsset;

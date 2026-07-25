@@ -1,30 +1,67 @@
 using System.Collections.Generic;
+using System.Text;
 using UnityEngine;
 using UnityEngine.UI;
 using TMPro;
 
-/// <summary>По #show metrics — переключатель (вкл/выкл) графиков обучения на экране.</summary>
+/// <summary>
+/// #show metrics jack|lily|george — задачи героя и success rate.
+/// #show metrics без имени — скрыть. Меньше лагов: реже redraw, меньше графиков, skip SetPixels.
+/// </summary>
 public sealed class TrainingMetricsBurstOverlay : MonoBehaviour
 {
-    const int GraphWidth = 300;
-    const int GraphHeight = 100;
-    const int YAxisWidth = 52;
-    const int SlotPaddingX = 8;
-    const int XAxisHeight = 20;
+    public enum MetricsHero
+    {
+        None = 0,
+        Jack = 1,
+        Lily = 2,
+        George = 3,
+    }
+
+    const int GraphWidth = 200;
+    const int GraphHeight = 68;
+    const int YAxisWidth = 44;
+    const int SlotPaddingX = 6;
+    const int XAxisHeight = 16;
     const int LineThickness = 2;
-    const int YTickCount = 5;
+    const int YTickCount = 3;
     const int XTickCount = 3;
-    const float RedrawIntervalSeconds = 0.5f;
+    const int MaxSlots = 6; // reward + entropy + до 4 задач
+    const float RedrawIntervalSeconds = 2.5f;
 
     static readonly Color GridColor = new Color(0.22f, 0.26f, 0.3f, 1f);
     static readonly Color AxisLabelColor = new Color(0.78f, 0.82f, 0.88f, 1f);
     static readonly Color GraphBg = new Color(0.08f, 0.1f, 0.12f, 1f);
+
+    static readonly EnvTrainingTask[] JackTasks =
+    {
+        EnvTrainingTask.JackWood,
+        EnvTrainingTask.JackFood,
+        EnvTrainingTask.JackWater,
+        EnvTrainingTask.JackZombie,
+    };
+
+    static readonly EnvTrainingTask[] LilyTasks =
+    {
+        EnvTrainingTask.LilyFood,
+        EnvTrainingTask.LilyWater,
+        EnvTrainingTask.LilyHeat,
+        EnvTrainingTask.LilyFlower,
+    };
+
+    static readonly EnvTrainingTask[] GeorgeTasks =
+    {
+        EnvTrainingTask.GeorgeFood,
+        EnvTrainingTask.GeorgeWater,
+        EnvTrainingTask.GeorgeHeat,
+    };
 
     static TrainingMetricsBurstOverlay _instance;
     static Color[] _sharedPixels;
 
     sealed class GraphSlot
     {
+        public GameObject Root;
         public RawImage Image;
         public Texture2D Tex;
         public TMP_Text TitleLabel;
@@ -33,19 +70,18 @@ public sealed class TrainingMetricsBurstOverlay : MonoBehaviour
         public float LastYMin;
         public float LastYMax;
         public int LastPointCount;
-        public bool IsPercent;
+        public int LastDrawSig;
+        public bool IsPercent = true;
     }
 
     GameObject _panel;
-    GraphSlot _rewardGraph;
-    GraphSlot _entropyGraph;
-    GraphSlot _gradGraph;
-    GraphSlot _woodSuccessGraph;
-    GraphSlot _sheepSuccessGraph;
-    GraphSlot _fireSuccessGraph;
+    TMP_Text _titleText;
     TMP_Text _valuesText;
+    readonly GraphSlot[] _slots = new GraphSlot[MaxSlots];
     bool _visible;
+    MetricsHero _hero = MetricsHero.None;
     float _nextRedrawTime;
+    readonly StringBuilder _sb = new StringBuilder(256);
 
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
     static void Bootstrap()
@@ -58,11 +94,43 @@ public sealed class TrainingMetricsBurstOverlay : MonoBehaviour
         _instance = go.AddComponent<TrainingMetricsBurstOverlay>();
     }
 
-    public static void Toggle()
+    public static void Toggle() => Show(MetricsHero.Jack);
+
+    /// <summary>9 в Play: Jack → Lily → George → скрыть → Jack…</summary>
+    public static void CycleHeroes()
     {
         if (_instance == null)
             Bootstrap();
-        _instance.ToggleInternal();
+        _instance.CycleHeroesInternal();
+    }
+
+    public static void Show(MetricsHero hero)
+    {
+        if (_instance == null)
+            Bootstrap();
+        _instance.ShowInternal(hero);
+    }
+
+    void CycleHeroesInternal()
+    {
+        if (!_visible || _hero == MetricsHero.None)
+        {
+            ShowInternal(MetricsHero.Jack);
+            return;
+        }
+
+        switch (_hero)
+        {
+            case MetricsHero.Jack:
+                ShowInternal(MetricsHero.Lily);
+                break;
+            case MetricsHero.Lily:
+                ShowInternal(MetricsHero.George);
+                break;
+            default:
+                ShowInternal(MetricsHero.None);
+                break;
+        }
     }
 
     void Awake()
@@ -83,25 +151,46 @@ public sealed class TrainingMetricsBurstOverlay : MonoBehaviour
     {
         if (!_visible)
             return;
-        // Не каждый кадр: 6× SetPixels+диск убивали FPS стрима → «игра замерла».
         if (Time.unscaledTime < _nextRedrawTime)
             return;
         _nextRedrawTime = Time.unscaledTime + RedrawIntervalSeconds;
         RedrawAll();
     }
 
-    void ToggleInternal()
+    void ShowInternal(MetricsHero hero)
     {
         if (_panel == null)
             BuildUi();
 
-        _visible = !_visible;
-        _panel.SetActive(_visible);
-        if (_visible)
+        // Без имени героя — только скрыть.
+        if (hero == MetricsHero.None)
         {
-            _nextRedrawTime = 0f;
-            RedrawAll();
+            _visible = false;
+            _hero = MetricsHero.None;
+            _panel.SetActive(false);
+            return;
         }
+
+        // Тот же герой повторно — скрыть.
+        if (_visible && _hero == hero)
+        {
+            _visible = false;
+            _hero = MetricsHero.None;
+            _panel.SetActive(false);
+            return;
+        }
+
+        _hero = hero;
+        _visible = true;
+        _panel.SetActive(true);
+        _nextRedrawTime = 0f;
+        for (int i = 0; i < _slots.Length; i++)
+        {
+            if (_slots[i] != null)
+                _slots[i].LastDrawSig = int.MinValue;
+        }
+
+        RedrawAll();
     }
 
     void BuildUi()
@@ -125,23 +214,30 @@ public sealed class TrainingMetricsBurstOverlay : MonoBehaviour
         panelRt.anchorMin = new Vector2(0.5f, 0.5f);
         panelRt.anchorMax = new Vector2(0.5f, 0.5f);
         panelRt.pivot = new Vector2(0.5f, 0.5f);
-        panelRt.sizeDelta = new Vector2(1180f, 640f);
+        panelRt.sizeDelta = new Vector2(1180f, 580f);
 
         var bg = _panel.AddComponent<Image>();
         bg.color = new Color(0.03f, 0.05f, 0.08f, 0.92f);
         bg.raycastTarget = false;
         _panel.AddComponent<RectMask2D>();
 
-        CreateTitle(_panel.transform, "Метрики обучения (#show metrics — вкл/выкл)", new Vector2(0f, -8f));
+        _titleText = CreateTitle(_panel.transform, "Метрики", new Vector2(0f, -8f));
 
-        float colStep = (GraphWidth + YAxisWidth + SlotPaddingX * 2f + 12f);
-        _rewardGraph = CreateGraphSlot(_panel.transform, "Суммарный reward (EMA)", new Vector2(-colStep, 165f), false);
-        _entropyGraph = CreateGraphSlot(_panel.transform, "Энтропия политики", new Vector2(0f, 165f), false);
-        _gradGraph = CreateGraphSlot(_panel.transform, "Grad norm (approx)", new Vector2(colStep, 165f), false);
+        float colStep = GraphWidth + YAxisWidth + SlotPaddingX * 2f + 20f;
+        float rowTop = 145f;
+        float rowBot = -55f;
+        Vector2[] positions =
+        {
+            new Vector2(-colStep, rowTop),
+            new Vector2(0f, rowTop),
+            new Vector2(colStep, rowTop),
+            new Vector2(-colStep, rowBot),
+            new Vector2(0f, rowBot),
+            new Vector2(colStep, rowBot),
+        };
 
-        _woodSuccessGraph = CreateGraphSlot(_panel.transform, "Success: Wood (≥10)", new Vector2(-colStep, -55f), true);
-        _sheepSuccessGraph = CreateGraphSlot(_panel.transform, "Success: Sheep (≥10)", new Vector2(0f, -55f), true);
-        _fireSuccessGraph = CreateGraphSlot(_panel.transform, "Success: Fire (дом)", new Vector2(colStep, -55f), true);
+        for (int i = 0; i < MaxSlots; i++)
+            _slots[i] = CreateGraphSlot(_panel.transform, $"Slot{i}", positions[i]);
 
         var valuesGo = new GameObject("Values");
         valuesGo.transform.SetParent(_panel.transform, false);
@@ -150,17 +246,17 @@ public sealed class TrainingMetricsBurstOverlay : MonoBehaviour
         valuesRt.anchorMax = new Vector2(1f, 0f);
         valuesRt.pivot = new Vector2(0.5f, 0f);
         valuesRt.anchoredPosition = new Vector2(0f, 10f);
-        valuesRt.sizeDelta = new Vector2(-24f, 44f);
+        valuesRt.sizeDelta = new Vector2(-24f, 52f);
 
         _valuesText = valuesGo.AddComponent<TextMeshProUGUI>();
-        _valuesText.fontSize = 17;
+        _valuesText.fontSize = 16;
         _valuesText.alignment = TextAlignmentOptions.Center;
         _valuesText.raycastTarget = false;
         if (TMP_Settings.defaultFontAsset != null)
             _valuesText.font = TMP_Settings.defaultFontAsset;
     }
 
-    static void CreateTitle(Transform parent, string text, Vector2 anchoredPos)
+    static TMP_Text CreateTitle(Transform parent, string text, Vector2 anchoredPos)
     {
         var go = new GameObject("Title");
         go.transform.SetParent(parent, false);
@@ -169,30 +265,32 @@ public sealed class TrainingMetricsBurstOverlay : MonoBehaviour
         rt.anchorMax = new Vector2(0.5f, 1f);
         rt.pivot = new Vector2(0.5f, 1f);
         rt.anchoredPosition = anchoredPos;
-        rt.sizeDelta = new Vector2(980f, 32f);
+        rt.sizeDelta = new Vector2(920f, 32f);
 
         var tmp = go.AddComponent<TextMeshProUGUI>();
         tmp.text = text;
-        tmp.fontSize = 24;
+        tmp.fontSize = 22;
         tmp.fontStyle = FontStyles.Bold;
         tmp.alignment = TextAlignmentOptions.Center;
         tmp.raycastTarget = false;
         if (TMP_Settings.defaultFontAsset != null)
             tmp.font = TMP_Settings.defaultFontAsset;
+        return tmp;
     }
 
-    static GraphSlot CreateGraphSlot(Transform parent, string label, Vector2 anchoredPos, bool isPercent)
+    static GraphSlot CreateGraphSlot(Transform parent, string label, Vector2 anchoredPos)
     {
-        var slot = new GraphSlot { IsPercent = isPercent };
+        var slot = new GraphSlot();
 
         var slotGo = new GameObject(label);
         slotGo.transform.SetParent(parent, false);
+        slot.Root = slotGo;
         var rt = slotGo.AddComponent<RectTransform>();
         rt.anchorMin = new Vector2(0.5f, 0.5f);
         rt.anchorMax = new Vector2(0.5f, 0.5f);
         rt.pivot = new Vector2(0.5f, 0.5f);
         rt.anchoredPosition = anchoredPos;
-        rt.sizeDelta = new Vector2(GraphWidth + YAxisWidth + SlotPaddingX * 2f, GraphHeight + XAxisHeight + 48f);
+        rt.sizeDelta = new Vector2(GraphWidth + YAxisWidth + SlotPaddingX * 2f, GraphHeight + XAxisHeight + 44f);
 
         var labelGo = new GameObject("Label");
         labelGo.transform.SetParent(slotGo.transform, false);
@@ -201,11 +299,10 @@ public sealed class TrainingMetricsBurstOverlay : MonoBehaviour
         labelRt.anchorMax = new Vector2(1f, 1f);
         labelRt.pivot = new Vector2(0.5f, 1f);
         labelRt.anchoredPosition = Vector2.zero;
-        labelRt.sizeDelta = new Vector2(0f, 26f);
+        labelRt.sizeDelta = new Vector2(0f, 24f);
 
         slot.TitleLabel = labelGo.AddComponent<TextMeshProUGUI>();
-        slot.TitleLabel.text = label;
-        slot.TitleLabel.fontSize = 18;
+        slot.TitleLabel.fontSize = 16;
         slot.TitleLabel.fontStyle = FontStyles.Bold;
         slot.TitleLabel.alignment = TextAlignmentOptions.Center;
         slot.TitleLabel.raycastTarget = false;
@@ -218,7 +315,7 @@ public sealed class TrainingMetricsBurstOverlay : MonoBehaviour
         plotRt.anchorMin = new Vector2(0f, 0f);
         plotRt.anchorMax = new Vector2(1f, 1f);
         plotRt.offsetMin = new Vector2(SlotPaddingX, 0f);
-        plotRt.offsetMax = new Vector2(-SlotPaddingX, -28f);
+        plotRt.offsetMax = new Vector2(-SlotPaddingX, -26f);
 
         var yAxisGo = new GameObject("YAxis");
         yAxisGo.transform.SetParent(plotGo.transform, false);
@@ -234,7 +331,7 @@ public sealed class TrainingMetricsBurstOverlay : MonoBehaviour
             float t = i / (float)(YTickCount - 1);
             slot.YLabels[i] = CreateAxisLabel(yAxisGo.transform, $"Y{i}", "0",
                 new Vector2(0f, 1f - t), new Vector2(1f, 1f - t), new Vector2(1f, 0.5f),
-                Vector2.zero, new Vector2(YAxisWidth - 4f, 18f), 12, TextAlignmentOptions.MidlineRight);
+                Vector2.zero, new Vector2(YAxisWidth - 4f, 16f), 11, TextAlignmentOptions.MidlineRight);
         }
 
         var graphGo = new GameObject("Graph");
@@ -269,7 +366,7 @@ public sealed class TrainingMetricsBurstOverlay : MonoBehaviour
             float anchorX = i / (float)(XTickCount - 1);
             slot.XLabels[i] = CreateAxisLabel(xAxisGo.transform, $"X{i}", "0",
                 new Vector2(anchorX, 0f), new Vector2(anchorX, 0f), new Vector2(0.5f, 0f),
-                Vector2.zero, new Vector2(64f, 18f), 12, TextAlignmentOptions.Bottom);
+                Vector2.zero, new Vector2(56f, 16f), 11, TextAlignmentOptions.Bottom);
             slot.XLabels[i].alignment = i == 0
                 ? TextAlignmentOptions.BottomLeft
                 : (i == XTickCount - 1 ? TextAlignmentOptions.BottomRight : TextAlignmentOptions.Bottom);
@@ -295,7 +392,7 @@ public sealed class TrainingMetricsBurstOverlay : MonoBehaviour
         label.text = text;
         label.fontSize = fontSize;
         label.color = AxisLabelColor;
-        label.enableWordWrapping = false;
+        label.textWrappingMode = TextWrappingModes.NoWrap;
         label.overflowMode = TextOverflowModes.Overflow;
         label.alignment = alignment;
         label.raycastTarget = false;
@@ -308,55 +405,164 @@ public sealed class TrainingMetricsBurstOverlay : MonoBehaviour
     {
         TrainingTaskSuccessTracker.TickOverlayRefresh();
 
-        // Без копии списка каждый кадр — только чтение.
-        var rewardSeries = TrainingGraphOverlay.GetJackRewardSeriesReadonly();
+        EnvTrainingTask[] tasks = TasksForHero(_hero);
+        string heroName = HeroTitle(_hero);
+        if (_titleText != null)
+            _titleText.text = $"Метрики: {heroName}  (#show metrics — скрыть)";
+
+        var rewardSeries = RewardSeriesForHero(_hero);
+        float rewardEma = RewardEmaForHero(_hero);
         var entropySeries = TrainingPolicyStats.EntropySeries;
-        var gradSeries = TrainingPolicyStats.GradNormSeries;
-        var woodSeries = TrainingTaskSuccessTracker.GetRateSeries(TrainingTaskSuccessTracker.Metric.Wood);
-        var sheepSeries = TrainingTaskSuccessTracker.GetRateSeries(TrainingTaskSuccessTracker.Metric.Sheep);
-        var fireSeries = TrainingTaskSuccessTracker.GetRateSeries(TrainingTaskSuccessTracker.Metric.Fire);
 
-        DrawGraph(_rewardGraph, rewardSeries, new Color(0.22f, 0.48f, 0.95f, 1f), "Суммарный reward (EMA)", null);
-        DrawGraph(_entropyGraph, entropySeries, new Color(0.35f, 0.95f, 0.55f, 1f), "Энтропия политики", null);
-        DrawGraph(_gradGraph, gradSeries, new Color(0.98f, 0.72f, 0.25f, 1f), "Grad norm (approx)", null);
+        // Слот 0 — reward, 1 — entropy, дальше задачи героя.
+        DrawGraph(_slots[0], rewardSeries, new Color(0.22f, 0.48f, 0.95f, 1f),
+            $"Reward EMA — {rewardEma:F2}", isPercent: false);
+        DrawGraph(_slots[1], entropySeries, new Color(0.35f, 0.95f, 0.55f, 1f),
+            $"Entropy — {TrainingPolicyStats.LastEntropy:F2}", isPercent: false);
+        if (_slots[0]?.Root != null) _slots[0].Root.SetActive(true);
+        if (_slots[1]?.Root != null) _slots[1].Root.SetActive(true);
 
-        float woodRate = TrainingTaskSuccessTracker.GetLastRate(TrainingTaskSuccessTracker.Metric.Wood);
-        float sheepRate = TrainingTaskSuccessTracker.GetLastRate(TrainingTaskSuccessTracker.Metric.Sheep);
-        float fireRate = TrainingTaskSuccessTracker.GetLastRate(TrainingTaskSuccessTracker.Metric.Fire);
-        int woodN = TrainingTaskSuccessTracker.GetSampleCount(TrainingTaskSuccessTracker.Metric.Wood);
-        int sheepN = TrainingTaskSuccessTracker.GetSampleCount(TrainingTaskSuccessTracker.Metric.Sheep);
-        int fireN = TrainingTaskSuccessTracker.GetSampleCount(TrainingTaskSuccessTracker.Metric.Fire);
+        _sb.Clear();
+        _sb.Append(heroName)
+            .Append("  Reward EMA: ").Append(rewardEma.ToString("F2"))
+            .Append(" · Entropy: ").Append(TrainingPolicyStats.LastEntropy.ToString("F2"))
+            .Append(" · SR: ");
 
-        DrawGraph(_woodSuccessGraph, woodSeries, new Color(0.55f, 0.82f, 0.35f, 1f),
-            $"Success: Wood (≥10) — {woodRate:P0} · n={woodN}", 0f, 1f);
-        DrawGraph(_sheepSuccessGraph, sheepSeries, new Color(0.98f, 0.55f, 0.35f, 1f),
-            $"Success: Sheep (≥10) — {sheepRate:P0} · n={sheepN}", 0f, 1f);
-        DrawGraph(_fireSuccessGraph, fireSeries, new Color(0.95f, 0.45f, 0.55f, 1f),
-            $"Success: Fire (дом) — {fireRate:P0} · n={fireN}", 0f, 1f);
-
-        float jackLive = TrainingGraphOverlay.GetPresentationJackCumulativeReward();
-        if (_valuesText != null)
+        for (int i = 0; i < MaxSlots - 2; i++)
         {
-            int graphPoints = TrainingGraphOverlay.GraphPointCount;
-            _valuesText.text =
-                $"Reward EMA: {TrainingGraphOverlay.JackEma:F2} · эпизод: {jackLive:F2} · точек: {graphPoints}   |   " +
-                $"Entropy: {TrainingPolicyStats.LastEntropy:F2}   |   Grad≈: {TrainingPolicyStats.LastGradNormApprox:F3}   |   " +
-                $"SR wood {woodRate:P0} (n={woodN}) · sheep {sheepRate:P0} (n={sheepN}) · " +
-                $"fire {fireRate:P0} (n={fireN}) · water {TrainingTaskSuccessTracker.GetLastRate(TrainingTaskSuccessTracker.Metric.Water):P0}";
+            int slotIndex = i + 2;
+            var slot = _slots[slotIndex];
+            if (slot == null)
+                continue;
+
+            if (i >= tasks.Length)
+            {
+                if (slot.Root != null)
+                    slot.Root.SetActive(false);
+                continue;
+            }
+
+            if (slot.Root != null)
+                slot.Root.SetActive(true);
+
+            var task = tasks[i];
+            var series = TrainingTaskSuccessTracker.GetTaskRateSeriesCached(task);
+            float rate = TrainingTaskSuccessTracker.GetTaskLastRateCached(task);
+            int n = TrainingTaskSuccessTracker.GetTaskSampleCountCached(task);
+            string label = TaskShortName(task);
+            string title = $"{label} — {rate:P0} · n={n}";
+            DrawGraph(slot, series, TaskColor(task), title, 0f, 1f, isPercent: true);
+
+            if (i > 0)
+                _sb.Append(" · ");
+            _sb.Append(label).Append(' ').Append(Mathf.RoundToInt(rate * 100f)).Append("% (n=").Append(n).Append(')');
+        }
+
+        if (_valuesText != null)
+            _valuesText.text = _sb.ToString();
+    }
+
+    static IReadOnlyList<float> RewardSeriesForHero(MetricsHero hero)
+    {
+        switch (hero)
+        {
+            case MetricsHero.Lily: return TrainingGraphOverlay.GetLilyRewardSeriesReadonly();
+            case MetricsHero.George: return TrainingGraphOverlay.GetGeorgeRewardSeriesReadonly();
+            default: return TrainingGraphOverlay.GetJackRewardSeriesReadonly();
+        }
+    }
+
+    static float RewardEmaForHero(MetricsHero hero)
+    {
+        switch (hero)
+        {
+            case MetricsHero.Lily: return TrainingGraphOverlay.LilyEma;
+            case MetricsHero.George: return TrainingGraphOverlay.GeorgeEma;
+            default: return TrainingGraphOverlay.JackEma;
+        }
+    }
+
+    static EnvTrainingTask[] TasksForHero(MetricsHero hero)
+    {
+        switch (hero)
+        {
+            case MetricsHero.Jack: return JackTasks;
+            case MetricsHero.Lily: return LilyTasks;
+            case MetricsHero.George: return GeorgeTasks;
+            default: return System.Array.Empty<EnvTrainingTask>();
+        }
+    }
+
+    static string HeroTitle(MetricsHero hero)
+    {
+        switch (hero)
+        {
+            case MetricsHero.Jack: return "Jack";
+            case MetricsHero.Lily: return "Lily";
+            case MetricsHero.George: return "George";
+            default: return "";
+        }
+    }
+
+    static string TaskShortName(EnvTrainingTask task)
+    {
+        switch (task)
+        {
+            case EnvTrainingTask.JackWood: return "Wood";
+            case EnvTrainingTask.JackFood:
+            case EnvTrainingTask.LilyFood:
+            case EnvTrainingTask.GeorgeFood: return "Sheep";
+            case EnvTrainingTask.JackWater:
+            case EnvTrainingTask.LilyWater:
+            case EnvTrainingTask.GeorgeWater: return "Water";
+            case EnvTrainingTask.JackZombie: return "Zombie";
+            case EnvTrainingTask.LilyHeat:
+            case EnvTrainingTask.GeorgeHeat: return "Fire";
+            case EnvTrainingTask.LilyFlower: return "Flower";
+            default: return task.ToString();
+        }
+    }
+
+    static Color TaskColor(EnvTrainingTask task)
+    {
+        switch (task)
+        {
+            case EnvTrainingTask.JackWood: return new Color(0.55f, 0.82f, 0.35f, 1f);
+            case EnvTrainingTask.JackFood:
+            case EnvTrainingTask.LilyFood:
+            case EnvTrainingTask.GeorgeFood: return new Color(0.98f, 0.55f, 0.35f, 1f);
+            case EnvTrainingTask.JackWater:
+            case EnvTrainingTask.LilyWater:
+            case EnvTrainingTask.GeorgeWater: return new Color(0.35f, 0.7f, 0.98f, 1f);
+            case EnvTrainingTask.JackZombie: return new Color(0.72f, 0.45f, 0.95f, 1f);
+            case EnvTrainingTask.LilyHeat:
+            case EnvTrainingTask.GeorgeHeat: return new Color(0.95f, 0.45f, 0.55f, 1f);
+            case EnvTrainingTask.LilyFlower: return new Color(0.95f, 0.85f, 0.35f, 1f);
+            default: return Color.white;
         }
     }
 
     static void DrawGraph(GraphSlot slot, IReadOnlyList<float> values, Color lineColor, string title,
-        float? fixedMin = null, float? fixedMax = null)
+        float? fixedMin = null, float? fixedMax = null, bool isPercent = true)
     {
         if (slot == null)
             return;
+
+        slot.IsPercent = isPercent;
 
         if (slot.TitleLabel != null)
         {
             slot.TitleLabel.text = title;
             slot.TitleLabel.raycastTarget = false;
         }
+
+        // Подпись обновляем всегда; SetPixels — только если серия реально изменилась.
+        int count = values?.Count ?? 0;
+        float last = count > 0 ? values[count - 1] : 0f;
+        int sig = count * 397 ^ (int)(last * 10000f) ^ (isPercent ? 1 : 0);
+        if (sig == slot.LastDrawSig)
+            return;
+        slot.LastDrawSig = sig;
 
         DrawSeriesTexture(slot, values, lineColor, fixedMin, fixedMax);
         UpdateAxisLabels(slot);
@@ -425,7 +631,6 @@ public sealed class TrainingMetricsBurstOverlay : MonoBehaviour
             return;
         }
 
-        // Не рисуем все 512 точек толстой кистью — прореживаем до ширины графика.
         int count = values.Count;
         int step = Mathf.Max(1, count / w);
         if (count == 1)
@@ -489,11 +694,9 @@ public sealed class TrainingMetricsBurstOverlay : MonoBehaviour
             return;
         }
 
-        int xMin = 1;
-        int xMax = count;
-        if (slot.XLabels[0] != null) slot.XLabels[0].text = xMin.ToString();
-        if (slot.XLabels[1] != null) slot.XLabels[1].text = ((xMin + xMax) / 2).ToString();
-        if (slot.XLabels[2] != null) slot.XLabels[2].text = xMax.ToString();
+        if (slot.XLabels[0] != null) slot.XLabels[0].text = "1";
+        if (slot.XLabels[1] != null) slot.XLabels[1].text = ((1 + count) / 2).ToString();
+        if (slot.XLabels[2] != null) slot.XLabels[2].text = count.ToString();
     }
 
     static string FormatAxisValue(float value)

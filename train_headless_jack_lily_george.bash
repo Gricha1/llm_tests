@@ -2,15 +2,17 @@
 set -eu
 set -o pipefail
 
-# Jack+Lily+George: 26 Unity headless (num-envs=26) + стрим отдельно (run_stream_onnx.bash).
-# worker 0  = PresentationFull (все трое, headless train)
-# workers 1–11 = узкие задачи (headless)
-# workers 12–25 = boost: 4 задачи с самым низким success rate (по ~3–4 копии каждой)
+# Jack+Lily+George: 27 Unity headless (num-envs=27) + стрим отдельно (run_stream_onnx.bash).
+# worker 0  = PresentationFull (как на стриме)
+# worker 1  = PresentationFull train (все трое)
+# workers 2–12 = узкие задачи (headless)
+# workers 13–27 = буст по 3 копии:
+#   JackWood×3, JackWater×3, JackZombie×3, LilyWater×3, GeorgeWater×3
 #
 #   RUN_ID=run_72 bash train_headless_jack_lily_george.bash --resume
 #   RUN_ID=run_72 bash train_scripts/lab_comp/run_stream_onnx.bash
 #
-# Без PresentationFull worker0 (11 envs):
+# Без PresentationFull worker0/1 (11 envs):
 #   TRAIN_MODE=multi bash train_headless_jack_lily_george.bash
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
@@ -40,7 +42,7 @@ export FOREST_TRAIN_ALL_HEADLESS=1
 if [ "${TRAIN_MODE}" = "multi" ]; then
   NUM_ENVS="${NUM_ENVS:-11}"
 else
-  NUM_ENVS="${NUM_ENVS:-26}"
+  NUM_ENVS="${NUM_ENVS:-28}"
 fi
 
 CONFIG="custom_configs/Jack_Lily_George.yaml"
@@ -53,7 +55,7 @@ if [ -f "build_versions/${BUILD%.x86_64}.BUILD_STAMP" ]; then
   echo "[train] BUILD_STAMP:"
   sed 's/^/[train]   /' "build_versions/${BUILD%.x86_64}.BUILD_STAMP"
 else
-  echo "[train] WARN: нет BUILD_STAMP — билд могли не обновить через sync_build" >&2
+  echo "[train] WARN: нет BUILD_STAMP — билд могли не обновить через sync.bash" >&2
 fi
 
 if [ -f "${HOME}/anaconda3/etc/profile.d/conda.sh" ]; then
@@ -92,14 +94,40 @@ for arg in "$@"; do
   [ "${arg}" = "--force" ] && FORCE=1
 done
 
+# Есть ли реальные .pt для продолжения (пустая results/run_N — не считается).
+run_has_checkpoints() {
+  local run="$1"
+  local beh d
+  for beh in JackLowLevelAgent LilyLowLevelAgent GeorgeLowLevelAgent; do
+    d="results/${run}/${beh}"
+    [ -d "${d}" ] || return 1
+    # хотя бы один .pt (checkpoint.pt или Name-*.pt)
+    if ! compgen -G "${d}/*.pt" >/dev/null; then
+      return 1
+    fi
+  done
+  return 0
+}
+
+# Пустая/битая папка run не должна блокировать новый старт.
+if [ -d "results/${RUN_ID}" ] && ! run_has_checkpoints "${RUN_ID}"; then
+  echo "[train] results/${RUN_ID} пустой или без .pt — сношу и стартую с нуля"
+  rm -rf "results/${RUN_ID}"
+  if [ "${RESUME}" -eq 1 ]; then
+    echo "[train] WARN: --resume игнорирую (нечего продолжать). Для нового обучения флаг не нужен."
+    RESUME=0
+  fi
+fi
+
 if [ -d "results/${RUN_ID}" ] && [ "${RESUME}" -eq 0 ] && [ "${FORCE}" -eq 0 ]; then
   if [ "${RUN_ID}" = "jack_lily_george_1" ]; then
     RUN_ID="$(pick_free_run_id)"
   else
-    echo "ERROR: results/${RUN_ID} уже есть." >&2
-    echo "  --resume  продолжить" >&2
+    echo "ERROR: results/${RUN_ID} уже есть (с чекпоинтами)." >&2
+    echo "  --resume  продолжить обучение" >&2
     echo "  --force   начать заново (удалит прогресс run)" >&2
-    echo "  RUN_ID=run_N  другой run" >&2
+    echo "  RUN_ID=run_N  другой свободный id" >&2
+    echo "Новый run без флагов:  RUN_ID=run_80 bash train_scripts/lab_comp/run_train.bash" >&2
     exit 1
   fi
 fi
@@ -110,12 +138,16 @@ if [ "${RESUME}" -eq 0 ] && [ "${FORCE}" -eq 1 ] && [ -d "results/${RUN_ID}" ]; 
 fi
 
 if [ "${RESUME}" -eq 1 ]; then
-  for behavior in JackLowLevelAgent LilyLowLevelAgent GeorgeLowLevelAgent; do
-    [ -d "results/${RUN_ID}/${behavior}" ] || {
-      echo "ERROR: results/${RUN_ID}/${behavior} не найден" >&2
-      exit 1
-    }
-  done
+  if ! run_has_checkpoints "${RUN_ID}"; then
+    echo "[train] WARN: --resume, но results/${RUN_ID}/*/ нет .pt — стартую с нуля" >&2
+    RESUME=0
+  else
+    echo "[train] resume: найдены чекпоинты в results/${RUN_ID}"
+  fi
+fi
+
+if [ "${RESUME}" -eq 0 ]; then
+  echo "[train] новый прогон: RUN_ID=${RUN_ID} (без --resume)"
 fi
 
 while netstat -tuln 2>/dev/null | grep -q ":${TRAIN_PORT} "; do
@@ -135,7 +167,13 @@ ML_ARGS=(
 
 # Важно: --resume/--force ДО --env-args, иначе mlagents съест их как аргументы Unity.
 [ "${RESUME}" -eq 1 ] && ML_ARGS+=(--resume)
-[ "${FORCE}" -eq 1 ] && ML_ARGS+=(--force)
+# Даже пустой results/run_N (наш mkdir под Unity/jsonl) mlagents считает «старыми данными»
+# и падает без --force. Для нового прогона всегда --force.
+if [ "${RESUME}" -eq 0 ]; then
+  ML_ARGS+=(--force)
+elif [ "${FORCE}" -eq 1 ]; then
+  ML_ARGS+=(--force)
+fi
 
 if [ "${TRAIN_MODE}" = "multi" ]; then
   ML_ARGS+=(--env-args -forestSingleEnvByPort -forestBasePort "${TRAIN_PORT}" -forestTrainAllHeadless -forestResultsDir "${ROOT}/results/${RUN_ID}")
@@ -152,11 +190,23 @@ fi
 
 export FOREST_BASE_PORT="${TRAIN_PORT}"
 export FOREST_RESULTS_DIR="${ROOT}/results/${RUN_ID}"
+mkdir -p "${FOREST_RESULTS_DIR}"
+
+# TensorBoard сразу с train — с ПК: http://<lab_comp>:6006 или open_tensorboard.bash (туннель).
+TB_PORT="${TB_PORT:-6006}"
+echo "[train] TensorBoard RUN_ID=${RUN_ID} port=${TB_PORT}..."
+RUN_ID="${RUN_ID}" PORT="${TB_PORT}" bash "${ROOT}/train_scripts/lab_comp/run_tensorboard.bash" --daemon || \
+  echo "WARN: TensorBoard не стартовал (обучение продолжается)" >&2
+LAB_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+if [ -n "${LAB_IP}" ]; then
+  echo "[train] TensorBoard: http://${LAB_IP}:${TB_PORT}/  (если порт открыт в сети)"
+fi
+echo "[train] С ПК (туннель): RUN_ID=${RUN_ID} bash train_scripts/lab_comp/open_tensorboard.bash → http://127.0.0.1:${TB_PORT}"
 
 echo "[train] mode=${TRAIN_MODE} DISPLAY=${DISPLAY} run-id=${RUN_ID} num-envs=${NUM_ENVS} port=${TRAIN_PORT} time-scale=${TIME_SCALE} resume=${RESUME}"
 echo "[train] CPU affinity: train=${FOREST_TRAIN_CPUS} (stream reserved=${FOREST_STREAM_CPUS})"
 if [ "${TRAIN_MODE}" = "presentation" ]; then
-  echo "[train] 26 headless: w0=PresentationFull, w1-11=узкие, w12+=boost(low SR)"
+  echo "[train] 28 headless: w0=stream-PresentationFull, w1=train-PresentationFull, w2-12=узкие, w13-27=буст×3"
   echo "[train] Стрим отдельно: RUN_ID=${RUN_ID} bash train_scripts/lab_comp/run_stream_onnx.bash"
 fi
 if command -v taskset >/dev/null 2>&1; then

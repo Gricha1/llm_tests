@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "${ROOT}"
+RUN_ID="${RUN_ID:-run_80}"
+
+mkdir -p "stream_weights/${RUN_ID}/onnx"
+for b in JackLowLevelAgent LilyLowLevelAgent GeorgeLowLevelAgent; do
+  src="$(ls -1 "results/${RUN_ID}/${b}/"${b}-*.onnx 2>/dev/null | sort -V | tail -1 || true)"
+  if [ -z "${src}" ] && [ "${b}" = "GeorgeLowLevelAgent" ]; then
+    src="$(ls -1 results/run_74/GeorgeLowLevelAgent/*.onnx 2>/dev/null | sort -V | tail -1 || true)"
+    echo "WARN: George из run_74 (временно), пока train не напишет onnx"
+  fi
+  if [ -n "${src}" ]; then
+    cp -f "${src}" "stream_weights/${RUN_ID}/onnx/${b}.onnx"
+    echo "sticky ${b} <- $(basename "${src}")"
+  else
+    echo "WARN: нет ${b}"
+  fi
+done
+rm -f stream_weights/run_78/onnx/*.onnx 2>/dev/null || true
+
+touch .stream_stop_request
+sleep 2
+pkill -f 'stream_onnx_infer\.py' 2>/dev/null || true
+pkill -f 'forestStreamOnly' 2>/dev/null || true
+sleep 2
+rm -f .stream_stop_request .stream_restart_request
+
+LOG="results/stream_onnx_${RUN_ID}.log"
+nohup env RUN_ID="${RUN_ID}" bash train_scripts/lab_comp/run_stream_onnx.bash >"${LOG}" 2>&1 &
+echo "started pid=$! log=${LOG}"
+sleep 10
+tail -30 "${LOG}"

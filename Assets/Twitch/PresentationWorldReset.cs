@@ -1,6 +1,6 @@
 using UnityEngine;
 
-/// <summary>Сброс деревьев, овец и зомби в presentation Env (Twitch #reset и OnEpisodeBegin).</summary>
+/// <summary>Сброс деревьев, овец и зомби в Env (Twitch #reset / клавиша 0 / OnEpisodeBegin).</summary>
 public static class PresentationWorldReset
 {
     const float DedupeSeconds = 0.25f;
@@ -22,6 +22,10 @@ public static class PresentationWorldReset
         _lastEnvId = envId;
         _lastResetTime = now;
 
+        // Иначе TreeSpawner считает деревья мёртвыми (activeInHierarchy=false).
+        if (!envRoot.gameObject.activeSelf)
+            envRoot.gameObject.SetActive(true);
+
         var treeSpawner = envRoot.GetComponentInChildren<TreeSpawner>(true);
         var sheepSpawner = envRoot.GetComponentInChildren<SheepSpawner>(true);
         var flowerSpawner = envRoot.GetComponentInChildren<FlowerSpawner>(true);
@@ -31,7 +35,10 @@ public static class PresentationWorldReset
         flowerSpawner?.ResetFlowers();
 
         var envConfig = envRoot.GetComponent<EnvTrainingConfig>();
-        if (envConfig == null || envConfig.ResolveJackMode() != JackTrainingMode.ZombieOnly)
+        bool zombieOnly = envConfig != null
+            && envConfig.ResolveJackMode() == JackTrainingMode.ZombieOnly;
+
+        if (!zombieOnly)
         {
             foreach (var zombieSpawner in envRoot.GetComponentsInChildren<ZombieSpawner>(true))
             {
@@ -41,11 +48,14 @@ public static class PresentationWorldReset
         }
 
         VerifyAndRetry(treeSpawner, sheepSpawner);
+
+        if (zombieOnly)
+            TrainingEnvSpace.ForceStartJackZombieSpawners(envRoot);
     }
 
     static void VerifyAndRetry(TreeSpawner trees, SheepSpawner sheep)
     {
-        if (trees != null)
+        if (trees != null && trees.isActiveAndEnabled && trees.gameObject.activeInHierarchy)
         {
             int target = trees.TargetCount;
             int need = Mathf.Max(1, Mathf.RoundToInt(target * MinFillRatio));
@@ -69,7 +79,7 @@ public static class PresentationWorldReset
             }
         }
 
-        if (sheep != null)
+        if (sheep != null && sheep.isActiveAndEnabled && sheep.gameObject.activeInHierarchy)
         {
             int alive = sheep.AliveCount;
             int target = sheep.TargetCount;
@@ -89,7 +99,7 @@ public static class PresentationWorldReset
 
         var trees = envRoot.GetComponentInChildren<TreeSpawner>(true);
         var sheep = envRoot.GetComponentInChildren<SheepSpawner>(true);
-        var jack = TrainingEnvSpace.FindPresentationPrimaryJack();
+        var jack = TrainingEnvSpace.FindPrimaryJackInEnv(envRoot);
 
         int treeN = trees != null ? trees.AliveCount : -1;
         int treeT = trees != null ? trees.TargetCount : -1;
@@ -99,6 +109,6 @@ public static class PresentationWorldReset
             ? $"hp={jack.hp} wood={jack.wood} satiety={jack.satiety} heat={jack.heat}"
             : "нет";
 
-        return $"деревья {treeN}/{treeT}, овцы {sheepN}/{sheepT}, Jack ({jackState})";
+        return $"env={envRoot.name} trees={treeN}/{treeT} sheep={sheepN}/{sheepT} jack={jackState}";
     }
 }

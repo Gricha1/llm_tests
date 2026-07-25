@@ -6,9 +6,9 @@ using Unity.MLAgents;
 using UnityEngine;
 
 /// <summary>
-/// Success rate по простым задачам (wood / sheep / fire / …).
+/// Success rate по задачам героев (Jack/Lily/George).
 /// Пишет JSONL в results/&lt;run_id&gt;/ — все headless worker'ы и стрим читают один файл.
-/// При обучении шлёт TaskSuccess/… в TensorBoard (0..1).
+/// В TensorBoard: SuccessRate/Jack|Lily|George/… и EpisodeReward/….
 /// </summary>
 public static class TrainingTaskSuccessTracker
 {
@@ -30,10 +30,14 @@ public static class TrainingTaskSuccessTracker
     const float BoostRankingRefreshSeconds = 30f;
     const string FileName = "simple_task_success.jsonl";
 
+    const int DiskTailMaxLines = 32000;
+    const int MaxRawSamples = 4096;
+
     static readonly Dictionary<Metric, List<float>> RateHistory = new();
     static readonly Dictionary<Metric, List<float>> RawSamples = new();
     static readonly Dictionary<Metric, float> LastRate = new();
     static readonly Dictionary<EnvTrainingTask, List<float>> TaskRawSamples = new();
+    static readonly Dictionary<EnvTrainingTask, List<float>> TaskRateHistory = new();
     static readonly Dictionary<EnvTrainingTask, float> TaskLastRate = new();
     static readonly EnvTrainingTask[] _boostRankedTasks = new EnvTrainingTask[BoostSlotCount];
     static string _resultsDir;
@@ -137,7 +141,7 @@ public static class TrainingTaskSuccessTracker
         if (!metric.HasValue)
             return;
 
-        AppendToDisk(metric.Value, success);
+        AppendToDisk(metric.Value, task, success);
         PushLocalSample(metric.Value, success ? 1f : 0f);
         PushTaskSample(task, success ? 1f : 0f);
         ReportToTensorBoard(task, metric.Value);
@@ -145,8 +149,18 @@ public static class TrainingTaskSuccessTracker
 
     public static float GetTaskLastRate(EnvTrainingTask task)
     {
+        MaybeRefreshFromDisk();
         return TaskLastRate.TryGetValue(task, out float v) ? v : 0f;
     }
+
+    public static float GetTaskLastRateCached(EnvTrainingTask task) =>
+        TaskLastRate.TryGetValue(task, out float v) ? v : 0f;
+
+    public static IReadOnlyList<float> GetTaskRateSeriesCached(EnvTrainingTask task) =>
+        TaskRateHistory.TryGetValue(task, out var list) ? list : Array.Empty<float>();
+
+    public static int GetTaskSampleCountCached(EnvTrainingTask task) =>
+        TaskRawSamples.TryGetValue(task, out var list) ? list.Count : 0;
 
     public static bool EvaluateJackSuccess(EnvTrainingTask task, AgentGoToHouseDiscrete jack, int episodeSheepEaten, int episodeZombiesKilled)
     {
@@ -200,17 +214,27 @@ public static class TrainingTaskSuccessTracker
         return RateHistory.TryGetValue(metric, out var list) ? list : Array.Empty<float>();
     }
 
+    /// <summary>Без чтения диска — для UI после TickOverlayRefresh.</summary>
+    public static IReadOnlyList<float> GetRateSeriesCached(Metric metric) =>
+        RateHistory.TryGetValue(metric, out var list) ? list : Array.Empty<float>();
+
     public static float GetLastRate(Metric metric)
     {
         MaybeRefreshFromDisk();
         return LastRate.TryGetValue(metric, out float v) ? v : 0f;
     }
 
+    public static float GetLastRateCached(Metric metric) =>
+        LastRate.TryGetValue(metric, out float v) ? v : 0f;
+
     public static int GetSampleCount(Metric metric)
     {
         MaybeRefreshFromDisk();
         return RawSamples.TryGetValue(metric, out var list) ? list.Count : 0;
     }
+
+    public static int GetSampleCountCached(Metric metric) =>
+        RawSamples.TryGetValue(metric, out var list) ? list.Count : 0;
 
     /// <summary>
     /// Workers 12–15: фиксируем задачу на эпизод (slot 0..3 = 4 самых слабых метрики).
@@ -239,7 +263,8 @@ public static class TrainingTaskSuccessTracker
         if (Time.unscaledTime < _nextDiskReadTime)
             return;
 
-        _nextDiskReadTime = Time.unscaledTime + 2f;
+        // Реже читаем диск: 32k строк хвоста, иначе #show metrics снова подвешивает стрим.
+        _nextDiskReadTime = Time.unscaledTime + 4f;
         RefreshFromDisk(force: true);
     }
 
@@ -248,7 +273,7 @@ public static class TrainingTaskSuccessTracker
         RefreshFromDisk(force: false);
     }
 
-    static void AppendToDisk(Metric metric, bool success)
+    static void AppendToDisk(Metric metric, EnvTrainingTask task, bool success)
     {
         var path = GetStatsFilePath();
         if (path == null)
@@ -260,7 +285,9 @@ public static class TrainingTaskSuccessTracker
             if (!string.IsNullOrEmpty(dir))
                 Directory.CreateDirectory(dir);
 
-            var line = $"{{\"m\":\"{metric}\",\"s\":{(success ? 1 : 0)},\"t\":{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}}}\n";
+            // task нужен стриму: иначе wood/zombie тонут в хвосте sheep/fire.
+            var line =
+                $"{{\"m\":\"{metric}\",\"task\":\"{task}\",\"s\":{(success ? 1 : 0)},\"t\":{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}}}\n";
             using (var fs = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite))
             using (var sw = new StreamWriter(fs, Encoding.UTF8))
                 sw.Write(line);
@@ -277,7 +304,7 @@ public static class TrainingTaskSuccessTracker
             raw = RawSamples[metric] = new List<float>();
 
         raw.Add(sample);
-        if (raw.Count > 4096)
+        if (raw.Count > MaxRawSamples)
             raw.RemoveAt(0);
 
         RebuildMetricHistory(metric, raw);
@@ -289,28 +316,85 @@ public static class TrainingTaskSuccessTracker
             raw = TaskRawSamples[task] = new List<float>();
 
         raw.Add(sample);
-        if (raw.Count > 4096)
+        if (raw.Count > MaxRawSamples)
             raw.RemoveAt(0);
 
-        TaskLastRate[task] = ComputeRollingRate(raw, raw.Count - 1, RollingWindow);
+        RebuildTaskHistory(task, raw);
     }
 
     static string TaskTensorBoardKey(EnvTrainingTask task)
     {
+        // Без префикса героя: StatsRecorder пишет в папку текущего Behavior
+        // (JackLowLevelAgent / Lily… / George…) — там уже ясно чей лог.
         switch (task)
         {
-            case EnvTrainingTask.JackWood: return "Jack/Wood";
-            case EnvTrainingTask.JackFood: return "Jack/Food";
-            case EnvTrainingTask.JackWater: return "Jack/Water";
-            case EnvTrainingTask.JackZombie: return "Jack/Zombie";
-            case EnvTrainingTask.LilyFood: return "Lily/Food";
-            case EnvTrainingTask.LilyWater: return "Lily/Water";
-            case EnvTrainingTask.LilyHeat: return "Lily/Heat";
-            case EnvTrainingTask.LilyFlower: return "Lily/Flower";
-            case EnvTrainingTask.GeorgeFood: return "George/Food";
-            case EnvTrainingTask.GeorgeWater: return "George/Water";
-            case EnvTrainingTask.GeorgeHeat: return "George/Heat";
+            case EnvTrainingTask.JackWood: return "Wood";
+            case EnvTrainingTask.JackFood:
+            case EnvTrainingTask.LilyFood:
+            case EnvTrainingTask.GeorgeFood: return "Sheep";
+            case EnvTrainingTask.JackWater:
+            case EnvTrainingTask.LilyWater:
+            case EnvTrainingTask.GeorgeWater: return "Water";
+            case EnvTrainingTask.JackZombie: return "Zombie";
+            case EnvTrainingTask.LilyHeat:
+            case EnvTrainingTask.GeorgeHeat: return "Fire";
+            case EnvTrainingTask.LilyFlower: return "Flower";
             default: return null;
+        }
+    }
+
+    static string HeroNameForTask(EnvTrainingTask task)
+    {
+        switch (task)
+        {
+            case EnvTrainingTask.JackWood:
+            case EnvTrainingTask.JackFood:
+            case EnvTrainingTask.JackWater:
+            case EnvTrainingTask.JackZombie:
+                return "Jack";
+            case EnvTrainingTask.LilyFood:
+            case EnvTrainingTask.LilyWater:
+            case EnvTrainingTask.LilyHeat:
+            case EnvTrainingTask.LilyFlower:
+                return "Lily";
+            case EnvTrainingTask.GeorgeFood:
+            case EnvTrainingTask.GeorgeWater:
+            case EnvTrainingTask.GeorgeHeat:
+                return "George";
+            default:
+                return null;
+        }
+    }
+
+    static EnvTrainingTask[] TasksForHero(string hero)
+    {
+        switch (hero)
+        {
+            case "Jack":
+                return new[]
+                {
+                    EnvTrainingTask.JackWood,
+                    EnvTrainingTask.JackFood,
+                    EnvTrainingTask.JackWater,
+                    EnvTrainingTask.JackZombie,
+                };
+            case "Lily":
+                return new[]
+                {
+                    EnvTrainingTask.LilyFood,
+                    EnvTrainingTask.LilyWater,
+                    EnvTrainingTask.LilyHeat,
+                    EnvTrainingTask.LilyFlower,
+                };
+            case "George":
+                return new[]
+                {
+                    EnvTrainingTask.GeorgeFood,
+                    EnvTrainingTask.GeorgeWater,
+                    EnvTrainingTask.GeorgeHeat,
+                };
+            default:
+                return Array.Empty<EnvTrainingTask>();
         }
     }
 
@@ -320,13 +404,47 @@ public static class TrainingTaskSuccessTracker
             return;
 
         var stats = Academy.Instance.StatsRecorder;
-        float taskRate = GetTaskLastRate(task);
+        // Пишется в summary текущего Behavior (кто вызвал Record).
         string taskKey = TaskTensorBoardKey(task);
         if (!string.IsNullOrEmpty(taskKey))
-            stats.Add($"TaskSuccess/{taskKey}", taskRate, StatAggregationMethod.Average);
+            stats.Add($"SuccessRate/{taskKey}", GetTaskLastRateCached(task), StatAggregationMethod.Average);
 
-        float metricRate = GetLastRate(metric);
-        stats.Add($"TaskSuccess/Metric/{metric}", metricRate, StatAggregationMethod.Average);
+        string hero = HeroNameForTask(task);
+        if (string.IsNullOrEmpty(hero))
+            return;
+
+        float sum = 0f;
+        int n = 0;
+        var heroTasks = TasksForHero(hero);
+        for (int i = 0; i < heroTasks.Length; i++)
+        {
+            if (GetTaskSampleCountCached(heroTasks[i]) <= 0)
+                continue;
+            sum += GetTaskLastRateCached(heroTasks[i]);
+            n++;
+        }
+
+        if (n > 0)
+            stats.Add("SuccessRate/Mean", sum / n, StatAggregationMethod.Average);
+    }
+
+    /// <summary>
+    /// Суммарный reward эпизода в папку текущего Behavior (Jack/Lily/George).
+    /// Один тег EpisodeReward — return одного эпизода (через anchor в агенте).
+    /// В TB при выборе 3 runs будет 1 график с 3 линиями.
+    /// </summary>
+    public static void ReportAgentEpisodeReward(float episodeReward)
+    {
+        if (!Academy.IsInitialized || !Academy.Instance.IsCommunicatorOn)
+            return;
+
+        if (float.IsNaN(episodeReward) || float.IsInfinity(episodeReward))
+            return;
+
+        Academy.Instance.StatsRecorder.Add(
+            "EpisodeReward",
+            episodeReward,
+            StatAggregationMethod.Average);
     }
 
     static void RefreshFromDisk(bool force)
@@ -338,24 +456,48 @@ public static class TrainingTaskSuccessTracker
         try
         {
             long size = new FileInfo(path).Length;
-            if (!force && size == _lastFileSize && RateHistory[Metric.Wood].Count > 0)
+            if (!force && size == _lastFileSize)
                 return;
 
             _lastFileSize = size;
-            var tail = ReadTailLines(path, 4096);
+            // Большой хвост: Wood/Zombie пишутся реже Sheep/Fire и иначе выпадают из окна.
+            var tail = ReadTailLines(path, DiskTailMaxLines);
+            var metricSamples = new Dictionary<Metric, List<float>>();
+            var taskSamples = new Dictionary<EnvTrainingTask, List<float>>();
+            foreach (Metric m in Enum.GetValues(typeof(Metric)))
+                metricSamples[m] = new List<float>();
+
+            for (int i = 0; i < tail.Count; i++)
+                TryParseLine(tail[i], metricSamples, taskSamples);
+
             foreach (Metric m in Enum.GetValues(typeof(Metric)))
             {
-                var samples = new List<float>();
-                for (int i = 0; i < tail.Count; i++)
-                    TryParseSample(tail[i], m, samples);
-                RawSamples[m] = samples;
-                RebuildMetricHistory(m, samples);
+                TrimToLast(metricSamples[m], MaxRawSamples);
+                RawSamples[m] = metricSamples[m];
+                RebuildMetricHistory(m, metricSamples[m]);
+            }
+
+            TaskRawSamples.Clear();
+            TaskRateHistory.Clear();
+            TaskLastRate.Clear();
+            foreach (var kv in taskSamples)
+            {
+                TrimToLast(kv.Value, MaxRawSamples);
+                TaskRawSamples[kv.Key] = kv.Value;
+                RebuildTaskHistory(kv.Key, kv.Value);
             }
         }
         catch (Exception ex)
         {
             Debug.LogWarning($"[TaskSuccess] read fail: {ex.Message}");
         }
+    }
+
+    static void TrimToLast(List<float> list, int max)
+    {
+        if (list == null || list.Count <= max)
+            return;
+        list.RemoveRange(0, list.Count - max);
     }
 
     static void RebuildMetricHistory(Metric metric, List<float> samples01)
@@ -376,6 +518,21 @@ public static class TrainingTaskSuccessTracker
         LastRate[metric] = history.Count > 0 ? history[history.Count - 1] : 0f;
     }
 
+    static void RebuildTaskHistory(EnvTrainingTask task, List<float> samples01)
+    {
+        if (!TaskRateHistory.TryGetValue(task, out var history))
+            history = TaskRateHistory[task] = new List<float>();
+
+        history.Clear();
+        for (int i = 0; i < samples01.Count; i++)
+            history.Add(ComputeRollingRate(samples01, i, RollingWindow));
+
+        while (history.Count > MaxHistoryPoints)
+            history.RemoveAt(0);
+
+        TaskLastRate[task] = history.Count > 0 ? history[history.Count - 1] : 0f;
+    }
+
     static float ComputeRollingRate(List<float> samples, int endIndex, int window)
     {
         int start = Mathf.Max(0, endIndex - window + 1);
@@ -389,7 +546,9 @@ public static class TrainingTaskSuccessTracker
         return sum / count;
     }
 
-    static void TryParseSample(string line, Metric metric, List<float> dst)
+    static void TryParseLine(string line,
+        Dictionary<Metric, List<float>> metricSamples,
+        Dictionary<EnvTrainingTask, List<float>> taskSamples)
     {
         if (string.IsNullOrWhiteSpace(line))
             return;
@@ -400,7 +559,7 @@ public static class TrainingTaskSuccessTracker
 
         mIdx += 5;
         int mEnd = line.IndexOf('"', mIdx);
-        if (mEnd < 0 || !Enum.TryParse(line.Substring(mIdx, mEnd - mIdx), out Metric parsed) || parsed != metric)
+        if (mEnd < 0 || !Enum.TryParse(line.Substring(mIdx, mEnd - mIdx), out Metric metric))
             return;
 
         int sIdx = line.IndexOf("\"s\":", StringComparison.Ordinal);
@@ -412,21 +571,53 @@ public static class TrainingTaskSuccessTracker
         if (sEnd < 0 || !int.TryParse(line.Substring(sIdx, sEnd - sIdx), out int s))
             return;
 
-        dst.Add(s == 1 ? 1f : 0f);
+        float sample = s == 1 ? 1f : 0f;
+        if (metricSamples.TryGetValue(metric, out var mList))
+            mList.Add(sample);
+
+        EnvTrainingTask task = MetricToBoostTask(metric);
+        int tIdx = line.IndexOf("\"task\":\"", StringComparison.Ordinal);
+        if (tIdx >= 0)
+        {
+            tIdx += 8;
+            int tEnd = line.IndexOf('"', tIdx);
+            if (tEnd > tIdx && Enum.TryParse(line.Substring(tIdx, tEnd - tIdx), out EnvTrainingTask parsedTask))
+                task = parsedTask;
+        }
+
+        if (!taskSamples.TryGetValue(task, out var tList))
+            tList = taskSamples[task] = new List<float>();
+        tList.Add(sample);
     }
 
     static List<string> ReadTailLines(string path, int maxLines)
     {
-        var lines = new List<string>();
+        var lines = new List<string>(maxLines + 1);
+        // НЕ читать весь файл с начала: jsonl на стриме легко >100MB, и это вешает Unity
+        // (после #show metrics #restart_stream уже не обрабатывается).
         using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
-        using (var sr = new StreamReader(fs, Encoding.UTF8))
         {
-            string line;
-            while ((line = sr.ReadLine()) != null)
+            long len = fs.Length;
+            if (len <= 0)
+                return lines;
+
+            // ~200 байт на строку → запас под maxLines
+            long approx = Math.Min(len, (long)maxLines * 256L + 4096L);
+            fs.Seek(Math.Max(0L, len - approx), SeekOrigin.Begin);
+
+            using (var sr = new StreamReader(fs, Encoding.UTF8))
             {
-                lines.Add(line);
-                if (lines.Count > maxLines)
-                    lines.RemoveAt(0);
+                // Первая строка после seek может быть обрезана — пропускаем.
+                if (fs.Position > 0)
+                    sr.ReadLine();
+
+                string line;
+                while ((line = sr.ReadLine()) != null)
+                {
+                    lines.Add(line);
+                    if (lines.Count > maxLines)
+                        lines.RemoveAt(0);
+                }
             }
         }
 
@@ -468,13 +659,13 @@ public static class TrainingTaskSuccessTracker
 
     static bool IsJackWaterComplete(AgentGoToHouseDiscrete jack)
     {
-        var path = WaterGoalPath.Get(jack.transform);
-        return path != null && path.HasCompletedPath(jack.transform);
+        // Раньше success = прошли GoalWater1..3 (кубы), без обязательного сбора воды у озера.
+        // Из‑за этого метрики/boost думали, что «вода ок», а агент воду не качал.
+        return jack != null && jack.EpisodeWaterCollected > 0;
     }
 
     static bool IsLilyWaterComplete(LilyScript lily)
     {
-        var path = WaterGoalPath.Get(lily.transform);
-        return path != null && path.HasCompletedPath(lily.transform);
+        return lily != null && lily.EpisodeWaterCollected > 0;
     }
 }

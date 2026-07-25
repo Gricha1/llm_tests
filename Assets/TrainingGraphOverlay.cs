@@ -5,9 +5,8 @@ using TMPro;
 using Unity.MLAgents;
 
 /// <summary>
-/// График награды по эпизодам (Джек / Лили / Гера) поверх Game view.
-/// При обучении с несколькими Env — только training-копии (не presentation Full).
-/// G — показать/скрыть.
+/// Сбор EMA/серий награды для #show metrics.
+/// UI «График обучения» (G) — только Editor/train; на стриме (-forestStreamOnly) панели нет.
 /// </summary>
 public sealed class TrainingGraphOverlay : MonoBehaviour
 {
@@ -45,7 +44,8 @@ public sealed class TrainingGraphOverlay : MonoBehaviour
     }
 
     [SerializeField] private bool showOnlyWhenTraining;
-    [SerializeField] private bool visible = true;
+    // По умолчанию скрыт: на стриме UI не строим; в Editor G только по желанию.
+    [SerializeField] private bool visible;
     [SerializeField] private KeyCode toggleKey = KeyCode.G;
 
     readonly List<AgentEpisodeTracker> _jackTrackers = new List<AgentEpisodeTracker>();
@@ -103,13 +103,86 @@ public sealed class TrainingGraphOverlay : MonoBehaviour
 
         _instance = this;
         DontDestroyOnLoad(gameObject);
-        BuildUi();
+        // Стрим: только данные для #show metrics — панель G не создаём.
+        // Editor/train: UI по G (visible по умолчанию false — на главном экране пусто).
+        if (IsStreamInferenceWithoutOverlayUi())
+        {
+            visible = false;
+            TearDownUi();
+        }
+        else if (visible)
+            BuildUi();
+    }
+
+    /// <summary>Стрим/onnx: без UI G. Проверяем и cmdline — на случай гонки до ResolveEnvRunMode.</summary>
+    static bool IsStreamInferenceWithoutOverlayUi()
+    {
+        if (TrainingEnvSpace.IsStreamOnlyMode || TrainingEnvSpace.IsExternalPythonBrainStream)
+            return true;
+
+        if (IsTruthyEnv(System.Environment.GetEnvironmentVariable("FOREST_STREAM_ONLY")))
+            return true;
+
+        foreach (var arg in System.Environment.GetCommandLineArgs())
+        {
+            if (arg == "-forestStreamOnly" || arg == "--forest-stream-only"
+                || arg == "-forestExternalBrain" || arg == "--forest-external-brain")
+                return true;
+        }
+
+        return false;
+    }
+
+    static bool IsTruthyEnv(string value) =>
+        value == "1" || string.Equals(value, "true", System.StringComparison.OrdinalIgnoreCase);
+
+    void TearDownUi()
+    {
+        if (_panel != null)
+        {
+            var canvas = _panel.GetComponentInParent<Canvas>();
+            if (canvas != null)
+                Destroy(canvas.gameObject);
+            else
+                Destroy(_panel);
+            _panel = null;
+        }
+
+        _graphImage = null;
+        _tex = null;
+        _legend = null;
+        _title = null;
+        visible = false;
     }
 
     void Update()
     {
+        if (IsStreamInferenceWithoutOverlayUi())
+        {
+            if (_panel != null)
+                TearDownUi();
+            // Только сбор EMA/серий для #show metrics (свой UI на стриме не рисуем).
+            if (Time.frameCount % 8 != 0)
+                return;
+            RefreshTrackers();
+            TrackAll(_jackTrackers, _jackRewards, ref _jackEma, ref _jackLastRaw,
+            ref _jackAggSum, ref _jackAggCount, notifyPolicyStats: true,
+            usePresentationSampling: true, heroName: "Jack");
+            TrackAll(_lilyTrackers, _lilyRewards, ref _lilyEma, ref _lilyLastRaw,
+                ref _lilyAggSum, ref _lilyAggCount, notifyPolicyStats: false,
+                usePresentationSampling: true, heroName: "Lily");
+            TrackAll(_georgeTrackers, _georgeRewards, ref _georgeEma, ref _georgeLastRaw,
+                ref _georgeAggSum, ref _georgeAggCount, notifyPolicyStats: false,
+                usePresentationSampling: true, heroName: "George");
+            return;
+        }
+
         if (toggleKey != KeyCode.None && Input.GetKeyDown(toggleKey))
+        {
             visible = !visible;
+            if (visible && _panel == null)
+                BuildUi();
+        }
 
         int stride = TrainingEnvSpace.IsPresentationWorkerProcess ? 8 : 1;
         if (Time.frameCount % stride != 0)
@@ -132,13 +205,14 @@ public sealed class TrainingGraphOverlay : MonoBehaviour
         RefreshTrackers();
         TrackAll(_jackTrackers, _jackRewards, ref _jackEma, ref _jackLastRaw,
             ref _jackAggSum, ref _jackAggCount, notifyPolicyStats: true,
-            usePresentationSampling: !_usesTrainingEnvs);
+            usePresentationSampling: !_usesTrainingEnvs, heroName: "Jack");
         TrackAll(_lilyTrackers, _lilyRewards, ref _lilyEma, ref _lilyLastRaw,
             ref _lilyAggSum, ref _lilyAggCount, notifyPolicyStats: false,
-            usePresentationSampling: !_usesTrainingEnvs);
+            usePresentationSampling: !_usesTrainingEnvs, heroName: "Lily");
         TrackAll(_georgeTrackers, _georgeRewards, ref _georgeEma, ref _georgeLastRaw,
             ref _georgeAggSum, ref _georgeAggCount, notifyPolicyStats: false,
-            usePresentationSampling: !_usesTrainingEnvs);
+            usePresentationSampling: !_usesTrainingEnvs, heroName: "George");
+
 
         bool show = visible && ShouldShow();
         if (_panel != null)
@@ -328,7 +402,8 @@ public sealed class TrainingGraphOverlay : MonoBehaviour
         ref float aggSum,
         ref int aggCount,
         bool notifyPolicyStats,
-        bool usePresentationSampling)
+        bool usePresentationSampling,
+        string heroName)
     {
         int aggregateTarget = RewardAggregateEpisodes;
 
@@ -359,6 +434,8 @@ public sealed class TrainingGraphOverlay : MonoBehaviour
             history.Add(ema);
             if (history.Count > MaxPoints)
                 history.RemoveAt(0);
+
+            // EpisodeReward в TB пишем из EndEpisode агента (в папку его Behavior), не отсюда.
 
             if (notifyPolicyStats)
             {
@@ -423,6 +500,8 @@ public sealed class TrainingGraphOverlay : MonoBehaviour
     }
 
     public static float JackEma => _instance != null ? _instance._jackEma : 0f;
+    public static float LilyEma => _instance != null ? _instance._lilyEma : 0f;
+    public static float GeorgeEma => _instance != null ? _instance._georgeEma : 0f;
     public static int GraphPointCount => _instance != null ? _instance._graphPointCounter : 0;
 
     public static List<float> GetJackRewardSeriesCopy()
@@ -437,6 +516,20 @@ public sealed class TrainingGraphOverlay : MonoBehaviour
         if (_instance == null)
             return System.Array.Empty<float>();
         return _instance._jackRewards;
+    }
+
+    public static IReadOnlyList<float> GetLilyRewardSeriesReadonly()
+    {
+        if (_instance == null)
+            return System.Array.Empty<float>();
+        return _instance._lilyRewards;
+    }
+
+    public static IReadOnlyList<float> GetGeorgeRewardSeriesReadonly()
+    {
+        if (_instance == null)
+            return System.Array.Empty<float>();
+        return _instance._georgeRewards;
     }
 
     public static float GetPresentationJackCumulativeReward()
@@ -455,7 +548,7 @@ public sealed class TrainingGraphOverlay : MonoBehaviour
         var root = TrainingEnvSpace.PresentationRoot;
         if (root != null)
             return root.GetComponentInChildren<LilyScript>(false);
-        return Object.FindObjectOfType<LilyScript>();
+        return Object.FindFirstObjectByType<LilyScript>();
     }
 
     void BuildUi()
@@ -764,7 +857,7 @@ public sealed class TrainingGraphOverlay : MonoBehaviour
         label.text = text;
         label.fontSize = fontSize;
         label.color = AxisLabelColor;
-        label.enableWordWrapping = false;
+        label.textWrappingMode = TextWrappingModes.NoWrap;
         label.alignment = centered ? TextAlignmentOptions.Center : TextAlignmentOptions.MidlineRight;
         if (TMP_Settings.defaultFontAsset != null)
             label.font = TMP_Settings.defaultFontAsset;

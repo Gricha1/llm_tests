@@ -15,7 +15,7 @@ public sealed class GeorgeWoodDisplay : MonoBehaviour
             _text.richText = true;
         if (spriteAsset == null)
         {
-            var jackHud = Object.FindObjectOfType<TreeDisplay>();
+            var jackHud = Object.FindFirstObjectByType<TreeDisplay>();
             var jackText = jackHud != null ? jackHud.GetComponent<TMP_Text>() : null;
             if (jackText != null)
                 spriteAsset = jackText.spriteAsset;

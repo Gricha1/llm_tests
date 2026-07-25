@@ -41,7 +41,7 @@ fi
 
 if [ ! -f "${BUILD_PATH}" ]; then
   echo "ERROR: ${BUILD_PATH} не найден." >&2
-  echo "С Windows: wsl bash train_scripts/lab_comp/sync_build.bash" >&2
+  echo "С Windows: wsl bash train_scripts/lab_comp/sync.bash" >&2
   exit 1
 fi
 chmod +x "${BUILD_PATH}" 2>/dev/null || true

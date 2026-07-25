@@ -19,7 +19,7 @@ public sealed class GeorgeHeatDisplay : MonoBehaviour
 
         if (spriteAsset == null)
         {
-            var jackHud = Object.FindObjectOfType<HeatDisplay>();
+            var jackHud = Object.FindFirstObjectByType<HeatDisplay>();
             if (jackHud != null)
                 spriteAsset = jackHud.HeatSpriteAsset;
         }

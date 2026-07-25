@@ -68,7 +68,7 @@ public sealed class TwitchChatHelpHud : MonoBehaviour
         rt.anchorMax = new Vector2(1f, 0f);
         rt.pivot = new Vector2(1f, 0f);
         rt.anchoredPosition = new Vector2(-16f, 16f);
-        rt.sizeDelta = new Vector2(420f, 400f);
+        rt.sizeDelta = new Vector2(440f, 460f);
 
         var bg = _panel.AddComponent<Image>();
         bg.color = new Color(0.03f, 0.05f, 0.07f, 0.88f);
@@ -104,7 +104,7 @@ public sealed class TwitchChatHelpHud : MonoBehaviour
         _body.fontSize = 20;
         _body.alignment = TextAlignmentOptions.TopLeft;
         _body.richText = true;
-        _body.enableWordWrapping = true;
+        _body.textWrappingMode = TextWrappingModes.Normal;
         _body.lineSpacing = 8f;
         _body.color = new Color(0.95f, 0.97f, 1f, 1f);
         if (TMP_Settings.defaultFontAsset != null)
@@ -119,16 +119,20 @@ static class TwitchChatCommandCatalog
     /// Примеры с числом, чтобы зритель сразу копировал формат.
     /// </summary>
     public const string HelpText =
-        "• <b>#add_sheep=5</b> — овцы\n" +
-        "• <b>#add_tree=5</b> — деревья\n" +
+        "• <b>#add sheep=5</b> — овцы\n" +
+        "• <b>#add tree=5</b> — деревья\n" +
         "• <b>#add fire</b> — костёр вкл/выкл\n" +
-        "• <b>#zombie=3</b> — зомби рядом\n" +
+        "• <b>#add zombie=3</b> — зомби рядом\n" +
         "• <b>#up=3</b> — прыжок\n" +
         "• <b>#forward=3</b> — рывок вперёд\n" +
         "• <b>#size=2</b> — размер\n" +
-        "• <b>#speed_up=3</b> — скорость\n" +
+        "• <b>#speed up=3</b> — скорость\n" +
         "• <b>#reset</b> — новый эпизод\n" +
-        "• <b>#show metrics</b> — графики\n" +
+        "• <b>#restart stream</b> — рестарт стрима\n" +
+        "• <b>#show metrics jack</b> — задачи Джека\n" +
+        "• <b>#show metrics lily</b> — задачи Лили\n" +
+        "• <b>#show metrics george</b> — задачи Геры\n" +
+        "• <b>#show metrics</b> — скрыть графики\n" +
         "• <b>#menu</b> — меню сред\n" +
-        "• <b>#env_0</b>…<b>#env_11</b> — среда";
+        "• <b>#env_0</b>…<b>#env_12</b> — среда";
 }

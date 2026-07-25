@@ -165,10 +165,7 @@ public static class TwitchEphemeralEffects
 
     public static void ApplyJackSize(AgentGoToHouseDiscrete jack, int sizeLevel)
     {
-        if (jack == null || !TrainingEnvSpace.IsPresentationTransform(jack.transform))
-            return;
-
-        if (IsTwitchClone(jack))
+        if (jack == null || !CanApplyBodyFx(jack))
             return;
 
         sizeLevel = Mathf.Clamp(sizeLevel, 1, 5);
@@ -211,7 +208,7 @@ public static class TwitchEphemeralEffects
 
     public static void ApplyJackSpeed(AgentGoToHouseDiscrete jack, int speedMultiplier)
     {
-        if (jack == null || !TrainingEnvSpace.IsPresentationTransform(jack.transform))
+        if (jack == null || !CanApplyBodyFx(jack))
             return;
 
         if (IsTwitchClone(jack))
@@ -227,6 +224,38 @@ public static class TwitchEphemeralEffects
             return;
 
         jack.ResetTwitchMoveSpeed();
+    }
+
+    /// <summary>Сброс #size/#speed у всех Jack (смена среды меню K).</summary>
+    public static void ResetAllJackBodyFx()
+    {
+        var jacks = Object.FindObjectsByType<AgentGoToHouseDiscrete>(
+            FindObjectsInactive.Include, FindObjectsSortMode.None);
+        for (int i = 0; i < jacks.Length; i++)
+        {
+            var jack = jacks[i];
+            if (jack == null || IsTwitchClone(jack) || TrainingEnvSpace.IsGeorgeAgent(jack))
+                continue;
+            ResetJackScale(jack);
+            ResetJackSpeed(jack);
+        }
+    }
+
+    static bool CanApplyBodyFx(AgentGoToHouseDiscrete jack)
+    {
+        if (jack == null || IsTwitchClone(jack) || TrainingEnvSpace.IsGeorgeAgent(jack))
+            return false;
+
+        // Стрим / presentation Env.
+        if (TrainingEnvSpace.IsPresentationTransform(jack.transform))
+            return true;
+
+        // Меню K: только Jack в текущей среде просмотра.
+        if (!TrainingEnvSpace.IsDebugEnvFocusActive)
+            return false;
+
+        var focused = TrainingEnvSpace.GetDebugFocusedEnvRoot();
+        return focused != null && TrainingEnvSpace.IsDescendantOf(jack.transform, focused);
     }
 
     public static float SpeedLevelToMultiplier(int speedLevel)

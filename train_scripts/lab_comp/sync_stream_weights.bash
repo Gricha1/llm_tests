@@ -62,37 +62,25 @@ find_onnx_for_behavior() {
   local beh="$1"
   local step="$2"
   local dir="${RUN_DIR}/${beh}"
-  local f best="" best_step=-1 cand_step
+  local candidates=() f newest=""
 
-  if [ -n "${step}" ] && [ "${step}" != "checkpoint" ] && [ "${step}" -gt 0 ] 2>/dev/null; then
-    if [ -f "${dir}/${beh}-${step}.onnx" ]; then
-      echo "${dir}/${beh}-${step}.onnx"
-      return 0
-    fi
+  if [ -n "${step}" ] && [ "${step}" != "checkpoint" ]; then
+    candidates+=(
+      "${dir}/${beh}-${step}.onnx"
+      "${dir}/${beh}.onnx"
+      "${RUN_DIR}/${beh}.onnx"
+    )
   fi
-
-  # Max numeric step among Name-*.onnx (игнор -0 если есть старше).
+  candidates+=("${dir}/${beh}.onnx" "${RUN_DIR}/${beh}.onnx")
   for f in "${dir}/${beh}-"*.onnx; do
     [ -f "${f}" ] || continue
-    cand_step="$(basename "${f}")"
-    cand_step="${cand_step#${beh}-}"
-    cand_step="${cand_step%.onnx}"
-    if [[ "${cand_step}" =~ ^[0-9]+$ ]] && [ "${cand_step}" -gt "${best_step}" ]; then
-      best_step="${cand_step}"
-      best="${f}"
-    fi
+    newest="${f}"
   done
-  if [ -n "${best}" ] && [ "${best_step}" -gt 0 ]; then
-    echo "${best}"
-    return 0
-  fi
-  if [ -n "${best}" ]; then
-    echo "${best}"
-    return 0
-  fi
+  [ -n "${newest}" ] && candidates+=("${newest}")
 
-  for f in "${dir}/${beh}.onnx" "${RUN_DIR}/${beh}.onnx"; do
-    [ -f "${f}" ] && { echo "${f}"; return 0; }
+  local c
+  for c in "${candidates[@]}"; do
+    [ -f "${c}" ] && { echo "${c}"; return 0; }
   done
   return 1
 }
@@ -172,7 +160,7 @@ while true; do
       else
         echo "[sync_weights] WARN: onnx→sentis не удался." >&2
         echo "[sync_weights] Один раз на сервере: bash train_scripts/lab_comp/build_sentis_docker.bash" >&2
-        echo "[sync_weights] И sync Unity Assets: с ПК wsl bash train_scripts/lab_comp/sync_unity_for_sentis.bash" >&2
+        echo "[sync_weights] На сервере нужен Unity Editor (detect_unity_editor.bash)" >&2
       fi
     fi
   fi

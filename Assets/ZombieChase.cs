@@ -13,8 +13,13 @@ public class ZombieChase : MonoBehaviour
     [Header("Movement")]
     [SerializeField] private float moveSpeed = 0.5f;
     [SerializeField] private float rotationSpeed = 120f;
-    [Tooltip("На этой дистанции зомби останавливается и бьёт, не залезая на цель.")]
-    [SerializeField] private float stopDistance = 1.25f;
+    [Tooltip("Дистанция до центра цели, на которой зомби останавливается (меш FatZombie широкий — держим маленькой).")]
+    [SerializeField] private float stopDistance = 0.55f;
+
+    [Header("Separation")]
+    [Tooltip("Не скучиваться: мягкий разнос, если CharacterController тоньше меша.")]
+    [SerializeField] private float separationRadius = 1.25f;
+    [SerializeField] private float separationStrength = 2.2f;
 
     [Header("Path (optional)")]
     [Tooltip("Если true — зомби идёт по точкам внутри pathRoot (FirstPoint, SecondPoint...) вместо преследования целей.")]
@@ -119,7 +124,81 @@ public class ZombieChase : MonoBehaviour
         return lily != null && lily.gameObject.activeInHierarchy && lily.Hp > 0;
     }
 
-    float GetEffectiveStopDistance() => stopDistance;
+    float GetEffectiveStopDistance(Transform target)
+    {
+        // Зазор от поверхности цели: при #size коллайдер Джека растёт — иначе зомби
+        // упирается в CC и «не достаёт» до центра с старым stopDistance ~0.4.
+        float gap = stopDistance > 0.05f ? stopDistance : 0.4f;
+        gap = Mathf.Clamp(gap, 0.3f, 0.5f);
+        return gap + EstimateHeroBodyRadius(target);
+    }
+
+    /// <summary>Горизонтальный радиус тела героя (CharacterController после #size).</summary>
+    public static float EstimateHeroBodyRadius(Transform target)
+    {
+        if (target == null)
+            return 0.35f;
+
+        var cc = target.GetComponent<CharacterController>();
+        if (cc != null && cc.radius > 0.05f)
+            return cc.radius;
+
+        float scale = Mathf.Max(Mathf.Abs(target.lossyScale.x), Mathf.Abs(target.lossyScale.z));
+        return 0.35f * Mathf.Max(1f, scale);
+    }
+
+    /// <summary>После спавна: подобрать дистанцию атаки/остановки.</summary>
+    public void ConfigureApproach(float stopDist)
+    {
+        stopDistance = Mathf.Clamp(stopDist, 0.3f, 0.5f);
+    }
+
+    void ApplyZombieSeparation()
+    {
+        if (controller == null || !controller.enabled || separationRadius <= 0.01f)
+            return;
+
+        int layerMask = 1 << gameObject.layer;
+        if (layerMask == 0)
+            layerMask = ~0;
+
+        var hits = Physics.OverlapSphere(transform.position, separationRadius, layerMask);
+        if (hits == null || hits.Length == 0)
+            return;
+
+        Vector3 push = Vector3.zero;
+        int count = 0;
+        for (int i = 0; i < hits.Length; i++)
+        {
+            var col = hits[i];
+            if (col == null)
+                continue;
+            var other = col.GetComponentInParent<ZombieChase>();
+            if (other == null || other == this)
+                continue;
+
+            Vector3 d = transform.position - other.transform.position;
+            d.y = 0f;
+            float dist = d.magnitude;
+            if (dist < 0.001f)
+            {
+                d = new Vector3(Random.Range(-1f, 1f), 0f, Random.Range(-1f, 1f));
+                dist = 0.001f;
+            }
+
+            if (dist >= separationRadius)
+                continue;
+
+            float w = 1f - (dist / separationRadius);
+            push += d.normalized * w;
+            count++;
+        }
+
+        if (count <= 0 || push.sqrMagnitude < 0.0001f)
+            return;
+
+        controller.Move(push.normalized * (separationStrength * Time.deltaTime));
+    }
 
     static void TryPickNearest(Transform candidate, Vector3 fromPos, ref Transform best, ref float bestDist)
     {
@@ -417,7 +496,7 @@ public class ZombieChase : MonoBehaviour
 
         Vector3 dir = delta.normalized;
         float dist = delta.magnitude;
-        float stopAt = GetEffectiveStopDistance();
+        float stopAt = GetEffectiveStopDistance(target);
 
         Quaternion targetRot = Quaternion.LookRotation(dir);
         transform.rotation = Quaternion.RotateTowards(
@@ -429,6 +508,7 @@ public class ZombieChase : MonoBehaviour
         if (dist <= stopAt)
         {
             _walkAnimIntent = 0f;
+            ApplyZombieSeparation();
             ApplyHeightLock();
             return;
         }
@@ -442,6 +522,7 @@ public class ZombieChase : MonoBehaviour
             {
                 // Только горизонталь — без гравитации, иначе Y уезжает.
                 controller.Move(dir * (moveSpeed * Time.deltaTime));
+                ApplyZombieSeparation();
                 ApplyHeightLock();
             }
             else
@@ -452,6 +533,7 @@ public class ZombieChase : MonoBehaviour
                     verticalVelocity += gravity * Time.deltaTime;
                 Vector3 move = dir * moveSpeed + Vector3.up * verticalVelocity;
                 controller.Move(move * Time.deltaTime);
+                ApplyZombieSeparation();
             }
         }
         else if (useRigidbody)
@@ -496,7 +578,7 @@ public class ZombieChase : MonoBehaviour
         if (delta.sqrMagnitude < 0.001f) return;
         Vector3 dir = delta.normalized;
         float dist = delta.magnitude;
-        float stopAt = GetEffectiveStopDistance();
+        float stopAt = GetEffectiveStopDistance(target);
 
         if (dist <= stopAt)
         {

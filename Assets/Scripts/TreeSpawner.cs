@@ -44,12 +44,13 @@ public class TreeSpawner : MonoBehaviour
     /// <summary>
     /// Живое дерево: есть визуал. Маркер ChoppableTree дописываем, если пропал —
     /// раньше его отсутствие чистило весь лес Destroy().
-    /// Важно: не требовать renderer.enabled — MuteEnvPresentation выключает рендереры
-    /// у скрытых Env, иначе спавнер думает «лес пуст» и крутит ResetTrees (лаги + нет деревьев).
+    /// Не требовать activeInHierarchy: при #reset / Mute родитель Env может быть
+    /// выключен на кадр — иначе чекер FAIL 0/30 и спам ошибок.
+    /// Не требовать renderer.enabled — MuteEnvPresentation гасит рендереры.
     /// </summary>
     static bool IsAliveTree(GameObject go)
     {
-        if (IsUnityNull(go) || !go.activeInHierarchy)
+        if (IsUnityNull(go) || !go.activeSelf)
             return false;
 
         var renderers = go.GetComponentsInChildren<Renderer>(true);
@@ -59,8 +60,6 @@ public class TreeSpawner : MonoBehaviour
             var r = renderers[i];
             if (r == null)
                 continue;
-            // Достаточно наличия меша; enabled может быть false у скрытой Env.
-            // ChoppableTree — уже подготовленное дерево (bounds иногда 0 в первый кадр).
             if (r.bounds.size.sqrMagnitude > 0.02f)
             {
                 hasVisual = true;
@@ -69,6 +68,8 @@ public class TreeSpawner : MonoBehaviour
         }
 
         if (!hasVisual && go.GetComponentInChildren<MeshFilter>(true) != null)
+            hasVisual = true;
+        if (!hasVisual && go.GetComponentInChildren<SkinnedMeshRenderer>(true) != null)
             hasVisual = true;
 
         if (!hasVisual)
@@ -121,11 +122,17 @@ public class TreeSpawner : MonoBehaviour
     private void Start()
     {
         nextWatchdogTime = Time.unscaledTime + watchdogInterval;
-        ResetTrees();
+        // Уже заполнили при #env_N / Instantate — не дёргать ResetTrees второй раз в том же кадре.
+        if (CountAliveChildren() == 0)
+            ResetTrees();
     }
 
     private void Update()
     {
+        // Скрытая копия Env (меню K) — не крутить ResetTrees впустую.
+        if (!isActiveAndEnabled || !gameObject.activeInHierarchy)
+            return;
+
         if (_resetInProgress)
             return;
 

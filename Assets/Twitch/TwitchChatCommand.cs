@@ -1,6 +1,6 @@
 using System;
 
-/// <summary>Команда чата вида #add_tree=5</summary>
+/// <summary>Команда чата вида #add tree=5 (внутри имя нормализуется в add_tree).</summary>
 [Serializable]
 public readonly struct TwitchChatCommand
 {

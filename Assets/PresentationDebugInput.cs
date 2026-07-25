@@ -5,15 +5,15 @@ using UnityEngine.InputSystem;
 
 /// <summary>
 /// Горячие клавиши для Play-теста presentation-сцены и Twitch-команд.
-/// Цифры 1–0 — те же команды, что в чате (#add_tree, #zombie, #reset…).
-/// P — показать/скрыть рендер параллельных Env. K — меню переключения сред. Z — быстро #zombie=1. V — следующий этап выживания. B — день/ночь.
+/// Цифры 1–0 — те же команды, что в чате (#add_tree, #add zombie, #reset…).
+/// P — показать/скрыть рендер параллельных Env. K — меню сред. Z — #add zombie=1. V — этап выживания. B — день/ночь.
 /// </summary>
 public sealed class PresentationDebugInput : MonoBehaviour
 {
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
     static void Bootstrap()
     {
-        var existing = Object.FindObjectOfType<PresentationDebugInput>();
+        var existing = Object.FindFirstObjectByType<PresentationDebugInput>();
         if (existing != null)
             return;
 
@@ -32,7 +32,7 @@ public sealed class PresentationDebugInput : MonoBehaviour
         if (WasKeyPressed(KeyCode.Alpha4) || WasKeyPressed(KeyCode.Keypad4))
             TwitchChatGameBridge.SimulateCommand("forward", 3);
         if (WasKeyPressed(KeyCode.Alpha5) || WasKeyPressed(KeyCode.Keypad5))
-            TwitchChatGameBridge.SimulateCommand("zombie", 2);
+            TwitchChatGameBridge.SimulateCommand("add_zombie", 2);
         if (WasKeyPressed(KeyCode.Alpha6) || WasKeyPressed(KeyCode.Keypad6))
             TwitchChatGameBridge.SimulateCommand("add_fire", 0);
         // clone_jack временно отключён (ломал зомби/эпизод)
@@ -41,12 +41,12 @@ public sealed class PresentationDebugInput : MonoBehaviour
         if (WasKeyPressed(KeyCode.Alpha8) || WasKeyPressed(KeyCode.Keypad8))
             TwitchChatGameBridge.SimulateCommand("speed_up", 2);
         if (WasKeyPressed(KeyCode.Alpha9) || WasKeyPressed(KeyCode.Keypad9))
-            TwitchChatGameBridge.SimulateCommand("show_metrics", 0);
+            TrainingMetricsBurstOverlay.CycleHeroes();
         if (WasKeyPressed(KeyCode.Alpha0) || WasKeyPressed(KeyCode.Keypad0))
             TwitchChatGameBridge.SimulateCommand("reset", 0);
 
         if (WasKeyPressed(KeyCode.Z))
-            TwitchChatGameBridge.SimulateCommand("zombie", 1);
+            TwitchChatGameBridge.SimulateCommand("add_zombie", 1);
 
         if (WasKeyPressed(KeyCode.V))
             AdvancePresentationSurvivalPhase();

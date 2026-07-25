@@ -47,7 +47,7 @@ public sealed class JackSurvivalTaskHud : MonoBehaviour
     public static void SetGlobalEnabled(bool enabled)
     {
         GlobalEnabled = enabled;
-        var inst = FindObjectOfType<JackSurvivalTaskHud>();
+        var inst = FindFirstObjectByType<JackSurvivalTaskHud>();
         if (inst != null)
             inst.ApplyVisibility();
     }
@@ -267,7 +267,7 @@ public sealed class JackSurvivalTaskHud : MonoBehaviour
             : anchorX >= 0.99f
                 ? TextAlignmentOptions.BottomRight
                 : TextAlignmentOptions.Bottom;
-        tmp.enableWordWrapping = false;
+        tmp.textWrappingMode = TextWrappingModes.NoWrap;
         if (TMP_Settings.defaultFontAsset != null)
             tmp.font = TMP_Settings.defaultFontAsset;
 

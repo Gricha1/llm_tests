@@ -25,6 +25,12 @@ BEHAVIORS = (
     "GeorgeLowLevelAgent",
 )
 
+# Без Jack стрим не стартует. Lily/George — только если есть в этом run (не из чужих).
+REQUIRED_TO_START = ("JackLowLevelAgent",)
+
+# Совпадает с RESTART_EXIT в run_stream_onnx.bash (#restart_stream)
+RESTART_EXIT_CODE = 75
+
 
 def _log(msg: str) -> None:
     print(f"[stream_onnx] {msg}", flush=True)
@@ -47,17 +53,14 @@ def _onnx_step(path: Path, name: str) -> int:
     return int(step_s)
 
 
-def find_latest_onnx(run_dir: Path, behavior: str) -> Optional[Path]:
-    """Самый свежий чекпоинт по номеру шага (не по mtime).
+def sticky_onnx_dir(run_dir: Path) -> Path:
+    """results/run_N → stream_weights/run_N/onnx (не стирается при --force train)."""
+    return run_dir.parent.parent / "stream_weights" / run_dir.name / "onnx"
 
-    ML-Agents иногда пишет Name-0.onnx рядом с checkpoint.pt — он новее по
-    времени, но это не обученные веса (шаг 0). Берём max(step).
-    """
-    name = behavior_stem(behavior)
-    d = run_dir / name
+
+def _best_onnx_in_dir(d: Path, name: str) -> Optional[Path]:
     if not d.is_dir():
         return None
-
     best: Optional[Path] = None
     best_step = -1
     for path in d.glob(f"{name}-*.onnx"):
@@ -65,18 +68,80 @@ def find_latest_onnx(run_dir: Path, behavior: str) -> Optional[Path]:
         if step > best_step:
             best_step = step
             best = path
-
-    # step=0 только если других нет
     if best is not None and best_step > 0:
         return best
     if best is not None:
         return best
-
     plain = d / f"{name}.onnx"
-    if plain.is_file():
-        return plain
-    root = run_dir / f"{name}.onnx"
-    return root if root.is_file() else None
+    return plain if plain.is_file() else None
+
+
+def find_latest_onnx(run_dir: Path, behavior: str) -> Optional[Path]:
+    """Самый свежий чекпоинт по номеру шага (results, потом sticky этого run).
+
+    ML-Agents иногда пишет Name-0.onnx рядом с checkpoint.pt — он новее по
+    времени, но это не обученные веса (шаг 0). Берём max(step).
+    Sticky: stream_weights/<run>/onnx — чтобы стрим не умирал после --force / rm.
+    Чужие run не подставляем: jack-only валидация = только Jack.
+    """
+    name = behavior_stem(behavior)
+    candidates: List[Tuple[int, Path]] = []
+
+    for d in (run_dir / name, sticky_onnx_dir(run_dir)):
+        path = _best_onnx_in_dir(d, name)
+        if path is None:
+            continue
+        step = _onnx_step(path, name)
+        if step < 0 and path.name == f"{name}.onnx":
+            step = 0
+        candidates.append((step, path))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[0][1]
+
+
+def run_has_results_onnx(run_dir: Path, behavior: str) -> bool:
+    """Есть ли onnx именно в results/run_N (не sticky)."""
+    name = behavior_stem(behavior)
+    return _best_onnx_in_dir(run_dir / name, name) is not None
+
+
+def is_jack_only_run(run_dir: Path) -> bool:
+    """Jack есть в results, Lily/George нет — как train_headless_jack."""
+    if not run_has_results_onnx(run_dir, "JackLowLevelAgent"):
+        return False
+    return not run_has_results_onnx(run_dir, "LilyLowLevelAgent") and not run_has_results_onnx(
+        run_dir, "GeorgeLowLevelAgent"
+    )
+
+
+def persist_sticky_onnx(run_dir: Path, behavior: str, src: Path) -> None:
+    """Копия в stream_weights — переживает удаление results/run_N."""
+    name = behavior_stem(behavior)
+    # Не копируем уже из sticky в себя.
+    sticky = sticky_onnx_dir(run_dir)
+    try:
+        if src.resolve().parent == sticky.resolve():
+            return
+    except OSError:
+        pass
+    try:
+        sticky.mkdir(parents=True, exist_ok=True)
+        dst = sticky / f"{name}.onnx"
+        tmp = sticky / f".{name}.onnx.tmp"
+        shutil.copy2(src, tmp)
+        tmp.replace(dst)
+        # Сохраняем и именнованный по шагу, если есть.
+        step = _onnx_step(src, name)
+        if step > 0:
+            named = sticky / src.name
+            if not named.exists():
+                shutil.copy2(src, named)
+    except OSError as e:
+        _log(f"sticky save fail {name}: {e}")
 
 
 def _file_stable(path: Path, settle_sec: float = 0.4) -> bool:
@@ -155,6 +220,24 @@ class OnnxPolicy:
                 arr = obs_list[min(idx, len(obs_list) - 1)].astype(np.float32)
                 if arr.ndim == 1:
                     arr = arr[None, :]
+                # Билд обновил размер obs, а onnx со старого run — иначе ORT валит весь стрим.
+                exp = None
+                in_shape = self.session.get_inputs()[i].shape
+                if len(in_shape) >= 2 and isinstance(in_shape[1], int) and in_shape[1] > 0:
+                    exp = int(in_shape[1])
+                got = int(arr.shape[-1])
+                if exp is not None and got != exp:
+                    if not getattr(self, "_obs_shape_warned", False):
+                        _log(
+                            f"WARN {self.path.name}: {name} got={got} expected={exp} — "
+                            f"pad/trunc; поставь RUN_ID на текущий train (совпадающий onnx)"
+                        )
+                        self._obs_shape_warned = True
+                    if got > exp:
+                        arr = arr[..., :exp].copy()
+                    else:
+                        pad = np.zeros(arr.shape[:-1] + (exp - got,), dtype=np.float32)
+                        arr = np.concatenate([arr, pad], axis=-1)
                 feeds[name] = arr
             else:
                 shape = self.session.get_inputs()[i].shape
@@ -196,8 +279,14 @@ class OnnxPolicy:
 class PolicyBank:
     """Веса грузятся в фоне. По умолчанию — только после конца эпизода (незаметно)."""
 
-    def __init__(self, run_dir: Path, poll_sec: float = 0.0):
+    def __init__(
+        self,
+        run_dir: Path,
+        poll_sec: float = 0.0,
+        behaviors: Tuple[str, ...] = BEHAVIORS,
+    ):
         self.run_dir = run_dir
+        self.behaviors = behaviors
         # 0 = только по request_reload() (конец эпизода); >0 = ещё и страховочный таймер.
         self.poll_sec = poll_sec
         self.policies: Dict[str, OnnxPolicy] = {}
@@ -225,7 +314,7 @@ class PolicyBank:
 
     def _reload_all_blocking(self) -> None:
         """Только до старта Unity — один раз можно подождать."""
-        for behavior in BEHAVIORS:
+        for behavior in self.behaviors:
             path = find_latest_onnx(self.run_dir, behavior)
             if path is None:
                 continue
@@ -235,12 +324,13 @@ class PolicyBank:
                 pol = OnnxPolicy(path)
                 with self._lock:
                     self.policies[behavior] = pol
+                persist_sticky_onnx(self.run_dir, behavior, path)
             except Exception as e:
                 _log(f"reload fail {behavior}: {e}")
 
     def ready(self) -> bool:
         with self._lock:
-            return all(b in self.policies for b in BEHAVIORS)
+            return all(b in self.policies for b in REQUIRED_TO_START)
 
     def _loader_loop(self) -> None:
         while not self._stop.is_set():
@@ -251,7 +341,7 @@ class PolicyBank:
                 break
 
             jobs: List[Tuple[str, Path]] = []
-            for behavior in BEHAVIORS:
+            for behavior in self.behaviors:
                 path = find_latest_onnx(self.run_dir, behavior)
                 if path is None:
                     continue
@@ -277,6 +367,7 @@ class PolicyBank:
                     pol = OnnxPolicy(latest)
                     with self._lock:
                         self.policies[behavior] = pol
+                    persist_sticky_onnx(self.run_dir, behavior, latest)
                     _log(f"weights updated: {behavior} <- {latest.name}")
                 except Exception as e:
                     _log(f"reload fail {behavior}: {e}")
@@ -290,7 +381,8 @@ def run_loop(
     bank: PolicyBank,
     step_log_every: int = 500,
     target_fps: float = 30.0,
-) -> None:
+    restart_flag: Path | None = None,
+) -> int:
     from mlagents_envs.base_env import ActionTuple
 
     behavior_names = list(env.behavior_specs.keys())
@@ -306,6 +398,8 @@ def run_loop(
         "reload trigger: только конец эпизода Jack "
         "(смерть Lily/George mid-frame больше не грузит onnx)"
     )
+    if restart_flag is not None:
+        _log(f"restart flag watch: {restart_flag}")
 
     steps = 0
     logged_first_act = set()
@@ -319,6 +413,14 @@ def run_loop(
     window_t0 = time.perf_counter()
 
     while True:
+        if restart_flag is not None and steps % 30 == 0 and restart_flag.is_file():
+            _log(f"#restart_stream: найден {restart_flag} — выходим для рестарта")
+            try:
+                restart_flag.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return RESTART_EXIT_CODE
+
         t0 = time.perf_counter()
         jack_episode_ended = False
         for behavior in behavior_names:
@@ -432,34 +534,76 @@ def main() -> int:
         from mlagents_envs.side_channel.engine_configuration_channel import (
             EngineConfigurationChannel,
         )
+        from mlagents_envs.side_channel.stats_side_channel import StatsSideChannel
     except ImportError as e:
         _log(f"ERROR: нужен conda env mlagents ({e})")
         _log("  conda activate mlagents && pip install onnxruntime")
         return 1
 
-    bank = PolicyBank(run_dir, poll_sec=args.poll_sec)
-    if not bank.ready():
-        _log(f"жду первые .onnx в {run_dir}/<Behavior>/ ...")
-        while not bank.ready():
-            bank._reload_all_blocking()
-            if bank.ready():
-                break
+    jack_only = os.environ.get("FOREST_JACK_ONLY", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    # Ждём Jack в results, потом решаем jack-only (без Lily/George в этом run).
+    if not run_has_results_onnx(run_dir, "JackLowLevelAgent"):
+        _log(f"жду Jack .onnx в {run_dir}/JackLowLevelAgent/ ...")
+        while not run_has_results_onnx(run_dir, "JackLowLevelAgent"):
             time.sleep(2.0)
-        _log("onnx найдены, стартую Unity")
+        _log("Jack onnx найден")
+    if not jack_only:
+        jack_only = is_jack_only_run(run_dir)
+
+    behaviors: Tuple[str, ...] = (
+        ("JackLowLevelAgent",) if jack_only else BEHAVIORS
+    )
+    bank = PolicyBank(run_dir, poll_sec=args.poll_sec, behaviors=behaviors)
+    bank._reload_all_blocking()
+    if not bank.ready():
+        _log(f"ERROR: не загрузился Jack onnx из {run_dir}")
+        bank.close()
+        return 1
+    with bank._lock:
+        loaded = [b for b in behaviors if b in bank.policies]
+    if jack_only:
+        _log(f"onnx: jack-only ({', '.join(loaded)}) — Lily/George не грузим")
+    else:
+        missing = [b for b in BEHAVIORS if b not in loaded]
+        if missing:
+            _log(f"WARN: нет onnx для {missing} в {run_dir.name} — стрим с тем что есть")
+        else:
+            _log("onnx: Jack + Lily + George готовы")
+    _log("onnx найдены, стартую Unity")
     _log(
         "weight reload: on Jack episode end"
         + (f" + every {args.poll_sec:.0f}s" if args.poll_sec > 0 else "")
     )
 
     engine = EngineConfigurationChannel()
+    stats = StatsSideChannel()
     additional = [
         "-forestStreamOnly",
         "-forestExternalBrain",
         "-forestResultsDir",
         str(run_dir),
     ]
+    if jack_only:
+        # Unity: только Jack (иначе Lily/George регистрируются без onnx).
+        additional.append("-forestJackOnlyTasks")
+    # Явный X11: из tmux без XAUTHORITY окно не появляется, OBS чёрный.
+    display = os.environ.get("DISPLAY") or ":1"
+    os.environ["DISPLAY"] = display
+    if not os.environ.get("XAUTHORITY"):
+        for cand in (
+            f"/run/user/{os.getuid()}/gdm/Xauthority",
+            os.path.expanduser("~/.Xauthority"),
+        ):
+            if os.path.isfile(cand):
+                os.environ["XAUTHORITY"] = cand
+                break
     _log(
         f"start Unity {env_path} port={args.port} DISPLAY={os.environ.get('DISPLAY')} "
+        f"XAUTHORITY={os.environ.get('XAUTHORITY', '')} "
         f"fps={args.target_fps} quality={args.quality_level} "
         f"{args.width}x{args.height}"
     )
@@ -468,7 +612,7 @@ def main() -> int:
         base_port=args.port,
         no_graphics=False,
         timeout_wait=args.timeout,
-        side_channels=[engine],
+        side_channels=[engine, stats],
         additional_args=additional,
     )
     if hasattr(engine, "set_configuration_parameters"):
@@ -485,18 +629,48 @@ def main() -> int:
         _log("WARN: не удалось выставить engine config")
     env.reset()
 
+    restart_flag = Path(
+        os.environ.get("FOREST_STREAM_RESTART_FLAG", "").strip()
+        or (Path.cwd() / ".stream_restart_request")
+    )
+
+    # Если Unity завис в step(), проверка флага в run_loop не сработает.
+    # Поток добивает процесс → супервизор поднимает стрим заново.
+    def _restart_watchdog() -> None:
+        while True:
+            try:
+                if restart_flag.is_file():
+                    _log(f"#restart_stream watchdog: {restart_flag} — hard exit {RESTART_EXIT_CODE}")
+                    try:
+                        restart_flag.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    os._exit(RESTART_EXIT_CODE)
+            except Exception:
+                pass
+            time.sleep(1.0)
+
+    threading.Thread(target=_restart_watchdog, name="stream-restart-watchdog", daemon=True).start()
+
+    exit_code = 0
     try:
         try:
             os.nice(-5)
         except OSError:
             pass
-        run_loop(env, bank, target_fps=0.0)  # без sleep-пейсинга
+        exit_code = run_loop(
+            env,
+            bank,
+            target_fps=0.0,
+            restart_flag=restart_flag,
+        )
     except KeyboardInterrupt:
         _log("stop")
+        exit_code = 0
     finally:
         bank.close()
         env.close()
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":

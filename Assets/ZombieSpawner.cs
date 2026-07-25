@@ -10,10 +10,12 @@ public class ZombieSpawner : MonoBehaviour
 {
     const float DefaultSpawnScale = 1f;
     const float PrefabCharacterControllerHeight = 2f;
-    const float PrefabCharacterControllerRadius = 0.5f;
+    // Не раздувать CC: иначе Jack.radius+zombie.radius ≈ «стена». Разнос зомби — Separation.
+    const float PrefabCharacterControllerRadius = 0.45f;
     static readonly Vector3 PrefabCharacterControllerCenter = new Vector3(0f, 1f, 0f);
     const float CityFixedSpawnWorldY = 0.44f;
-    const float ForestSpawnLocalY = 0f;
+    // Как у Jack; Y спавнера в сцене ≈ -5.92 — на нём зомби тонут и стопорятся.
+    const float ForestGroundEnvLocalY = -5.228786f;
 
     [Header("Prefab")]
     [SerializeField] private GameObject zombiePrefab;
@@ -35,6 +37,15 @@ public class ZombieSpawner : MonoBehaviour
     bool _bootstrapDone;
     RuntimeAnimatorController _cachedZombieAnimator;
 
+    public int AliveCount
+    {
+        get
+        {
+            RemoveDestroyed();
+            return zombies.Count;
+        }
+    }
+
     static bool IsCityScene()
     {
         string name = SceneManager.GetActiveScene().name;
@@ -49,6 +60,14 @@ public class ZombieSpawner : MonoBehaviour
         if (_bootstrapDone)
             return;
         _bootstrapDone = true;
+
+        // Меню K / клон Env (N): не BootstrapSpawn (hills×10) — иначе hitch на каждом #env_N.
+        if (ShouldSkipAutoBootstrap())
+        {
+            nextRespawnTime = Time.time + Mathf.Max(0.5f, spawnInterval);
+            return;
+        }
+
         BootstrapSpawn();
     }
 
@@ -57,12 +76,24 @@ public class ZombieSpawner : MonoBehaviour
         if (_bootstrapDone)
             return;
         _bootstrapDone = true;
+
+        if (ShouldSkipAutoBootstrap())
+        {
+            nextRespawnTime = Time.time + Mathf.Max(0.5f, spawnInterval);
+            return;
+        }
+
         BootstrapSpawn();
     }
 
-    void OnDisable()
+    // Не сбрасываем _bootstrapDone в OnDisable: SetActive при #env_N иначе снова hills×10.
+
+    bool ShouldSkipAutoBootstrap()
     {
-        _bootstrapDone = false;
+        if (TrainingEnvSpace.IsDebugEnvFocusActive)
+            return true;
+        var envRoot = TrainingEnvSpace.FindRoot(transform);
+        return envRoot != null && TrainingEnvSpace.GetEnvCopyIndex(envRoot) > 0;
     }
 
     void BootstrapSpawn()
@@ -92,10 +123,24 @@ public class ZombieSpawner : MonoBehaviour
             return;
         if (spawn_idle)
             return;
+
+        // Меню K: досыпать только на JackZombie, раз в 2 сек (не hills-армия).
+        if (TrainingEnvSpace.IsDebugEnvFocusActive)
+        {
+            if (!TrainingEnvSpace.IsJackZombieDebugFocus)
+                return;
+            if (zombie_from_hills)
+                return;
+        }
+
+        float interval = TrainingEnvSpace.IsDebugEnvFocusActive
+            ? 2f
+            : (zombie_from_hills ? 2f : spawnInterval);
+
         if (Time.time < nextRespawnTime)
             return;
 
-        nextRespawnTime = Time.time + (zombie_from_hills ? 2f : spawnInterval);
+        nextRespawnTime = Time.time + interval;
         RemoveDestroyed();
         if (zombie_from_hills || zombies.Count < maxZombies)
             SpawnOne();
@@ -119,7 +164,7 @@ public class ZombieSpawner : MonoBehaviour
                 return spawners[0];
         }
 
-        var all = Object.FindObjectsOfType<ZombieSpawner>(true);
+        var all = Object.FindObjectsByType<ZombieSpawner>(FindObjectsInactive.Include, FindObjectsSortMode.None);
         for (int i = 0; i < all.Length; i++)
         {
             if (all[i] != null && all[i].gameObject.name == "ZombieSpawner")
@@ -162,7 +207,7 @@ public class ZombieSpawner : MonoBehaviour
         if (IsCityScene())
             SpawnOneCity();
         else
-            SpawnOneForestLocal(Random.Range(-1.2f, 1.2f), Random.Range(-1.2f, 1.2f));
+            SpawnOneForestLocal(Random.Range(-2.2f, 2.2f), Random.Range(-2.2f, 2.2f));
     }
 
     void SpawnOneForestLocal(float localX, float localZ)
@@ -197,9 +242,14 @@ public class ZombieSpawner : MonoBehaviour
         var cc = zombie.GetComponentInChildren<CharacterController>();
         if (cc != null)
         {
-            cc.height = PrefabCharacterControllerHeight;
-            cc.radius = PrefabCharacterControllerRadius;
-            cc.center = PrefabCharacterControllerCenter;
+            // Радиус растёт со scale — иначе толстый меш пересекается, а CC тонкий.
+            float r = PrefabCharacterControllerRadius * Mathf.Max(1f, scaleMult);
+            cc.height = PrefabCharacterControllerHeight * Mathf.Max(1f, scaleMult);
+            cc.radius = r;
+            cc.center = new Vector3(
+                PrefabCharacterControllerCenter.x,
+                PrefabCharacterControllerCenter.y * Mathf.Max(1f, scaleMult),
+                PrefabCharacterControllerCenter.z);
             cc.skinWidth = 0.08f;
             cc.enabled = false;
         }
@@ -212,13 +262,53 @@ public class ZombieSpawner : MonoBehaviour
         ApplySpawnScale(zombie, scaleExtra);
         DisableCharacterControllers(zombie);
 
-        // Только local у спавнера — высота = высота спавнера/Джека, не world Y.
-        zombie.transform.SetParent(transform, false);
-        zombie.transform.localPosition = new Vector3(localX, ForestSpawnLocalY, localZ);
+        var envRoot = TrainingEnvSpace.FindRoot(transform);
+        // XZ у спавнера (дом), Y — уровень пола Env как у Jack (не Y объекта Spawner).
+        Vector3 worldAtSpawner = transform.TransformPoint(new Vector3(localX, 0f, localZ));
+        Vector3 envLocal;
+        if (envRoot != null)
+        {
+            envLocal = envRoot.InverseTransformPoint(worldAtSpawner);
+            envLocal.y = ForestGroundEnvLocalY;
+            zombie.transform.SetParent(envRoot, false);
+        }
+        else
+        {
+            envLocal = new Vector3(localX, ForestGroundEnvLocalY, localZ);
+            zombie.transform.SetParent(transform, false);
+        }
+
+        zombie.transform.localPosition = envLocal;
         zombie.transform.localRotation = Quaternion.Euler(0f, Random.Range(0f, 360f), 0f);
+
+        if (!IsFinitePos(zombie.transform.position) || !IsFinitePos(zombie.transform.localScale))
+        {
+            Vector3 world = worldAtSpawner;
+            world.y = envRoot != null
+                ? envRoot.TransformPoint(new Vector3(0f, ForestGroundEnvLocalY, 0f)).y
+                : world.y;
+            if (!IsFinitePos(world))
+                world = Vector3.up;
+            zombie.transform.SetParent(null, false);
+            zombie.transform.SetPositionAndRotation(world, Quaternion.identity);
+            zombie.transform.localScale = Vector3.one;
+            ApplySpawnScale(zombie, scaleExtra);
+            if (envRoot != null)
+            {
+                zombie.transform.SetParent(envRoot, true);
+                var lp = zombie.transform.localPosition;
+                lp.y = ForestGroundEnvLocalY;
+                zombie.transform.localPosition = lp;
+            }
+        }
 
         FinishSpawnedZombie(zombie, city: false);
     }
+
+    static bool IsFinitePos(Vector3 v) =>
+        !(float.IsNaN(v.x) || float.IsNaN(v.y) || float.IsNaN(v.z)
+          || float.IsInfinity(v.x) || float.IsInfinity(v.y) || float.IsInfinity(v.z)
+          || Mathf.Abs(v.x) > 100000f || Mathf.Abs(v.y) > 100000f || Mathf.Abs(v.z) > 100000f);
 
     void FinalizeCityZombie(GameObject zombie, Vector3 worldPos, float scaleExtra)
     {
@@ -277,10 +367,19 @@ public class ZombieSpawner : MonoBehaviour
             return;
 
         chase.EnableAgentChaseMode();
+        chase.ConfigureApproach(0.4f);
         if (city)
             chase.LockWorldY(CityFixedSpawnWorldY);
         else
-            chase.LockParentLocalY(ForestSpawnLocalY);
+        {
+            var envRoot = TrainingEnvSpace.FindRoot(transform);
+            if (envRoot != null)
+                chase.LockEnvLocalY(envRoot, ForestGroundEnvLocalY);
+        }
+
+        var attack = zombie.GetComponentInChildren<ZombieAttack>();
+        if (attack != null)
+            attack.ConfigureDamageRadius(1.9f);
 
         if (_spawnMoveSpeedMultiplier > 1f)
             chase.SetMoveSpeedMultiplier(_spawnMoveSpeedMultiplier);
@@ -427,7 +526,7 @@ public class ZombieSpawner : MonoBehaviour
             var lilyRoot = TrainingEnvSpace.PresentationRoot;
             LilyScript presentationLily = lilyRoot != null
                 ? lilyRoot.GetComponentInChildren<LilyScript>(false)
-                : Object.FindObjectOfType<LilyScript>();
+                : Object.FindFirstObjectByType<LilyScript>();
             if (presentationLily != null)
                 lily = presentationLily.transform;
         }
@@ -542,6 +641,11 @@ public class ZombieSpawner : MonoBehaviour
 
     public void ClearZombies()
     {
+        ClearZombies(scanOrphanRoots: true);
+    }
+
+    public void ClearZombies(bool scanOrphanRoots)
+    {
         RemoveDestroyed();
         foreach (var z in zombies)
         {
@@ -553,40 +657,58 @@ public class ZombieSpawner : MonoBehaviour
         zombies.Clear();
         _spawnMoveSpeedMultiplier = 1f;
 
-        // Сироты без родителя.
-        var all = FindObjectsOfType<Transform>();
-        for (int i = 0; i < all.Length; i++)
+        // Полный FindObjectsOfType по сцене — дорого; при ClearZombiesInAllEnvs делаем один раз.
+        if (scanOrphanRoots)
+            DestroyOrphanFatZombieRoots();
+    }
+
+    static void DestroyOrphanFatZombieRoots()
+    {
+        // Только корни сцены — не FindObjectsOfType<Transform> по всей иерархии (хитч при #env_N).
+        var scene = UnityEngine.SceneManagement.SceneManager.GetActiveScene();
+        if (!scene.IsValid())
+            return;
+
+        var roots = scene.GetRootGameObjects();
+        for (int i = 0; i < roots.Length; i++)
         {
-            var t = all[i];
-            if (t == null || t.parent != null)
+            var go = roots[i];
+            if (go == null)
                 continue;
-            string n = t.name;
+            string n = go.name;
             if (n.IndexOf("FatZombie", System.StringComparison.OrdinalIgnoreCase) < 0)
                 continue;
-            Destroy(t.gameObject);
+            Object.Destroy(go);
         }
     }
 
     /// <summary>Очистить всех зомби во всех Env (переключение меню K / #env_N).</summary>
     public static void ClearZombiesInAllEnvs()
     {
-        var spawners = Object.FindObjectsOfType<ZombieSpawner>(true);
+        var spawners = Object.FindObjectsByType<ZombieSpawner>(FindObjectsInactive.Include, FindObjectsSortMode.None);
         for (int i = 0; i < spawners.Length; i++)
         {
             if (spawners[i] == null)
                 continue;
-            spawners[i].ClearZombies();
+            // orphan-scan один раз в конце — иначе N×FindObjectsOfType → hitch при #env_N
+            spawners[i].ClearZombies(scanOrphanRoots: false);
             if (spawners[i].gameObject.name.IndexOf("Hills", System.StringComparison.OrdinalIgnoreCase) >= 0)
                 continue;
             if (spawners[i].gameObject.activeSelf)
                 spawners[i].gameObject.SetActive(false);
         }
+
+        DestroyOrphanFatZombieRoots();
     }
 
     public int SpawnZombiesNear(Vector3 worldPos, int count, float radius = 7f)
     {
         if (ResolveZombiePrefab() == null)
             return 0;
+
+        // Twitch #add zombie: спавнер мог быть выключен ClearZombiesInAllEnvs.
+        if (!gameObject.activeSelf)
+            gameObject.SetActive(true);
 
         count = Mathf.Clamp(count, 1, 10);
         RemoveDestroyed();
@@ -615,27 +737,42 @@ public class ZombieSpawner : MonoBehaviour
         return spawned;
     }
 
+    float _lastTrainingEpisodeStartTime = -999f;
+
     public int StartTrainingEpisode(int immediateCount = 2)
     {
-        ClearZombies();
+        // Меню K: ForceApply / EndEpisode / delayed ForceStart зовут подряд — без debounce лаги.
+        if (zombies.Count > 0
+            && Time.unscaledTime - _lastTrainingEpisodeStartTime < 1f)
+            return zombies.Count;
+
+        ClearZombies(scanOrphanRoots: false);
         if (ResolveZombiePrefab() == null)
         {
             Debug.LogWarning($"[{name}] StartTrainingEpisode: zombiePrefab=null", this);
             return 0;
         }
 
-        immediateCount = Mathf.Clamp(immediateCount, 1, maxZombies);
+        // Меню K: всегда ровно 1 — иначе 2 в ±1.2м выглядят как «стопка» + hitch Instantiate.
+        if (TrainingEnvSpace.IsDebugEnvFocusActive)
+            immediateCount = 1;
+        else
+            immediateCount = Mathf.Clamp(immediateCount, 1, maxZombies);
+
         for (int i = 0; i < immediateCount; i++)
             SpawnOne();
 
-        nextRespawnTime = Time.time + Mathf.Max(0.5f, spawnInterval);
+        nextRespawnTime = Time.time + (TrainingEnvSpace.IsDebugEnvFocusActive
+            ? 2f
+            : Mathf.Max(0.5f, spawnInterval));
+        _lastTrainingEpisodeStartTime = Time.unscaledTime;
         return zombies.Count;
     }
 
     public void ResetForNewEpisode()
     {
         ClearZombies();
-        if (!gameObject.activeInHierarchy)
+        if (!gameObject.activeInHierarchy || ShouldSkipAutoBootstrap())
         {
             nextRespawnTime = Time.time + spawnInterval;
             return;

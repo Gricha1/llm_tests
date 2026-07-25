@@ -10,7 +10,7 @@ using System.Threading.Tasks;
 using UnityEngine;
 
 /// <summary>
-/// Читает Twitch-чат (IRC over SSL) и парсит команды вида #add_tree=5, #up=3, #forward=5, #zombie=2.
+/// Читает Twitch-чат (IRC over SSL) и парсит команды вида #add_tree=5, #add zombie=2, #up=3.
 /// </summary>
 public sealed class TwitchChatReader : MonoBehaviour
 {
@@ -66,7 +66,7 @@ public sealed class TwitchChatReader : MonoBehaviour
         if (_instance != null)
             return;
 
-        if (FindObjectOfType<TwitchChatReader>() != null)
+        if (FindFirstObjectByType<TwitchChatReader>() != null)
             return;
 
         var go = new GameObject(nameof(TwitchChatReader));
@@ -293,6 +293,11 @@ public sealed class TwitchChatReader : MonoBehaviour
     {
         TryParseShowMetrics(username, displayName, message);
         TryParseAddFire(username, displayName, message);
+        TryParseAddNoun(username, displayName, message, "sheep", "add_sheep");
+        TryParseAddNoun(username, displayName, message, "tree", "add_tree");
+        TryParseAddNoun(username, displayName, message, "zombie", "add_zombie");
+        TryParseSpacedNamedCommand(username, displayName, message, "speed", "up", "speed_up", allowValue: true);
+        TryParseSpacedNamedCommand(username, displayName, message, "restart", "stream", "restart_stream", allowValue: false);
 
         int searchFrom = 0;
         while (searchFrom < message.Length)
@@ -310,6 +315,93 @@ public sealed class TwitchChatReader : MonoBehaviour
             DispatchCommand(cmd);
             searchFrom = tokenEnd;
         }
+    }
+
+    static void TryParseAddNoun(string username, string displayName, string message, string noun, string commandName)
+    {
+        int idx = message.IndexOf("#add", System.StringComparison.OrdinalIgnoreCase);
+        if (idx < 0)
+            return;
+
+        int pos = idx + 4;
+        while (pos < message.Length && char.IsWhiteSpace(message[pos]))
+            pos++;
+
+        if (pos + noun.Length > message.Length)
+            return;
+
+        if (!message.Substring(pos, noun.Length).Equals(noun, System.StringComparison.OrdinalIgnoreCase))
+            return;
+
+        int afterNoun = pos + noun.Length;
+        if (afterNoun < message.Length && !char.IsWhiteSpace(message[afterNoun]) && message[afterNoun] != '=')
+            return;
+
+        int value = 1;
+        int end = afterNoun;
+        while (end < message.Length && char.IsWhiteSpace(message[end]))
+            end++;
+
+        if (end < message.Length && message[end] == '=')
+        {
+            end++;
+            int valueStart = end;
+            while (end < message.Length && !char.IsWhiteSpace(message[end]))
+                end++;
+            if (!int.TryParse(message.Substring(valueStart, end - valueStart).Trim(), out value))
+                return;
+        }
+
+        string raw = message.Substring(idx, end - idx).TrimEnd();
+        var cmd = new TwitchChatCommand(username, displayName, raw, commandName, value);
+        if (_instance != null)
+            _instance.DispatchCommand(cmd);
+    }
+
+    /// <summary>#speed up=3 / #restart stream — пробел вместо подчёркивания.</summary>
+    static void TryParseSpacedNamedCommand(string username, string displayName, string message,
+        string part1, string part2, string commandName, bool allowValue)
+    {
+        string needle = "#" + part1;
+        int idx = message.IndexOf(needle, System.StringComparison.OrdinalIgnoreCase);
+        if (idx < 0)
+            return;
+
+        int pos = idx + needle.Length;
+        while (pos < message.Length && char.IsWhiteSpace(message[pos]))
+            pos++;
+
+        if (pos + part2.Length > message.Length)
+            return;
+
+        if (!message.Substring(pos, part2.Length).Equals(part2, System.StringComparison.OrdinalIgnoreCase))
+            return;
+
+        int after = pos + part2.Length;
+        if (after < message.Length && !char.IsWhiteSpace(message[after]) && message[after] != '=')
+            return;
+
+        int value = 1;
+        int end = after;
+        while (end < message.Length && char.IsWhiteSpace(message[end]))
+            end++;
+
+        if (allowValue && end < message.Length && message[end] == '=')
+        {
+            end++;
+            int valueStart = end;
+            while (end < message.Length && !char.IsWhiteSpace(message[end]))
+                end++;
+            if (!int.TryParse(message.Substring(valueStart, end - valueStart).Trim(), out value))
+                return;
+        }
+        else if (!allowValue && after < message.Length && !char.IsWhiteSpace(message[after]))
+            return;
+
+        string raw = message.Substring(idx, Math.Max(end, after) - idx).TrimEnd();
+        var cmd = new TwitchChatCommand(username, displayName, raw, commandName, value);
+        if (_instance != null)
+            _instance.DispatchCommand(cmd);
     }
 
     static void TryParseAddFire(string username, string displayName, string message)
@@ -355,7 +447,42 @@ public sealed class TwitchChatReader : MonoBehaviour
         if (pos + 7 < message.Length && !char.IsWhiteSpace(message[pos + 7]))
             return;
 
-        var cmd = new TwitchChatCommand(username, displayName, "#show metrics", "show_metrics", 0);
+        int after = pos + 7;
+        while (after < message.Length && char.IsWhiteSpace(message[after]))
+            after++;
+
+        string commandName = "show_metrics";
+        int heroValue = 0;
+        int end = after;
+        if (after < message.Length)
+        {
+            int heroEnd = after;
+            while (heroEnd < message.Length && !char.IsWhiteSpace(message[heroEnd]))
+                heroEnd++;
+
+            string hero = message.Substring(after, heroEnd - after).Trim().ToLowerInvariant();
+            end = heroEnd;
+            if (hero == "jack" || hero == "джек")
+            {
+                commandName = "show_metrics_jack";
+                heroValue = 1;
+            }
+            else if (hero == "lily" || hero == "лили")
+            {
+                commandName = "show_metrics_lily";
+                heroValue = 2;
+            }
+            else if (hero == "george" || hero == "gera" || hero == "гера" || hero == "джордж")
+            {
+                commandName = "show_metrics_george";
+                heroValue = 3;
+            }
+            else if (hero.Length > 0)
+                return;
+        }
+
+        string raw = message.Substring(idx, Math.Max(end, pos + 7) - idx).TrimEnd();
+        var cmd = new TwitchChatCommand(username, displayName, raw, commandName, heroValue);
         if (_instance != null)
             _instance.DispatchCommand(cmd);
     }
@@ -426,13 +553,15 @@ public sealed class TwitchChatReader : MonoBehaviour
         {
             case "add_tree":
             case "add_sheep":
+            case "add_zombie":
             case "up":
             case "forward":
-            case "zombie":
+            case "zombie": // устаревший алиас → bridge мапит на add_zombie
             case "clone_jack":
             case "size":
             case "speed_up":
             case "reset":
+            case "restart_stream":
             case "menu":
             case "add_fire":
             case "show_metrics":

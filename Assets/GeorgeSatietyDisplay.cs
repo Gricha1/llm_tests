@@ -18,7 +18,7 @@ public sealed class GeorgeSatietyDisplay : MonoBehaviour
             _text.richText = true;
         if (spriteAsset == null)
         {
-            var jackHud = Object.FindObjectOfType<SatietyDisplay>();
+            var jackHud = Object.FindFirstObjectByType<SatietyDisplay>();
             if (jackHud != null)
                 spriteAsset = jackHud.FoodSpriteAsset;
         }

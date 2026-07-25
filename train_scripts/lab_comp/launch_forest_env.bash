@@ -55,7 +55,36 @@ if [ "${use_graphics}" -eq 1 ]; then
   exec "${BUILD}" "$@"
 fi
 
+# Headless train: звук в null-sink, чтобы не глушить стрим в OBS.
+# SDL_AUDIODRIVER=dummy недостаточно — FMOD всё равно открывает Pulse.
+ensure_train_null_sink() {
+  if ! command -v pactl >/dev/null 2>&1; then
+    return 0
+  fi
+  if ! pactl list short sinks 2>/dev/null | grep -q 'forest_train_null'; then
+    pactl load-module module-null-sink \
+      sink_name=forest_train_null \
+      sink_properties=device.description=ForestTrainNull \
+      >/dev/null 2>&1 || true
+  fi
+  # Не даём Pulse сделать null дефолтным — иначе стрим/OBS теряют звук.
+  hw="$(pactl list short sinks 2>/dev/null | awk '$2 !~ /null/ {print $2; exit}')"
+  if [ -n "$hw" ]; then
+    pactl set-default-sink "$hw" >/dev/null 2>&1 || true
+  fi
+}
+
+ensure_train_null_sink
+export PULSE_SINK="${PULSE_SINK:-forest_train_null}"
+export SDL_AUDIODRIVER="${SDL_AUDIODRIVER:-dummy}"
+
 if command -v taskset >/dev/null 2>&1 && [ -n "${FOREST_TRAIN_CPUS:-}" ]; then
-  exec taskset -c "${FOREST_TRAIN_CPUS}" "${BUILD}" -batchmode -nographics "$@"
+  exec taskset -c "${FOREST_TRAIN_CPUS}" env \
+    SDL_AUDIODRIVER="${SDL_AUDIODRIVER}" \
+    PULSE_SINK="${PULSE_SINK}" \
+    "${BUILD}" -batchmode -nographics "$@"
 fi
-exec "${BUILD}" -batchmode -nographics "$@"
+exec env \
+  SDL_AUDIODRIVER="${SDL_AUDIODRIVER}" \
+  PULSE_SINK="${PULSE_SINK}" \
+  "${BUILD}" -batchmode -nographics "$@"

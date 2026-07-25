@@ -10,7 +10,7 @@ public class SheepWander : MonoBehaviour
     [SerializeField] private float changeDirInterval = 3f;
 
     [Header("Return to Spawn")]
-    [SerializeField] private float maxDistanceFromSpawn = 12f; // если дальше — идём обратно в зону
+    [SerializeField] private float maxDistanceFromSpawn = 12f;
 
     [Header("Obstacle Avoidance")]
     [SerializeField] private float obstacleCheckDistance = 0.8f;
@@ -25,16 +25,50 @@ public class SheepWander : MonoBehaviour
     private Vector3 moveDir;
     private CharacterController controller;
 
-    // Зона спавна: задаётся из SheepSpawner при создании овцы
+    // Зона в local Env — после сдвига Env (N)→presentation world-центр не «уезжает» вправо.
     private bool hasSpawnArea;
-    private Vector3 spawnCenterXZ;
+    private Transform _envRoot;
+    private Vector3 _spawnCenterLocal;
+    private Vector3 _spawnCenterWorldFallback;
 
-    /// <summary>Вызывается из SheepSpawner при спавне — овца будет возвращаться в эту зону, если уйдёт дальше maxDistance.</summary>
+    /// <summary>Предпочтительно: центр в local Env, чтобы перенос копии не ломал возврат.</summary>
+    public void SetSpawnAreaLocal(Transform envRoot, Vector3 localCenter, float maxDistance)
+    {
+        _envRoot = envRoot;
+        _spawnCenterLocal = localCenter;
+        maxDistanceFromSpawn = maxDistance;
+        hasSpawnArea = envRoot != null;
+        if (envRoot != null)
+            _spawnCenterWorldFallback = envRoot.TransformPoint(localCenter);
+    }
+
+    /// <summary>Старый API (world). Лучше SetSpawnAreaLocal.</summary>
     public void SetSpawnArea(Vector3 center, float maxDistance)
     {
-        spawnCenterXZ = new Vector3(center.x, 0f, center.z);
+        _envRoot = TrainingEnvSpace.FindRoot(transform);
+        if (_envRoot != null)
+        {
+            SetSpawnAreaLocal(_envRoot, _envRoot.InverseTransformPoint(center), maxDistance);
+            return;
+        }
+
+        _spawnCenterWorldFallback = new Vector3(center.x, 0f, center.z);
         maxDistanceFromSpawn = maxDistance;
         hasSpawnArea = true;
+    }
+
+    Vector3 SpawnCenterXZ
+    {
+        get
+        {
+            if (_envRoot != null)
+            {
+                Vector3 w = _envRoot.TransformPoint(_spawnCenterLocal);
+                return new Vector3(w.x, 0f, w.z);
+            }
+
+            return new Vector3(_spawnCenterWorldFallback.x, 0f, _spawnCenterWorldFallback.z);
+        }
     }
 
     private void Start()
@@ -45,14 +79,19 @@ public class SheepWander : MonoBehaviour
 
     private void Update()
     {
+        if (controller == null)
+            controller = GetComponent<CharacterController>();
+        if (controller == null || !controller.enabled)
+            return;
+
         timer += Time.deltaTime;
 
         Vector3 posXZ = new Vector3(transform.position.x, 0f, transform.position.z);
+        Vector3 center = SpawnCenterXZ;
 
-        // Возврат в зону спавна, если ушли слишком далеко
-        if (hasSpawnArea && Vector3.Distance(posXZ, spawnCenterXZ) > maxDistanceFromSpawn)
+        if (hasSpawnArea && Vector3.Distance(posXZ, center) > maxDistanceFromSpawn)
         {
-            moveDir = (spawnCenterXZ - posXZ).normalized;
+            moveDir = (center - posXZ).normalized;
             timer = 0f;
         }
         else
@@ -72,7 +111,6 @@ public class SheepWander : MonoBehaviour
             }
         }
 
-        // Плавный поворот
         Quaternion targetRot = Quaternion.LookRotation(moveDir);
         transform.rotation = Quaternion.RotateTowards(
             transform.rotation,
@@ -80,7 +118,6 @@ public class SheepWander : MonoBehaviour
             rotationSpeed * Time.deltaTime
         );
 
-        // Движение
         Vector3 move = transform.forward * moveSpeed;
 
         if (controller.isGrounded)
@@ -94,9 +131,7 @@ public class SheepWander : MonoBehaviour
         }
 
         move.y = verticalVelocity;
-
         controller.Move(move * Time.deltaTime);
-
     }
 
     private void PickRandomDirection()

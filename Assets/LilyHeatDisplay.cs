@@ -82,7 +82,7 @@ public class LilyHeatDisplay : MonoBehaviour
             tmp.font = TMP_Settings.defaultFontAsset;
 
         var display = go.AddComponent<LilyHeatDisplay>();
-        var jackHud = Object.FindObjectOfType<HeatDisplay>();
+        var jackHud = Object.FindFirstObjectByType<HeatDisplay>();
         if (jackHud != null)
             display.spriteAsset = jackHud.HeatSpriteAsset;
         display.EnsureHudVisible();
@@ -97,7 +97,7 @@ public class LilyHeatDisplay : MonoBehaviour
 
         if (spriteAsset == null)
         {
-            var jackHud = FindObjectOfType<HeatDisplay>();
+            var jackHud = FindFirstObjectByType<HeatDisplay>();
             if (jackHud != null)
                 spriteAsset = jackHud.HeatSpriteAsset;
         }

@@ -265,7 +265,7 @@ public sealed class AgentDeathOverlay : MonoBehaviour
         _text.fontSize = fontSize;
         _text.fontStyle = FontStyles.Bold;
         _text.color = textColor;
-        _text.enableWordWrapping = false;
+        _text.textWrappingMode = TextWrappingModes.NoWrap;
         if (TMP_Settings.defaultFontAsset != null)
             _text.font = TMP_Settings.defaultFontAsset;
     }

@@ -410,7 +410,7 @@ public sealed class CommandLineEvalCapture : MonoBehaviour
 #if UNITY_2023_1_OR_NEWER
             jack = FindAnyObjectByType<AgentGoToHouseDiscrete>();
 #else
-            jack = FindObjectOfType<AgentGoToHouseDiscrete>();
+            jack = FindFirstObjectByType<AgentGoToHouseDiscrete>();
 #endif
             if (jack != null) _jackTarget = jack.transform;
         }
@@ -457,7 +457,7 @@ public sealed class CommandLineEvalCapture : MonoBehaviour
 #if UNITY_2023_1_OR_NEWER
             jack = FindAnyObjectByType<AgentGoToHouseDiscrete>();
 #else
-            jack = FindObjectOfType<AgentGoToHouseDiscrete>();
+            jack = FindFirstObjectByType<AgentGoToHouseDiscrete>();
 #endif
             if (jack != null) _jackTarget = jack.transform;
         }

@@ -59,7 +59,7 @@ public class RewardDisplay : MonoBehaviour
         else
             rt.anchoredPosition = new Vector2(-24f, 70f);
 
-        _text.enableWordWrapping = false;
+        _text.textWrappingMode = TextWrappingModes.NoWrap;
         _text.overflowMode = TextOverflowModes.Overflow;
         _text.horizontalAlignment = HorizontalAlignmentOptions.Left;
     }

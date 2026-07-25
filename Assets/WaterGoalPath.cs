@@ -4,12 +4,18 @@ using UnityEngine;
 
 /// <summary>
 /// Последовательность GoalWater1 → GoalWater2 → GoalWater3 для shaping опции «вода».
-/// Кубы скрываются во время Play, коллайдеры остаются для проверки достижения.
+/// Кубы скрыты визуально; для RayMiddleWater — тег Water и layer Water (bit 13).
+/// Пройденный чекпоинт убирается с water-ray (layer Ignore Raycast), пока агент не сбросит путь
+/// (повторный вход в опцию воды / ResetAgent).
 /// </summary>
 [DisallowMultipleComponent]
 public sealed class WaterGoalPath : MonoBehaviour
 {
     static readonly string[] GoalNames = { "GoalWater1", "GoalWater2", "GoalWater3" };
+    const string WaterTag = "Water";
+    // RayMiddleWater.m_RayLayerMask = 8192 → layer 13 (второй "Water" в TagManager).
+    const int WaterRayLayer = 13;
+    const int HiddenFromWaterRayLayer = 2; // Ignore Raycast
 
     [SerializeField] private float approachRewardScale = 0.3f;
     [SerializeField] private float reachReward = 10f;
@@ -94,6 +100,7 @@ public sealed class WaterGoalPath : MonoBehaviour
     public void ResetSequence()
     {
         _progressByAgent.Clear();
+        RefreshGoalRayVisibility();
     }
 
     public void ResetAgent(Transform agent)
@@ -102,6 +109,9 @@ public sealed class WaterGoalPath : MonoBehaviour
             return;
 
         _progressByAgent.Remove(agent.GetInstanceID());
+        // Снова с нуля: текущий агент начинает с GoalWater1 (index 0).
+        GetProgress(agent);
+        RefreshGoalRayVisibility();
     }
 
     AgentProgress GetProgress(Transform agent)
@@ -126,11 +136,12 @@ public sealed class WaterGoalPath : MonoBehaviour
         if (progress.CurrentIndex >= _goals.Length)
         {
             if (loopAfterComplete)
+            {
                 ResetAgent(agent);
+                progress = GetProgress(agent);
+            }
             else
                 return false;
-
-            progress = GetProgress(agent);
         }
 
         Transform goal = _goals[progress.CurrentIndex];
@@ -146,6 +157,7 @@ public sealed class WaterGoalPath : MonoBehaviour
             progress.CurrentIndex++;
             progress.PrevDist = -1f;
             AdvancePastMissingGoals(progress);
+            RefreshGoalRayVisibility();
 
             if (progress.CurrentIndex >= _goals.Length && loopAfterComplete)
                 ResetAgent(agent);
@@ -184,10 +196,65 @@ public sealed class WaterGoalPath : MonoBehaviour
                 continue;
 
             EnsureGoalCollider(_goals[i]);
+            EnsureWaterTagAndRayLayer(_goals[i], visibleToWaterRays: true);
             HideGoalVisuals(_goals[i]);
             _goalColliders[i] = _goals[i].GetComponentInChildren<Collider>(true);
             _goalBounds[i] = BuildGoalBounds(_goals[i]);
         }
+    }
+
+    /// <summary>
+    /// Goal i виден RayMiddleWater, пока есть агент с CurrentIndex &lt;= i
+    /// (пройденные чекпоинты скрыты с water-ray; при ResetAgent снова все с нуля).
+    /// </summary>
+    void RefreshGoalRayVisibility()
+    {
+        Initialize();
+
+        for (int goalIndex = 0; goalIndex < _goals.Length; goalIndex++)
+        {
+            var goal = _goals[goalIndex];
+            if (goal == null)
+                continue;
+
+            bool needed = false;
+            foreach (var kv in _progressByAgent)
+            {
+                if (kv.Value != null && kv.Value.CurrentIndex <= goalIndex)
+                {
+                    needed = true;
+                    break;
+                }
+            }
+
+            // Никто на пути — держим все чекпоинты видимыми для rays (готовность к воде).
+            if (_progressByAgent.Count == 0)
+                needed = true;
+
+            EnsureWaterTagAndRayLayer(goal, visibleToWaterRays: needed);
+        }
+    }
+
+    static void EnsureWaterTagAndRayLayer(Transform goal, bool visibleToWaterRays)
+    {
+        if (goal == null)
+            return;
+
+        if (!goal.CompareTag(WaterTag))
+        {
+            try
+            {
+                goal.tag = WaterTag;
+            }
+            catch (UnityException)
+            {
+                Debug.LogWarning($"[WaterGoalPath] тег '{WaterTag}' не найден в Tag Manager");
+            }
+        }
+
+        int layer = visibleToWaterRays ? WaterRayLayer : HiddenFromWaterRayLayer;
+        if (goal.gameObject.layer != layer)
+            goal.gameObject.layer = layer;
     }
 
     void HideAllGoalVisuals()
@@ -280,7 +347,7 @@ public sealed class WaterGoalPath : MonoBehaviour
         if (IsInsideGoalHorizontally(agentPos, goalBounds))
             return true;
 
-        if (goalCol != null)
+        if (goalCol != null && goalCol.enabled)
         {
             Vector3 closest = goalCol.ClosestPoint(agentPos);
             closest.y = 0f;
@@ -316,7 +383,7 @@ public sealed class WaterGoalPath : MonoBehaviour
         if (IsInsideGoalHorizontally(agentPos, goalBounds))
             return 0f;
 
-        if (goalCol != null)
+        if (goalCol != null && goalCol.enabled)
         {
             Vector3 closest = goalCol.ClosestPoint(agentPos);
             closest.y = 0f;

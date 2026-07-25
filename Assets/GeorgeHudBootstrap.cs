@@ -159,7 +159,7 @@ public static class GeorgeHudBootstrap
 
         if (typeof(T) == typeof(GeorgeWaterDisplay))
         {
-            var jackWater = Object.FindObjectOfType<WaterDisplay>();
+            var jackWater = Object.FindFirstObjectByType<WaterDisplay>();
             if (jackWater != null && jackWater.WaterSpriteAsset != null)
                 tmp.spriteAsset = jackWater.WaterSpriteAsset;
         }

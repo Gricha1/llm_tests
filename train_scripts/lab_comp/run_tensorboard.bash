@@ -59,8 +59,8 @@ for run_id in "${RUN_ARGS[@]}"; do
   run_id="${run_id#results/}"
   dir="${ROOT}/results/${run_id}"
   if [ ! -d "${dir}" ]; then
-    echo "ERROR: ${dir} не найден" >&2
-    exit 1
+    echo "WARN: ${dir} нет — создаю (обучение ещё не писало events)" >&2
+    mkdir -p "${dir}"
   fi
   n_events="$(find "${dir}" -name 'events.out.tfevents*' 2>/dev/null | wc -l | tr -d ' ')"
   if [ "${n_events}" = "0" ]; then
@@ -109,7 +109,7 @@ if [ "${DAEMON}" -eq 1 ]; then
   sleep 1.5
   if kill -0 "$(cat "${TB_PID_FILE}")" 2>/dev/null; then
     echo "[tensorboard] ok pid=$(cat "${TB_PID_FILE}")"
-    echo "[tensorboard] http://127.0.0.1:${PORT}  (через туннель с ПК)"
+    echo "[tensorboard] http://127.0.0.1:${PORT}  |  --bind_all → с ПК по IP сервера или туннель"
   else
     echo "ERROR: tensorboard не стартовал, см. ${TB_LOG}" >&2
     tail -30 "${TB_LOG}" >&2 || true

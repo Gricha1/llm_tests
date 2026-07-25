@@ -126,6 +126,7 @@ public class LilyScript : Agent, IHasHp
     [SerializeField] private int freezeDamageAmount = 1;
     [SerializeField] private float freezePenaltyPerTick = -0.5f;
     private float _freezeTimer;
+    float _episodeRewardAnchor;
 
     [Header("Dehydrated (water = 0)")]
     [SerializeField] private float thirstDamageInterval = 0.25f;
@@ -227,6 +228,8 @@ public class LilyScript : Agent, IHasHp
     private int stepCount;
     private float _episodeStartTime;
     private int _episodeSheepEaten;
+    private int _episodeWaterCollected;
+    public int EpisodeWaterCollected => _episodeWaterCollected;
     private int _lastHungerRewardStep = -1;
     private int _lastFreezeRewardStep = -1;
     private float flowerDecayTimer;
@@ -243,7 +246,7 @@ public class LilyScript : Agent, IHasHp
     private const float MaxJackDistForObs = 50f;
     private const float MaxZombieDistForObs = 50f;
 
-    public int StepCount => stepCount;
+    public new int StepCount => stepCount;
     public int GetCurrentOption() => currentOption;
 
     public float GetDistanceToJackNormalized()
@@ -457,7 +460,7 @@ public class LilyScript : Agent, IHasHp
         ApplyOptionIconLocalScale();
     }
 
-    private void Awake()
+    private new void Awake()
     {
         ConfigurePresentationControl();
     }
@@ -620,11 +623,51 @@ public class LilyScript : Agent, IHasHp
 
     public void ForceHardRespawnFromDeath()
     {
-        // См. JackScript: повторный OnEpisodeBegin без EndEpisode не сбрасывает GetCumulativeReward().
+        // См. JackScript: OnEpisodeBegin без EndEpisode не сбрасывает GetCumulativeReward().
         if (!_deathSequenceStarted && hp > 0)
             return;
 
+        if (Mathf.Abs(GetCumulativeReward()) > 0.01f)
+        {
+            NotifyEpisodeEndingForStats();
+            try
+            {
+                EndEpisode();
+            }
+            catch (System.Exception ex)
+            {
+                Debug.LogWarning($"[Lily] EndEpisode before hard respawn: {ex.Message}", this);
+            }
+
+            if (!_deathSequenceStarted && hp > 0)
+                return;
+        }
+
         OnEpisodeBegin();
+    }
+
+    /// <summary>
+    /// #reset / клавиша 0: полный новый эпизод (см. Jack ForceFullEpisodeRestart).
+    /// </summary>
+    public void ForceFullEpisodeRestart()
+    {
+        NotifyEpisodeEndingForStats();
+        try
+        {
+            EndEpisode();
+        }
+        catch (System.Exception ex)
+        {
+            Debug.LogWarning($"[Lily] EndEpisode on full restart: {ex.Message}", this);
+        }
+
+        OnEpisodeBegin();
+    }
+
+    public void NotifyEpisodeEndingForStats()
+    {
+        TrainingTaskSuccessTracker.ReportAgentEpisodeReward(
+            GetCumulativeReward() - _episodeRewardAnchor);
     }
 
     public override void OnEpisodeBegin()
@@ -641,6 +684,7 @@ public class LilyScript : Agent, IHasHp
         stepCount = 0;
         _episodeStartTime = Time.unscaledTime;
         _episodeSheepEaten = 0;
+        _episodeWaterCollected = 0;
         prevFlowerDist = -1f;
         prevJackDist = -1f;
         prevWaterDist = -1f;
@@ -690,8 +734,8 @@ public class LilyScript : Agent, IHasHp
             if (_resolvedLilyTask == EnvTrainingTask.PresentationFull
                 && TrainingEnvSpace.IsPresentationTransform(transform))
             {
-                // Стрим: бесконечный эпизод. Обучение: лимит — иначе cumulative reward уходит в -миллионы.
-                if (Academy.Instance.IsCommunicatorOn && !TrainingEnvSpace.IsStreamOnlyMode)
+                // Стрим/validate: бесконечный эпизод. Обучение: лимит шагов.
+                if (Academy.Instance.IsCommunicatorOn && !TrainingEnvSpace.AllowInfinitePresentationEpisode)
                     MaxStep = _trainingConfig != null
                         ? Mathf.Max(4000, _trainingConfig.SimpleMaxSteps * 10)
                         : 4000;
@@ -758,6 +802,7 @@ public class LilyScript : Agent, IHasHp
         }
 
         UpdateOptionIconVisual();
+        _episodeRewardAnchor = GetCumulativeReward();
     }
 
     void ApplyLilyEpisodeStartNeeds()
@@ -1009,7 +1054,7 @@ public class LilyScript : Agent, IHasHp
     private bool IsZombieColliderInFrontForDo(Vector3 origin, Collider c)
     {
         if (c == null) return false;
-        Vector3 toTarget = c.ClosestPoint(origin) - origin;
+        Vector3 toTarget = SafeClosestPointOnCollider(c, origin) - origin;
         toTarget.y = 0f;
         if (toTarget.sqrMagnitude < 1e-6f) return true;
 
@@ -1063,7 +1108,7 @@ public class LilyScript : Agent, IHasHp
             if (z == null) continue;
             if (!IsZombieColliderInFrontForDo(origin, c)) continue;
 
-            float d = Vector3.Distance(origin, c.ClosestPoint(origin));
+            float d = Vector3.Distance(origin, SafeClosestPointOnCollider(c, origin));
             if (d < bestDist)
             {
                 bestDist = d;
@@ -1153,6 +1198,7 @@ public class LilyScript : Agent, IHasHp
         sensor.AddObservation(maxFlowerCount > 0 ? (float)FlowerCount / maxFlowerCount : 0f);
         sensor.AddObservation(maxLove > 0 ? (float)Love / maxLove : 0f);
         sensor.AddObservation(Mathf.Clamp01((float)Heat / Mathf.Max(1, heatObservationScale)));
+        sensor.AddObservation(Mathf.Clamp01((float)WaterCount / Mathf.Max(1, maxSatiety + 10)));
         sensor.AddObservation(IsOnHouse() ? 1f : 0f);
         sensor.AddObservation(IsCampfireBurningInEnv() ? 1f : 0f);
 
@@ -1269,14 +1315,16 @@ public class LilyScript : Agent, IHasHp
             }
         }
 
-        // Дискретные действия как у Jack: ветка0 — 1 вперёд, 3 назад, 2 стой; ветка1 — 1/3 поворот, 2 не крутить
+        // BranchSizes Lily: move=3, rotate=3, collect=2.
+        // move: 0=назад, 1=вперёд, 2=стой (2 часто в старых политиках — оставляем idle);
+        // rotate: 0=влево, 1=вправо, 2=стой.
         float moveInput = 0f;
         if (moveAction == 1) moveInput = 1f;
-        else if (moveAction == 3) moveInput = -1f;
+        else if (moveAction == 0) moveInput = -1f;
 
         float rotateInput = 0f;
-        if (rotateAction == 1) rotateInput = 1f;
-        else if (rotateAction == 3) rotateInput = -1f;
+        if (rotateAction == 0) rotateInput = -1f;
+        else if (rotateAction == 1) rotateInput = 1f;
 
         transform.Rotate(0f, rotateInput * rotationSpeed * Time.deltaTime, 0f);
 
@@ -1464,6 +1512,7 @@ public class LilyScript : Agent, IHasHp
             && stepCount >= MaxStep)
         {
             EvalEpisodeTracker.NotifyEpisodeEnded();
+            NotifyEpisodeEndingForStats();
             EndEpisode();
         }
     }
@@ -1476,10 +1525,12 @@ public class LilyScript : Agent, IHasHp
         if (_trainingConfig.StepPenalty != 0f)
             AddReward(_trainingConfig.StepPenalty);
 
-        // Как у Jack Food/Water: не рвём эпизод на первом успехе — только MaxStep / timeout.
-        // Награда за овцу/воду/цветок уже даётся в OnActionReceived.
-        if (_trainingConfig.ResolveSimpleEpisodeTimeoutSeconds() > 0f
-            && Time.unscaledTime - _episodeStartTime >= _trainingConfig.ResolveSimpleEpisodeTimeoutSeconds())
+        // Не рвём на первом успехе — только MaxStep / timeout.
+        // Важно: при MaxStep тоже Record, иначе Agent сам EndEpisode без SR → графики n=0.
+        bool hitMaxStep = MaxStep > 0 && stepCount >= MaxStep;
+        bool hitTimeout = _trainingConfig.ResolveSimpleEpisodeTimeoutSeconds() > 0f
+            && Time.unscaledTime - _episodeStartTime >= _trainingConfig.ResolveSimpleEpisodeTimeoutSeconds();
+        if (hitMaxStep || hitTimeout)
         {
             EvalEpisodeTracker.NotifyEpisodeEnded();
             EndLilySimpleTrainingEpisode();
@@ -1499,6 +1550,7 @@ public class LilyScript : Agent, IHasHp
             }
         }
 
+        NotifyEpisodeEndingForStats();
         EndEpisode();
     }
 
@@ -1743,12 +1795,20 @@ public class LilyScript : Agent, IHasHp
         return opt2;
     }
 
+    private static Vector3 SafeClosestPointOnCollider(Collider c, Vector3 from)
+    {
+        if (c == null)
+            return from;
+        if (c is MeshCollider mesh && !mesh.convex)
+            return c.bounds.ClosestPoint(from);
+        if (c is BoxCollider || c is SphereCollider || c is CapsuleCollider || c is MeshCollider)
+            return c.ClosestPoint(from);
+        return c.bounds.ClosestPoint(from);
+    }
+
     private static float HarvestReachDistance(Vector3 from, Collider c)
     {
-        // Non-convex MeshCollider: ClosestPoint врёт (часто ≈0) → «сбор с любой дистанции».
-        if (c is MeshCollider mesh && !mesh.convex)
-            return Vector3.Distance(from, c.bounds.ClosestPoint(from));
-        return Vector3.Distance(from, c.ClosestPoint(from));
+        return Vector3.Distance(from, SafeClosestPointOnCollider(c, from));
     }
 
     bool IsNearAnyDoInteractable()
@@ -1799,7 +1859,7 @@ public class LilyScript : Agent, IHasHp
         }
 
         float personR = Mathf.Max(zombieKnockbackRadiusOnDo, 1.6f);
-        foreach (var jack in Object.FindObjectsOfType<AgentGoToHouseDiscrete>())
+        foreach (var jack in Object.FindObjectsByType<AgentGoToHouseDiscrete>(FindObjectsSortMode.None))
         {
             if (jack == null || !jack.isActiveAndEnabled)
                 continue;
@@ -2253,6 +2313,7 @@ public class LilyScript : Agent, IHasHp
             return false;
 
         WaterCount += Mathf.Max(1, waterPerCollect > 0 ? waterPerCollect : amount);
+        _episodeWaterCollected++;
         return true;
     }
 
@@ -2264,13 +2325,13 @@ public class LilyScript : Agent, IHasHp
         if (Input.GetKey(KeyCode.UpArrow))
             moveAction = 1;
         else if (Input.GetKey(KeyCode.DownArrow))
-            moveAction = 3;
+            moveAction = 0;
 
         int rotateAction = 2;
         if (Input.GetKey(KeyCode.RightArrow))
             rotateAction = 1;
         else if (Input.GetKey(KeyCode.LeftArrow))
-            rotateAction = 3;
+            rotateAction = 0;
 
         int collectAction = Input.GetMouseButton(1) ? 1 : 0;
 
