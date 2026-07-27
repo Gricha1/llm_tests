@@ -143,6 +143,9 @@ public sealed class EnvTrainingConfig : MonoBehaviour
     /// </summary>
     public static bool IsJackOnlyTasksMode()
     {
+        if (IsJackWoodFoodOnlyMode())
+            return true;
+
         if (IsTruthyEnv(System.Environment.GetEnvironmentVariable("FOREST_JACK_ONLY_TASKS")))
             return true;
 
@@ -155,18 +158,43 @@ public sealed class EnvTrainingConfig : MonoBehaviour
         return false;
     }
 
+    /// <summary>
+    /// Jack только wood+food: на 20 слотах 12 wood, 8 food.
+    /// Включает jack-only (Lily/George выключены).
+    /// </summary>
+    public static bool IsJackWoodFoodOnlyMode()
+    {
+        if (IsTruthyEnv(System.Environment.GetEnvironmentVariable("FOREST_JACK_WOOD_FOOD_ONLY")))
+            return true;
+
+        foreach (var arg in System.Environment.GetCommandLineArgs())
+        {
+            if (arg == "-forestJackWoodFoodOnly" || arg == "--forest-jack-wood-food-only")
+                return true;
+        }
+
+        return false;
+    }
+
     static bool IsTruthyEnv(string value) =>
         value == "1" || string.Equals(value, "true", System.StringComparison.OrdinalIgnoreCase);
 
     public static EnvTrainingTask ResolveJackOnlyTaskForCopyIndex(int copyIndex)
     {
+        if (IsJackWoodFoodOnlyMode())
+        {
+            // Период 20: 12 wood + 8 food.
+            int i = copyIndex < 0 ? 0 : copyIndex % 20;
+            return i < 12 ? EnvTrainingTask.JackWood : EnvTrainingTask.JackFood;
+        }
+
         // Период 30: 9+4+9+8 — ровно 2:1:2:2 при NUM_ENVS=30.
-        int i = copyIndex < 0 ? 0 : copyIndex % 30;
-        if (i < 9)
+        int j = copyIndex < 0 ? 0 : copyIndex % 30;
+        if (j < 9)
             return EnvTrainingTask.JackWood;
-        if (i < 13)
+        if (j < 13)
             return EnvTrainingTask.JackFood;
-        if (i < 22)
+        if (j < 22)
             return EnvTrainingTask.JackWater;
         return EnvTrainingTask.JackZombie;
     }

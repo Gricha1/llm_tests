@@ -14342,7 +14342,6 @@ MonoBehaviour:
   fireVfxOffDelaySeconds: 1
   fireVfxHomeOffset: {x: 0, y: 0.15, z: 0}
   chopDistance: 1.5
-  chopReward: 200
   treeLayer:
     serializedVersion: 2
     m_Bits: 8
@@ -14435,8 +14434,8 @@ MonoBehaviour:
     NumStackedVectorObservations: 1
     m_ActionSpec:
       m_NumContinuousActions: 0
-      BranchSizes: 020000000300000002000000
-    VectorActionSize: 020000000300000002000000
+      BranchSizes: 030000000300000002000000
+    VectorActionSize: 030000000300000002000000
     VectorActionDescriptions: []
     VectorActionSpaceType: 0
     hasUpgradedBrainParametersWithActionSpec: 1
@@ -25796,7 +25795,6 @@ MonoBehaviour:
   fireVfxOffDelaySeconds: 1
   fireVfxHomeOffset: {x: 0, y: 0.15, z: 0}
   chopDistance: 1.5
-  chopReward: 200
   treeLayer:
     serializedVersion: 2
     m_Bits: 8
@@ -25889,8 +25887,8 @@ MonoBehaviour:
     NumStackedVectorObservations: 1
     m_ActionSpec:
       m_NumContinuousActions: 0
-      BranchSizes: 020000000300000002000000
-    VectorActionSize: 020000000300000002000000
+      BranchSizes: 030000000300000002000000
+    VectorActionSize: 030000000300000002000000
     VectorActionDescriptions: []
     VectorActionSpaceType: 0
     hasUpgradedBrainParametersWithActionSpec: 1

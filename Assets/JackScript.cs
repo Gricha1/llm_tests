@@ -113,9 +113,6 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
 
     [Header("Wood")]
     [SerializeField] private float chopDistance = 1.5f;
-#pragma warning disable CS0414 // оставлено для тюнинга в Inspector / старых сцен
-    [SerializeField] private float chopReward = 200.0f;
-#pragma warning restore CS0414
     [SerializeField] private LayerMask treeLayer;
     public int wood;
 
@@ -425,6 +422,8 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     [SerializeField] private string doActionAnimTrigger = "Do";
     [Tooltip("Минимум секунд между срабатываниями DO (анимация + попытка добычи).")]
     [SerializeField] private float doActionCooldownSeconds = 0.45f;
+    [Tooltip("Если true — штраф emptyDoActionPenalty за DO не у цели. Для обучения wood/food пока false.")]
+    [SerializeField] private bool applyEmptyDoActionPenalty = false;
     [Tooltip("Штраф за DO не рядом с целью (дерево/овца/вода/зомби/человек). −5 отучает спамить DO в пустоту.")]
     [SerializeField] private float emptyDoActionPenalty = -5f;
     [Tooltip("Сглаживание параметра Speed в Animator (0 = без сглаживания — быстрее включение walk).")]
@@ -491,7 +490,9 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         // Никогда не снимаем HP Джеку за его собственное DO (даже если в инспекторе остались старые сериализованные значения).
         damageOnDoIfZombieNearby = false;
         zombieDamageOnDo = 0;
+        // Величину штрафа оставляем; включение — applyEmptyDoActionPenalty (сейчас false для train).
         emptyDoActionPenalty = -5f;
+        applyEmptyDoActionPenalty = false;
 
         if (zombieLayer.value == 0)
         {
@@ -1326,28 +1327,23 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
 
         if (!isTwitchClone)
         {
-            if (!TrainingEnvSpace.TryRestorePresentationSpawn(transform, controller))
+            // Все Env (включая presentation): каждый эпизод — случайная точка поляны
+            // (или fixedSpawn, если spawnAtHouseFixed). Presentation в стриме — MaxStep=0,
+            // эпизод не режется, этот телепорт почти не вызывается.
+            controller.enabled = false;
+            if (spawnAtHouseFixed)
             {
-                bool skipTeleport = !spawnAtHouseFixed && !TrainingEnvSpace.HasMultipleTrainingEnvs();
-
-                if (!skipTeleport)
-                {
-                    controller.enabled = false;
-                    if (spawnAtHouseFixed)
-                    {
-                        transform.position = TrainingEnvSpace.LocalToWorld(transform, fixedSpawnPosition);
-                        transform.rotation = TrainingEnvSpace.LocalToWorldRotation(transform, fixedSpawnEuler);
-                    }
-                    else
-                    {
-                        float randX = Random.Range(minX, maxX);
-                        float randZ = Random.Range(minZ, maxZ);
-                        transform.position = TrainingEnvSpace.LocalToWorld(transform, new Vector3(randX, groundY, randZ));
-                        transform.rotation = TrainingEnvSpace.LocalToWorldRotation(transform, new Vector3(0f, Random.Range(0f, 360f), 0f));
-                    }
-                    controller.enabled = true;
-                }
+                transform.position = TrainingEnvSpace.LocalToWorld(transform, fixedSpawnPosition);
+                transform.rotation = TrainingEnvSpace.LocalToWorldRotation(transform, fixedSpawnEuler);
             }
+            else
+            {
+                float randX = Random.Range(minX, maxX);
+                float randZ = Random.Range(minZ, maxZ);
+                transform.position = TrainingEnvSpace.LocalToWorld(transform, new Vector3(randX, groundY, randZ));
+                transform.rotation = TrainingEnvSpace.LocalToWorldRotation(transform, new Vector3(0f, Random.Range(0f, 360f), 0f));
+            }
+            controller.enabled = true;
         }
 
         prevPosition = transform.position;
@@ -2181,7 +2177,9 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         if (houseTarget == null)
             ResolveHouseTarget();
 
-        sensor.AddObservation(transform.position);
+        // Позиция в локали Env (или относительно дома), /scale — не мировые координаты,
+        // иначе десятки/сотни рядом с [0,1] фичами рвут Value Loss без yaml-normalize.
+        sensor.AddObservation(GetPositionObservationAndLogToTb());
         sensor.AddObservation(transform.forward);
 
         sensor.AddObservation(Mathf.Clamp01((float)wood / Mathf.Max(1, maxWood)));
@@ -2202,6 +2200,104 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         sensor.AddObservation(GetOptionObservationBit0(currentOption));
         sensor.AddObservation(GetOptionObservationBit1(currentOption));
         sensor.AddObservation(GetOptionObservationBit2(currentOption));
+    }
+
+    /// <summary>
+    /// Позиция для ML: локаль Env → иначе относительно дома → иначе world.
+    /// Делим на scale, чтобы порядок величины был как у остальных obs (~[-1..1]).
+    /// </summary>
+    Vector3 GetPositionObservation()
+    {
+        return GetPositionObservationAndLogToTb();
+    }
+
+    /// <summary>
+    /// Считает obs-позицию (то, что AddObservation) и копит min/mean/max со всех сред в TB.
+    /// </summary>
+    Vector3 GetPositionObservationAndLogToTb()
+    {
+        const float scale = 20f;
+        Vector3 local;
+        var envRoot = TrainingEnvSpace.FindRoot(transform);
+        if (envRoot != null)
+            local = envRoot.InverseTransformPoint(transform.position);
+        else if (houseTarget != null)
+            local = transform.position - houseTarget.position;
+        else
+            local = transform.position;
+
+        Vector3 obs = local / scale;
+        JackPosTbStats.Add(obs);
+        return obs;
+    }
+
+    /// <summary>
+    /// min/mean/max по тому x,y,z, что реально уходит в сеть (после /scale), со всех Jack/env.
+    /// </summary>
+    static class JackPosTbStats
+    {
+        const int FlushEveryAcademySteps = 2048;
+
+        static float _sumX, _sumY, _sumZ;
+        static float _minX = float.PositiveInfinity, _maxX = float.NegativeInfinity;
+        static float _minY = float.PositiveInfinity, _maxY = float.NegativeInfinity;
+        static float _minZ = float.PositiveInfinity, _maxZ = float.NegativeInfinity;
+        static int _n;
+        static int _lastFlushStep = -1;
+
+        public static void Add(Vector3 obsPos)
+        {
+            if (!Academy.IsInitialized || !Academy.Instance.IsCommunicatorOn)
+                return;
+
+            _sumX += obsPos.x;
+            _sumY += obsPos.y;
+            _sumZ += obsPos.z;
+
+            if (obsPos.x < _minX) _minX = obsPos.x;
+            if (obsPos.x > _maxX) _maxX = obsPos.x;
+            if (obsPos.y < _minY) _minY = obsPos.y;
+            if (obsPos.y > _maxY) _maxY = obsPos.y;
+            if (obsPos.z < _minZ) _minZ = obsPos.z;
+            if (obsPos.z > _maxZ) _maxZ = obsPos.z;
+            _n++;
+
+            int step = Academy.Instance.StepCount;
+            if (_lastFlushStep < 0)
+                _lastFlushStep = step;
+            if (step - _lastFlushStep < FlushEveryAcademySteps)
+                return;
+
+            Flush();
+            _lastFlushStep = step;
+        }
+
+        static void Flush()
+        {
+            if (_n <= 0)
+                return;
+
+            var stats = Academy.Instance.StatsRecorder;
+            float inv = 1f / _n;
+
+            void Axis(string prefix, float sum, float min, float max)
+            {
+                stats.Add($"{prefix}_Mean", sum * inv, StatAggregationMethod.MostRecent);
+                stats.Add($"{prefix}_Min", min, StatAggregationMethod.MostRecent);
+                stats.Add($"{prefix}_Max", max, StatAggregationMethod.MostRecent);
+            }
+
+            // Тот же вектор, что sensor.AddObservation(obs) — вход политики/критика.
+            Axis("Pos/Obs_X", _sumX, _minX, _maxX);
+            Axis("Pos/Obs_Y", _sumY, _minY, _maxY);
+            Axis("Pos/Obs_Z", _sumZ, _minZ, _maxZ);
+            stats.Add("Pos/SampleCount", _n, StatAggregationMethod.MostRecent);
+
+            _sumX = _sumY = _sumZ = 0f;
+            _minX = _minY = _minZ = float.PositiveInfinity;
+            _maxX = _maxY = _maxZ = float.NegativeInfinity;
+            _n = 0;
+        }
     }
 
     public override void OnActionReceived(ActionBuffers actions)
@@ -2257,8 +2353,8 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         float moveInput = 0f;
         float rotateInput = 0f;
 
-        // BranchSizes Jack/George: move=2, rotate=3, chop=2 (для ML).
-        // Ручной WASD: S назад вне action space — иначе назад недоступен.
+        // BranchSizes Jack/George: move=3, rotate=3, chop=2 (для ML).
+        // move: 0=назад, 1=вперёд, 2=стой — как у Lily.
         bool manualWasd = IsManualWasdControlActive() && !TwitchEphemeralEffects.IsTwitchClone(this);
         if (manualWasd)
         {
@@ -2278,6 +2374,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
             if (CanMoveThisStep)
             {
                 if (moveAction == 1) moveInput = 1f;
+                else if (moveAction == 0) moveInput = -1f;
             }
 
             if (CanRotateThisStep)
@@ -2356,7 +2453,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
 
             _doCooldownRemaining = Mathf.Max(0f, doActionCooldownSeconds);
 
-            if (emptyDoActionPenalty < 0f && !IsNearAnyDoInteractable())
+            if (applyEmptyDoActionPenalty && emptyDoActionPenalty < 0f && !IsNearAnyDoInteractable())
             {
                 AddReward(emptyDoActionPenalty);
                 currentStepReward += emptyDoActionPenalty;
@@ -3887,7 +3984,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         // Клоны не читают клавиатуру — иначе повторяют каждое действие оригинала.
         if (TwitchEphemeralEffects.IsTwitchClone(this))
         {
-            discreteActions[0] = 0;
+            discreteActions[0] = 2; // стой
             discreteActions[1] = 2;
             discreteActions[2] = 0;
             return;
@@ -3895,16 +3992,18 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
 
         if (!IsManualWasdControlActive())
         {
-            discreteActions[0] = 0;
+            discreteActions[0] = 2; // стой
             discreteActions[1] = 2;
             discreteActions[2] = 0;
             return;
         }
 
-        // move 0/1 (ветка size 2); rotate 0/1/2 (ветка size 3). S назад нет в action space.
-        int moveAction = 0;
+        // move: 0=назад, 1=вперёд, 2=стой; rotate: 0=лево, 1=право, 2=нет.
+        int moveAction = 2;
         if (Input.GetKey(KeyCode.W))
             moveAction = 1;
+        else if (Input.GetKey(KeyCode.S))
+            moveAction = 0;
 
         int rotateAction = 2;
         if (Input.GetKey(KeyCode.D))

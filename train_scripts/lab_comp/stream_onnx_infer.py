@@ -112,10 +112,79 @@ def run_has_results_onnx(run_dir: Path, behavior: str) -> bool:
 def is_jack_only_run(run_dir: Path) -> bool:
     """Jack есть в results, Lily/George нет — как train_headless_jack."""
     if not run_has_results_onnx(run_dir, "JackLowLevelAgent"):
-        return False
-    return not run_has_results_onnx(run_dir, "LilyLowLevelAgent") and not run_has_results_onnx(
-        run_dir, "GeorgeLowLevelAgent"
+        # Sticky тоже считаем: keep_checkpoints:0 мог стереть results, а sticky уже есть.
+        if _best_onnx_in_dir(sticky_onnx_dir(run_dir), "JackLowLevelAgent") is None:
+            return False
+    has_lily = run_has_results_onnx(run_dir, "LilyLowLevelAgent") or (
+        _best_onnx_in_dir(sticky_onnx_dir(run_dir), "LilyLowLevelAgent") is not None
     )
+    has_george = run_has_results_onnx(run_dir, "GeorgeLowLevelAgent") or (
+        _best_onnx_in_dir(sticky_onnx_dir(run_dir), "GeorgeLowLevelAgent") is not None
+    )
+    return not has_lily and not has_george
+
+
+def _latest_pt(run_dir: Path, behavior: str) -> Optional[Path]:
+    d = run_dir / behavior_stem(behavior)
+    if not d.is_dir():
+        return None
+    best: Optional[Path] = None
+    best_step = -1
+    for path in d.glob(f"{behavior_stem(behavior)}-*.pt"):
+        step = _onnx_step(path, behavior_stem(behavior))
+        if step > best_step:
+            best_step = step
+            best = path
+    plain = d / "checkpoint.pt"
+    if best is None and plain.is_file():
+        return plain
+    return best
+
+
+def salvage_results_onnx_to_sticky(run_dir: Path, behavior: str) -> Optional[Path]:
+    """Скопировать onnx из results в sticky сразу — иначе keep_checkpoints:0 стирает файл."""
+    name = behavior_stem(behavior)
+    src = _best_onnx_in_dir(run_dir / name, name)
+    if src is None:
+        return None
+    persist_sticky_onnx(run_dir, name, src)
+    sticky = _best_onnx_in_dir(sticky_onnx_dir(run_dir), name)
+    return sticky or src
+
+
+def wait_for_jack_onnx(run_dir: Path, poll_sec: float = 0.5) -> Path:
+    """Ждём Jack onnx в results или sticky; результаты сразу спасаем в sticky."""
+    name = "JackLowLevelAgent"
+    last_status = 0.0
+    while True:
+        salvaged = salvage_results_onnx_to_sticky(run_dir, name)
+        found = find_latest_onnx(run_dir, name)
+        if found is not None and _file_stable(found, settle_sec=0.15):
+            if salvaged is not None:
+                _log(f"Jack onnx: {found} (sticky salvage ok)")
+            else:
+                _log(f"Jack onnx: {found}")
+            return found
+
+        now = time.time()
+        if now - last_status >= 10.0:
+            last_status = now
+            pt = _latest_pt(run_dir, name)
+            res_dir = run_dir / name
+            n_onnx = len(list(res_dir.glob("*.onnx"))) if res_dir.is_dir() else 0
+            n_pt = len(list(res_dir.glob("*.pt"))) if res_dir.is_dir() else 0
+            sticky_n = 0
+            sd = sticky_onnx_dir(run_dir)
+            if sd.is_dir():
+                sticky_n = len(list(sd.glob(f"{name}*")))
+            pt_msg = pt.name if pt is not None else "нет"
+            _log(
+                f"жду Jack .onnx в {res_dir}/ "
+                f"(results onnx={n_onnx} pt={n_pt} sticky={sticky_n}; latest_pt={pt_msg}). "
+                f"ONNX пишет train каждые checkpoint_interval; "
+                f"keep_checkpoints должен быть >=1 иначе файл сразу удаляется."
+            )
+        time.sleep(poll_sec)
 
 
 def persist_sticky_onnx(run_dir: Path, behavior: str, src: Path) -> None:
@@ -315,6 +384,7 @@ class PolicyBank:
     def _reload_all_blocking(self) -> None:
         """Только до старта Unity — один раз можно подождать."""
         for behavior in self.behaviors:
+            salvage_results_onnx_to_sticky(self.run_dir, behavior)
             path = find_latest_onnx(self.run_dir, behavior)
             if path is None:
                 continue
@@ -342,6 +412,7 @@ class PolicyBank:
 
             jobs: List[Tuple[str, Path]] = []
             for behavior in self.behaviors:
+                salvage_results_onnx_to_sticky(self.run_dir, behavior)
                 path = find_latest_onnx(self.run_dir, behavior)
                 if path is None:
                     continue
@@ -545,12 +616,7 @@ def main() -> int:
         "true",
         "yes",
     )
-    # Ждём Jack в results, потом решаем jack-only (без Lily/George в этом run).
-    if not run_has_results_onnx(run_dir, "JackLowLevelAgent"):
-        _log(f"жду Jack .onnx в {run_dir}/JackLowLevelAgent/ ...")
-        while not run_has_results_onnx(run_dir, "JackLowLevelAgent"):
-            time.sleep(2.0)
-        _log("Jack onnx найден")
+    wait_for_jack_onnx(run_dir)
     if not jack_only:
         jack_only = is_jack_only_run(run_dir)
 

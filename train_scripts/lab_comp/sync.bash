@@ -56,6 +56,7 @@ sync_scripts() {
   rsync -avz --progress --info=name2,progress2 -e "${LAB_COMP_RSYNC_SSH}" \
     stream_inference_watch.bash \
     train_headless_jack.bash \
+    train_headless_jack_wood_food.bash \
     train_headless_jack_lily_george.bash \
     tensorboard.sh \
     "${LAB_COMP_RSYNC_REMOTE}:${REMOTE_DIR}/"
@@ -70,7 +71,7 @@ sync_scripts() {
     stream_bot/ "${LAB_COMP_RSYNC_REMOTE}:${REMOTE_DIR}/stream_bot/"
 
   "${LAB_COMP_SSH_CMD[@]}" "${LAB_COMP_RSYNC_REMOTE}" \
-    "chmod +x ${REMOTE_DIR}/train_scripts/lab_comp/*.bash ${REMOTE_DIR}/train_headless_jack.bash ${REMOTE_DIR}/train_headless_jack_lily_george.bash 2>/dev/null; true"
+    "chmod +x ${REMOTE_DIR}/train_scripts/lab_comp/*.bash ${REMOTE_DIR}/train_headless_jack.bash ${REMOTE_DIR}/train_headless_jack_wood_food.bash ${REMOTE_DIR}/train_headless_jack_lily_george.bash 2>/dev/null; true"
 }
 
 sync_build() {

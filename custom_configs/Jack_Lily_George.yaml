@@ -1,8 +1,8 @@
-# Jack + Lily + George: одновременное обучение трёх политик в одной сцене.
-# В Unity у каждого агента Behavior Name:
+# Jack + Lily + George: РѕРґРЅРѕРІСЂРµРјРµРЅРЅРѕРµ РѕР±СѓС‡РµРЅРёРµ С‚СЂС‘С… РїРѕР»РёС‚РёРє РІ РѕРґРЅРѕР№ СЃС†РµРЅРµ.
+# Р’ Unity Сѓ РєР°Р¶РґРѕРіРѕ Р°РіРµРЅС‚Р° Behavior Name:
 #   JackLowLevelAgent, LilyLowLevelAgent, GeorgeLowLevelAgent (Behavior Type = Default).
 #
-# Запуск:
+# Р—Р°РїСѓСЃРє:
 #   bash train_jack_lily_george.bash
 
 default_settings: null
@@ -21,7 +21,7 @@ behaviors:
       learning_rate_schedule: linear
       beta_schedule: linear
       epsilon_schedule: linear
-    checkpoint_interval: 5000
+    checkpoint_interval: 5000  # НЕ МЕНЯТЬ: стрим ждёт .onnx каждые N шагов
     network_settings:
       normalize: false
       hidden_units: 256
@@ -43,7 +43,7 @@ behaviors:
           goal_conditioning_type: hyper
           deterministic: false
     init_path: null
-    keep_checkpoints: 0
+    keep_checkpoints: 5  # НЕ МЕНЯТЬ: 0 сразу удаляет .onnx после записи
     even_checkpoints: false
     max_steps: 20000000
     time_horizon: 256
@@ -66,7 +66,7 @@ behaviors:
       learning_rate_schedule: linear
       beta_schedule: linear
       epsilon_schedule: linear
-    checkpoint_interval: 5000
+    checkpoint_interval: 5000  # НЕ МЕНЯТЬ: стрим ждёт .onnx каждые N шагов
     network_settings:
       normalize: false
       hidden_units: 256
@@ -88,7 +88,7 @@ behaviors:
           goal_conditioning_type: hyper
           deterministic: false
     init_path: null
-    keep_checkpoints: 0
+    keep_checkpoints: 5  # НЕ МЕНЯТЬ: 0 сразу удаляет .onnx после записи
     even_checkpoints: false
     max_steps: 50000000
     time_horizon: 256
@@ -111,7 +111,7 @@ behaviors:
       learning_rate_schedule: linear
       beta_schedule: linear
       epsilon_schedule: linear
-    checkpoint_interval: 5000
+    checkpoint_interval: 5000  # НЕ МЕНЯТЬ: стрим ждёт .onnx каждые N шагов
     network_settings:
       normalize: false
       hidden_units: 256
@@ -133,7 +133,7 @@ behaviors:
           goal_conditioning_type: hyper
           deterministic: false
     init_path: null
-    keep_checkpoints: 0
+    keep_checkpoints: 5  # НЕ МЕНЯТЬ: 0 сразу удаляет .onnx после записи
     even_checkpoints: false
     max_steps: 20000000
     time_horizon: 256

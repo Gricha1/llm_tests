@@ -1,6 +1,6 @@
 default_settings: null
 behaviors:
-  # Lily — обучается (цветы + поцелуй Джека). В Unity: Behavior Type = Default
+  # Lily вЂ” РѕР±СѓС‡Р°РµС‚СЃСЏ (С†РІРµС‚С‹ + РїРѕС†РµР»СѓР№ Р”Р¶РµРєР°). Р’ Unity: Behavior Type = Default
   LilyLowLevelAgent:
     trainer_type: ppo
     hyperparameters:
@@ -15,7 +15,7 @@ behaviors:
       learning_rate_schedule: linear
       beta_schedule: linear
       epsilon_schedule: linear
-    checkpoint_interval: 50000
+    checkpoint_interval: 5000  # НЕ МЕНЯТЬ: стрим ждёт .onnx каждые N шагов
     network_settings:
       normalize: false
       hidden_units: 256
@@ -37,7 +37,7 @@ behaviors:
           goal_conditioning_type: hyper
           deterministic: false
     init_path: null
-    keep_checkpoints: 0
+    keep_checkpoints: 5  # НЕ МЕНЯТЬ: 0 сразу удаляет .onnx после записи
     even_checkpoints: false
     max_steps: 50000000
     time_horizon: 256

@@ -1,17 +1,17 @@
-# Jack + Lily: одновременное обучение двух политик в одной сцене.
-# В Unity у обоих Behavior Name должны совпадать с ключами ниже:
+# Jack + Lily: РѕРґРЅРѕРІСЂРµРјРµРЅРЅРѕРµ РѕР±СѓС‡РµРЅРёРµ РґРІСѓС… РїРѕР»РёС‚РёРє РІ РѕРґРЅРѕР№ СЃС†РµРЅРµ.
+# Р’ Unity Сѓ РѕР±РѕРёС… Behavior Name РґРѕР»Р¶РЅС‹ СЃРѕРІРїР°РґР°С‚СЊ СЃ РєР»СЋС‡Р°РјРё РЅРёР¶Рµ:
 #   JackLowLevelAgent, LilyLowLevelAgent (Behavior Type = Default).
 #
-# Запуск (пример):
+# Р—Р°РїСѓСЃРє (РїСЂРёРјРµСЂ):
 #   mlagents-learn custom_configs/Jack_Lily.yaml --run-id jack_lily_1
 #
-# Совместный старт с весами из двух разных run (без --resume), см. train_scripts/train_ppo.bash:
+# РЎРѕРІРјРµСЃС‚РЅС‹Р№ СЃС‚Р°СЂС‚ СЃ РІРµСЃР°РјРё РёР· РґРІСѓС… СЂР°Р·РЅС‹С… run (Р±РµР· --resume), СЃРј. train_scripts/train_ppo.bash:
 #   bash train_scripts/train_ppo.bash <build> <num_envs> Jack_Lily <lily_src_run> <jack_src_run> [out_run_id]
-#   — чекпоинты Лили: results/<lily_src_run>/LilyLowLevelAgent/ (checkpoint.pt или *-<step>.pt)
-#   — чекпоинты Джека: results/<jack_src_run>/JackLowLevelAgent/
-#   — пишет в новый run (авто run_N или явный 6-й аргумент); подставляет init_path в _autogen_Jack_Lily.yaml
+#   вЂ” С‡РµРєРїРѕРёРЅС‚С‹ Р›РёР»Рё: results/<lily_src_run>/LilyLowLevelAgent/ (checkpoint.pt РёР»Рё *-<step>.pt)
+#   вЂ” С‡РµРєРїРѕРёРЅС‚С‹ Р”Р¶РµРєР°: results/<jack_src_run>/JackLowLevelAgent/
+#   вЂ” РїРёС€РµС‚ РІ РЅРѕРІС‹Р№ run (Р°РІС‚Рѕ run_N РёР»Рё СЏРІРЅС‹Р№ 6-Р№ Р°СЂРіСѓРјРµРЅС‚); РїРѕРґСЃС‚Р°РІР»СЏРµС‚ init_path РІ _autogen_Jack_Lily.yaml
 #
-# Основано на: Jack_single_agent.yaml, Lily_single_agent.yaml
+# РћСЃРЅРѕРІР°РЅРѕ РЅР°: Jack_single_agent.yaml, Lily_single_agent.yaml
 
 default_settings: null
 behaviors:
@@ -29,7 +29,7 @@ behaviors:
       learning_rate_schedule: linear
       beta_schedule: linear
       epsilon_schedule: linear
-    checkpoint_interval: 50000
+    checkpoint_interval: 5000  # НЕ МЕНЯТЬ: стрим ждёт .onnx каждые N шагов
     network_settings:
       normalize: false
       hidden_units: 256
@@ -51,7 +51,7 @@ behaviors:
           goal_conditioning_type: hyper
           deterministic: false
     init_path: null
-    keep_checkpoints: 0
+    keep_checkpoints: 5  # НЕ МЕНЯТЬ: 0 сразу удаляет .onnx после записи
     even_checkpoints: false
     max_steps: 20000000
     time_horizon: 256
@@ -74,7 +74,7 @@ behaviors:
       learning_rate_schedule: linear
       beta_schedule: linear
       epsilon_schedule: linear
-    checkpoint_interval: 50000
+    checkpoint_interval: 5000  # НЕ МЕНЯТЬ: стрим ждёт .onnx каждые N шагов
     network_settings:
       normalize: false
       hidden_units: 256
@@ -96,7 +96,7 @@ behaviors:
           goal_conditioning_type: hyper
           deterministic: false
     init_path: null
-    keep_checkpoints: 0
+    keep_checkpoints: 5  # НЕ МЕНЯТЬ: 0 сразу удаляет .onnx после записи
     even_checkpoints: false
     max_steps: 50000000
     time_horizon: 256

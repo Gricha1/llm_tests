@@ -20,24 +20,28 @@ lab_comp_init_ssh() {
   LAB_COMP_RSYNC_REMOTE=""
   LAB_COMP_SSH_CMD=()
 
+  # Windows ssh.exe видит ZeroTier; WSL ssh часто нет → сначала только ssh.exe.
+  # Порядок: alias → ZeroTier cds_team → ZeroTier home → LAN.
   if command -v ssh.exe >/dev/null 2>&1; then
-    if ssh.exe -o BatchMode=yes -o ConnectTimeout=8 lab_comp true 2>/dev/null; then
-      LAB_COMP_RSYNC_SSH="ssh.exe"
-      LAB_COMP_RSYNC_REMOTE="lab_comp"
-      LAB_COMP_SSH_CMD=(ssh.exe)
-      echo "[lab_comp_ssh] transport=ssh.exe host=lab_comp"
-      return 0
-    fi
-    if ssh.exe -o BatchMode=yes -o ConnectTimeout=8 reedgern@192.168.194.7 true 2>/dev/null; then
-      LAB_COMP_RSYNC_SSH="ssh.exe"
-      LAB_COMP_RSYNC_REMOTE="reedgern@192.168.194.7"
-      LAB_COMP_SSH_CMD=(ssh.exe)
-      echo "[lab_comp_ssh] transport=ssh.exe host=reedgern@192.168.194.7"
-      return 0
-    fi
+    local candidate
+    for candidate in \
+      "lab_comp" \
+      "reedgern@10.43.71.7" \
+      "reedgern@192.168.194.7" \
+      "lab_comp_local" \
+      "reedgern@192.168.50.18"
+    do
+      if ssh.exe -o BatchMode=yes -o ConnectTimeout=8 "${candidate}" true 2>/dev/null; then
+        LAB_COMP_RSYNC_SSH="ssh.exe"
+        LAB_COMP_RSYNC_REMOTE="${candidate}"
+        LAB_COMP_SSH_CMD=(ssh.exe)
+        echo "[lab_comp_ssh] transport=ssh.exe host=${candidate}"
+        return 0
+      fi
+    done
   fi
 
-  local fallback="${REMOTE:-reedgern@192.168.194.7}"
+  local fallback="${REMOTE:-reedgern@10.43.71.7}"
   LAB_COMP_RSYNC_SSH="ssh -i ${SSH_KEY} -o StrictHostKeyChecking=no -o ConnectTimeout=8"
   LAB_COMP_RSYNC_REMOTE="${fallback}"
   LAB_COMP_SSH_CMD=(ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o ConnectTimeout=8)
@@ -45,8 +49,10 @@ lab_comp_init_ssh() {
 
   if ! "${LAB_COMP_SSH_CMD[@]}" "${fallback}" true 2>/dev/null; then
     echo "ERROR: не удалось подключиться к lab_comp." >&2
-    echo "  Рабочий вариант у тебя: ssh.exe lab_comp" >&2
-    echo "  Проверь: ssh.exe lab_comp echo ok" >&2
+    echo "  Проверь ZeroTier (cds_team 10.43.71.* или network_home 192.168.194.*):" >&2
+    echo "    ssh.exe lab_comp echo ok" >&2
+    echo "    ssh.exe reedgern@10.43.71.7 echo ok" >&2
+    echo "    ssh.exe reedgern@192.168.194.7 echo ok" >&2
     return 1
   fi
 }

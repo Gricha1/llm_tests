@@ -756,10 +756,8 @@ public class LilyScript : Agent, IHasHp
         float minZ = 10f;
         float maxZ = 17f;
 
-        bool skipTeleport = !spawnAtFixedPosition && !followPath && !TrainingEnvSpace.HasMultipleTrainingEnvs();
-
-        if (!TrainingEnvSpace.TryRestorePresentationSpawn(transform, controller)
-            && !skipTeleport)
+        // Все Env: каждый эпизод — случайная точка (или fixed). Path — ниже.
+        if (!followPath)
         {
             controller.enabled = false;
             if (spawnAtFixedPosition)
