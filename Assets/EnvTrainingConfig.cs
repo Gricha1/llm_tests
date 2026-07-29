@@ -159,8 +159,8 @@ public sealed class EnvTrainingConfig : MonoBehaviour
     }
 
     /// <summary>
-    /// Jack только wood+food: на 20 слотах 12 wood, 8 food.
-    /// Включает jack-only (Lily/George выключены).
+    /// Jack wood+food+water+zombie: на 26 слотах 12 wood, 4 water, 4 food, 6 zombie.
+    /// Включает jack-only (Lily/George выключены). Флаг исторически WOOD_FOOD_ONLY.
     /// </summary>
     public static bool IsJackWoodFoodOnlyMode()
     {
@@ -176,6 +176,86 @@ public sealed class EnvTrainingConfig : MonoBehaviour
         return false;
     }
 
+    /// <summary>
+    /// 2-я стадия Jack: штраф за пустой DO и за ходьбу назад в wood/food/water.
+    /// Stage1 (без флага) штрафы выкл., чтобы сначала выучить цикл.
+    /// </summary>
+    public static bool IsJackStage2PenaltiesMode()
+    {
+        if (IsTruthyEnv(System.Environment.GetEnvironmentVariable("FOREST_JACK_STAGE2")))
+            return true;
+
+        foreach (var arg in System.Environment.GetCommandLineArgs())
+        {
+            if (arg == "-forestJackStage2" || arg == "--forest-jack-stage2")
+                return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>Lily solo: только задачи Lily (food/water/heat/flower). Jack/George выкл.</summary>
+    public static bool IsLilyOnlyTasksMode()
+    {
+        if (IsTruthyEnv(System.Environment.GetEnvironmentVariable("FOREST_LILY_ONLY_TASKS")))
+            return true;
+
+        foreach (var arg in System.Environment.GetCommandLineArgs())
+        {
+            if (arg == "-forestLilyOnlyTasks" || arg == "--forest-lily-only-tasks")
+                return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>George solo: только food/water/heat. Jack/Lily выкл.</summary>
+    public static bool IsGeorgeOnlyTasksMode()
+    {
+        if (IsTruthyEnv(System.Environment.GetEnvironmentVariable("FOREST_GEORGE_ONLY_TASKS")))
+            return true;
+
+        foreach (var arg in System.Environment.GetCommandLineArgs())
+        {
+            if (arg == "-forestGeorgeOnlyTasks" || arg == "--forest-george-only-tasks")
+                return true;
+        }
+
+        return false;
+    }
+
+    public static bool IsLilyStage2PenaltiesMode()
+    {
+        if (IsTruthyEnv(System.Environment.GetEnvironmentVariable("FOREST_LILY_STAGE2")))
+            return true;
+
+        foreach (var arg in System.Environment.GetCommandLineArgs())
+        {
+            if (arg == "-forestLilyStage2" || arg == "--forest-lily-stage2")
+                return true;
+        }
+
+        return false;
+    }
+
+    public static bool IsGeorgeStage2PenaltiesMode()
+    {
+        if (IsTruthyEnv(System.Environment.GetEnvironmentVariable("FOREST_GEORGE_STAGE2")))
+            return true;
+
+        foreach (var arg in System.Environment.GetCommandLineArgs())
+        {
+            if (arg == "-forestGeorgeStage2" || arg == "--forest-george-stage2")
+                return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>Любой solo-режим (один герой в yaml).</summary>
+    public static bool IsAnySoloHeroTasksMode() =>
+        IsJackOnlyTasksMode() || IsLilyOnlyTasksMode() || IsGeorgeOnlyTasksMode();
+
     static bool IsTruthyEnv(string value) =>
         value == "1" || string.Equals(value, "true", System.StringComparison.OrdinalIgnoreCase);
 
@@ -183,9 +263,15 @@ public sealed class EnvTrainingConfig : MonoBehaviour
     {
         if (IsJackWoodFoodOnlyMode())
         {
-            // Период 20: 12 wood + 8 food.
-            int i = copyIndex < 0 ? 0 : copyIndex % 20;
-            return i < 12 ? EnvTrainingTask.JackWood : EnvTrainingTask.JackFood;
+            // Период 26: 12 wood + 4 water + 4 food + 6 zombie.
+            int i = copyIndex < 0 ? 0 : copyIndex % 26;
+            if (i < 12)
+                return EnvTrainingTask.JackWood;
+            if (i < 16)
+                return EnvTrainingTask.JackWater;
+            if (i < 20)
+                return EnvTrainingTask.JackFood;
+            return EnvTrainingTask.JackZombie;
         }
 
         // Период 30: 9+4+9+8 — ровно 2:1:2:2 при NUM_ENVS=30.
@@ -199,13 +285,36 @@ public sealed class EnvTrainingConfig : MonoBehaviour
         return EnvTrainingTask.JackZombie;
     }
 
-    public static EnvTrainingTask ResolveAutoTaskForCopyIndex(int copyIndex)
+    /// <summary>Период 24: по 6 на food/water/heat/flower.</summary>
+    public static EnvTrainingTask ResolveLilyOnlyTaskForCopyIndex(int copyIndex)
     {
-        if (IsJackOnlyTasksMode())
-            return ResolveJackOnlyTaskForCopyIndex(copyIndex);
+        int i = copyIndex < 0 ? 0 : copyIndex % 24;
+        if (i < 6)
+            return EnvTrainingTask.LilyFood;
+        if (i < 12)
+            return EnvTrainingTask.LilyWater;
+        if (i < 18)
+            return EnvTrainingTask.LilyHeat;
+        return EnvTrainingTask.LilyFlower;
+    }
 
-        // 0 — стрим PresentationFull; 1 — train PresentationFull (все трое);
-        // 2–12 — узкие; 13+ — буст.
+    /// <summary>Период 24: по 8 на food/water/heat.</summary>
+    public static EnvTrainingTask ResolveGeorgeOnlyTaskForCopyIndex(int copyIndex)
+    {
+        int i = copyIndex < 0 ? 0 : copyIndex % 24;
+        if (i < 8)
+            return EnvTrainingTask.GeorgeFood;
+        if (i < 16)
+            return EnvTrainingTask.GeorgeWater;
+        return EnvTrainingTask.GeorgeHeat;
+    }
+
+    /// <summary>
+    /// Карта меню K / #env_N: 0–1 presentation, 2–5 Jack, 6–9 Lily, 10–12 George.
+    /// Не путать с train-слотами (12×wood… при JackWoodFoodOnly).
+    /// </summary>
+    public static EnvTrainingTask ResolveFixedMenuTaskForCopyIndex(int copyIndex)
+    {
         switch (copyIndex)
         {
             case 0: return EnvTrainingTask.PresentationFull;
@@ -229,6 +338,22 @@ public sealed class EnvTrainingConfig : MonoBehaviour
                 }
                 return EnvTrainingTask.JackWood;
         }
+    }
+
+    public static EnvTrainingTask ResolveAutoTaskForCopyIndex(int copyIndex)
+    {
+        // Меню K / #env_N: всегда 0–12, иначе train-слоты ≠ пункты меню.
+        if (TrainingEnvSpace.IsDebugEnvFocusActive)
+            return ResolveFixedMenuTaskForCopyIndex(copyIndex);
+
+        if (IsJackOnlyTasksMode())
+            return ResolveJackOnlyTaskForCopyIndex(copyIndex);
+        if (IsLilyOnlyTasksMode())
+            return ResolveLilyOnlyTaskForCopyIndex(copyIndex);
+        if (IsGeorgeOnlyTasksMode())
+            return ResolveGeorgeOnlyTaskForCopyIndex(copyIndex);
+
+        return ResolveFixedMenuTaskForCopyIndex(copyIndex);
     }
 
     /// <summary>Раньше фиксировал dynamic boost на эпизод; сейчас w12+ заданы жёстко в FixedBoostTasks.</summary>
@@ -280,10 +405,13 @@ public sealed class EnvTrainingConfig : MonoBehaviour
 
     public static bool ShouldAgentTrain(EnvTrainingTask task, EnvTrainingAgentRole role)
     {
-        // Jack-only train: в yaml только JackLowLevelAgent — Lily/George не должны
-        // регистрироваться как Default, иначе TrainerConfigError.
+        // Solo train: в yaml один behavior — остальные не Default.
         if (IsJackOnlyTasksMode())
             return role == EnvTrainingAgentRole.Jack;
+        if (IsLilyOnlyTasksMode())
+            return role == EnvTrainingAgentRole.Lily;
+        if (IsGeorgeOnlyTasksMode())
+            return role == EnvTrainingAgentRole.George;
 
         switch (task)
         {
@@ -333,7 +461,7 @@ public sealed class EnvTrainingConfig : MonoBehaviour
         // Сначала роли (HeuristicOnly / Agent.enabled), потом visibility:
         // иначе спрятанных агентов пропускают и они остаются Default → TrainerConfigError.
         bool applyRoles = TrainingEnvSpace.IsMlAgentsTrainingActive()
-            || IsJackOnlyTasksMode()
+            || IsAnySoloHeroTasksMode()
             || TrainingEnvSpace.IsDebugEnvFocusActive;
         if (applyRoles)
             ApplyAgentRoles(resolved);
@@ -455,12 +583,12 @@ public sealed class EnvTrainingConfig : MonoBehaviour
 
         if (TrainingEnvSpace.IsStreamOnlyMode && TrainingEnvSpace.IsPresentationEnv(transform))
         {
-            // Jack-only stream: не показывать/не регистрировать Lily/George.
-            if (IsJackOnlyTasksMode())
+            // Solo stream: только обучаемый герой.
+            if (IsAnySoloHeroTasksMode())
             {
-                var jackTask = ResolveTask();
-                ApplyAgentRoles(jackTask);
-                ApplyAgentVisibility(jackTask);
+                var soloTask = ResolveTask();
+                ApplyAgentRoles(soloTask);
+                ApplyAgentVisibility(soloTask);
                 return;
             }
             ApplyAgentVisibility(EnvTrainingTask.PresentationFull);
@@ -478,7 +606,7 @@ public sealed class EnvTrainingConfig : MonoBehaviour
         CommitBoostTaskIfNeeded();
         var resolved = ResolveTask();
         ApplyTrainingCampfire(resolved);
-        bool applyRoles = TrainingEnvSpace.IsMlAgentsTrainingActive() || IsJackOnlyTasksMode();
+        bool applyRoles = TrainingEnvSpace.IsMlAgentsTrainingActive() || IsAnySoloHeroTasksMode();
         if (applyRoles)
             ApplyAgentRoles(resolved);
         ApplyAgentVisibility(resolved);
@@ -646,14 +774,14 @@ public sealed class EnvTrainingConfig : MonoBehaviour
     {
         bool debugView = TrainingEnvSpace.IsDebugEnvFocusActive;
         bool mlTraining = TrainingEnvSpace.IsMlAgentsTrainingActive();
-        bool jackOnly = IsJackOnlyTasksMode();
+        bool soloHero = IsAnySoloHeroTasksMode();
         // Play без mlagents: всё равно HeuristicOnly + DecisionRequester для ручного WASD.
-        if (!mlTraining && !debugView && !jackOnly)
+        if (!mlTraining && !debugView && !soloHero)
             return;
         // Presentation worker тоже Default+train (пока нет sentis hot reload на сервере).
         if (TrainingEnvSpace.IsPresentationWorkerProcess
             && resolved != EnvTrainingTask.PresentationFull
-            && !jackOnly)
+            && !soloHero)
             return;
 
         var agents = GetComponentsInChildren<AgentGoToHouseDiscrete>(true);
@@ -670,7 +798,7 @@ public sealed class EnvTrainingConfig : MonoBehaviour
             if (agent.gameObject.name == "Jack" || agent.gameObject.name == "George")
                 continue;
             bool should = ShouldAgentTrain(resolved, role);
-            if (debugView && !mlTraining && !jackOnly)
+            if (debugView && !mlTraining && !soloHero)
                 SetAgentHeuristicPlayEnabled(agent, should);
             else
                 SetAgentTrainingEnabled(agent, should);
@@ -685,7 +813,7 @@ public sealed class EnvTrainingConfig : MonoBehaviour
                 continue;
 
             bool should = ShouldAgentTrain(resolved, EnvTrainingAgentRole.Lily);
-            if (debugView && !mlTraining && !jackOnly)
+            if (debugView && !mlTraining && !soloHero)
                 SetAgentHeuristicPlayEnabled(lily, should);
             else
                 SetAgentTrainingEnabled(lily, should);

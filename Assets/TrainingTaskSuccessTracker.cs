@@ -17,6 +17,8 @@ public static class TrainingTaskSuccessTracker
     public enum Metric
     {
         Wood,
+        /// <summary>Срубил ≥maxWood и сдал в костёр (без требования греться до heat≥20).</summary>
+        WoodDeliver,
         Sheep,
         Fire,
         Water,
@@ -91,6 +93,9 @@ public static class TrainingTaskSuccessTracker
         var ranked = new List<(Metric metric, float rate, int samples)>();
         foreach (Metric m in Enum.GetValues(typeof(Metric)))
         {
+            // WoodDeliver — диагностическая метрика, не двигает boost-слоты.
+            if (m == Metric.WoodDeliver)
+                continue;
             float rate = LastRate.TryGetValue(m, out float r) ? r : 0f;
             int samples = RawSamples.TryGetValue(m, out var list) ? list.Count : 0;
             ranked.Add((m, rate, samples));
@@ -141,10 +146,69 @@ public static class TrainingTaskSuccessTracker
         if (!metric.HasValue)
             return;
 
-        AppendToDisk(metric.Value, task, success);
+        AppendToDisk(metric.Value, task, success ? 1f : 0f);
         PushLocalSample(metric.Value, success ? 1f : 0f);
         PushTaskSample(task, success ? 1f : 0f);
         ReportToTensorBoard(task, metric.Value);
+    }
+
+    /// <summary>
+    /// Не 0/1, а числовое значение эпизода (например убийства зомби).
+    /// В TB: SuccessRate/ZombieCount = скользящее среднее count за эпизод.
+    /// </summary>
+    public static void RecordValue(EnvTrainingTask task, float value)
+    {
+        var metric = TaskToMetric(task);
+        if (!metric.HasValue)
+            return;
+
+        if (float.IsNaN(value) || float.IsInfinity(value))
+            value = 0f;
+        value = Mathf.Max(0f, value);
+
+        AppendToDisk(metric.Value, task, value);
+        PushLocalSample(metric.Value, value);
+        PushTaskSample(task, value);
+        ReportToTensorBoard(task, metric.Value);
+    }
+
+    /// <summary>
+    /// Отдельная TB-метрика (не привязана к EnvTrainingTask / Mean success).
+    /// </summary>
+    public static void RecordMetric(Metric metric, bool success, EnvTrainingTask relatedTask)
+    {
+        AppendToDisk(metric, relatedTask, success ? 1f : 0f);
+        PushLocalSample(metric, success ? 1f : 0f);
+        ReportMetricToTensorBoard(metric);
+    }
+
+    static string MetricTensorBoardKey(Metric metric)
+    {
+        switch (metric)
+        {
+            case Metric.Wood: return "Wood";
+            case Metric.WoodDeliver: return "WoodDeliver";
+            case Metric.Sheep: return "Sheep";
+            case Metric.Fire: return "Fire";
+            case Metric.Water: return "Water";
+            case Metric.Zombie: return "ZombieCount";
+            case Metric.Flower: return "Flower";
+            default: return metric.ToString();
+        }
+    }
+
+    static void ReportMetricToTensorBoard(Metric metric)
+    {
+        if (!Academy.IsInitialized || !Academy.Instance.IsCommunicatorOn)
+            return;
+
+        string key = MetricTensorBoardKey(metric);
+        if (string.IsNullOrEmpty(key))
+            return;
+
+        float rate = LastRate.TryGetValue(metric, out float r) ? r : 0f;
+        Academy.Instance.StatsRecorder.Add(
+            $"SuccessRate/{key}", rate, StatAggregationMethod.Average);
     }
 
     public static float GetTaskLastRate(EnvTrainingTask task)
@@ -273,7 +337,7 @@ public static class TrainingTaskSuccessTracker
         RefreshFromDisk(force: false);
     }
 
-    static void AppendToDisk(Metric metric, EnvTrainingTask task, bool success)
+    static void AppendToDisk(Metric metric, EnvTrainingTask task, float value)
     {
         var path = GetStatsFilePath();
         if (path == null)
@@ -285,9 +349,10 @@ public static class TrainingTaskSuccessTracker
             if (!string.IsNullOrEmpty(dir))
                 Directory.CreateDirectory(dir);
 
-            // task нужен стриму: иначе wood/zombie тонут в хвосте sheep/fire.
+            // s: 0/1 для обычных задач, целое ≥0 для ZombieCount (убийства за эпизод).
+            int sInt = Mathf.RoundToInt(Mathf.Max(0f, value));
             var line =
-                $"{{\"m\":\"{metric}\",\"task\":\"{task}\",\"s\":{(success ? 1 : 0)},\"t\":{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}}}\n";
+                $"{{\"m\":\"{metric}\",\"task\":\"{task}\",\"s\":{sInt},\"t\":{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}}}\n";
             using (var fs = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite))
             using (var sw = new StreamWriter(fs, Encoding.UTF8))
                 sw.Write(line);
@@ -335,7 +400,7 @@ public static class TrainingTaskSuccessTracker
             case EnvTrainingTask.JackWater:
             case EnvTrainingTask.LilyWater:
             case EnvTrainingTask.GeorgeWater: return "Water";
-            case EnvTrainingTask.JackZombie: return "Zombie";
+            case EnvTrainingTask.JackZombie: return "ZombieCount";
             case EnvTrainingTask.LilyHeat:
             case EnvTrainingTask.GeorgeHeat: return "Fire";
             case EnvTrainingTask.LilyFlower: return "Flower";
@@ -418,6 +483,9 @@ public static class TrainingTaskSuccessTracker
         var heroTasks = TasksForHero(hero);
         for (int i = 0; i < heroTasks.Length; i++)
         {
+            // ZombieCount — среднее убийств, не 0/1; в Mean success не смешиваем.
+            if (heroTasks[i] == EnvTrainingTask.JackZombie)
+                continue;
             if (GetTaskSampleCountCached(heroTasks[i]) <= 0)
                 continue;
             sum += GetTaskLastRateCached(heroTasks[i]);
@@ -571,7 +639,8 @@ public static class TrainingTaskSuccessTracker
         if (sEnd < 0 || !int.TryParse(line.Substring(sIdx, sEnd - sIdx), out int s))
             return;
 
-        float sample = s == 1 ? 1f : 0f;
+        // Wood/Sheep: 0/1; ZombieCount: число убийств за эпизод.
+        float sample = s;
         if (metricSamples.TryGetValue(metric, out var mList))
             mList.Add(sample);
 

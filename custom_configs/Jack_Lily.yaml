@@ -1,17 +1,17 @@
-# Jack + Lily: РѕРґРЅРѕРІСЂРµРјРµРЅРЅРѕРµ РѕР±СѓС‡РµРЅРёРµ РґРІСѓС… РїРѕР»РёС‚РёРє РІ РѕРґРЅРѕР№ СЃС†РµРЅРµ.
-# Р’ Unity Сѓ РѕР±РѕРёС… Behavior Name РґРѕР»Р¶РЅС‹ СЃРѕРІРїР°РґР°С‚СЊ СЃ РєР»СЋС‡Р°РјРё РЅРёР¶Рµ:
+﻿# Jack + Lily: Р С•Р Т‘Р Р…Р С•Р Р†РЎР‚Р ВµР СР ВµР Р…Р Р…Р С•Р Вµ Р С•Р В±РЎС“РЎвЂЎР ВµР Р…Р С‘Р Вµ Р Т‘Р Р†РЎС“РЎвЂ¦ Р С—Р С•Р В»Р С‘РЎвЂљР С‘Р С” Р Р† Р С•Р Т‘Р Р…Р С•Р в„– РЎРѓРЎвЂ Р ВµР Р…Р Вµ.
+# Р вЂ™ Unity РЎС“ Р С•Р В±Р С•Р С‘РЎвЂ¦ Behavior Name Р Т‘Р С•Р В»Р В¶Р Р…РЎвЂ№ РЎРѓР С•Р Р†Р С—Р В°Р Т‘Р В°РЎвЂљРЎРЉ РЎРѓ Р С”Р В»РЎР‹РЎвЂЎР В°Р СР С‘ Р Р…Р С‘Р В¶Р Вµ:
 #   JackLowLevelAgent, LilyLowLevelAgent (Behavior Type = Default).
 #
-# Р—Р°РїСѓСЃРє (РїСЂРёРјРµСЂ):
+# Р вЂ”Р В°Р С—РЎС“РЎРѓР С” (Р С—РЎР‚Р С‘Р СР ВµРЎР‚):
 #   mlagents-learn custom_configs/Jack_Lily.yaml --run-id jack_lily_1
 #
-# РЎРѕРІРјРµСЃС‚РЅС‹Р№ СЃС‚Р°СЂС‚ СЃ РІРµСЃР°РјРё РёР· РґРІСѓС… СЂР°Р·РЅС‹С… run (Р±РµР· --resume), СЃРј. train_scripts/train_ppo.bash:
+# Р РЋР С•Р Р†Р СР ВµРЎРѓРЎвЂљР Р…РЎвЂ№Р в„– РЎРѓРЎвЂљР В°РЎР‚РЎвЂљ РЎРѓ Р Р†Р ВµРЎРѓР В°Р СР С‘ Р С‘Р В· Р Т‘Р Р†РЎС“РЎвЂ¦ РЎР‚Р В°Р В·Р Р…РЎвЂ№РЎвЂ¦ run (Р В±Р ВµР В· --resume), РЎРѓР С. train_scripts/train_ppo.bash:
 #   bash train_scripts/train_ppo.bash <build> <num_envs> Jack_Lily <lily_src_run> <jack_src_run> [out_run_id]
-#   вЂ” С‡РµРєРїРѕРёРЅС‚С‹ Р›РёР»Рё: results/<lily_src_run>/LilyLowLevelAgent/ (checkpoint.pt РёР»Рё *-<step>.pt)
-#   вЂ” С‡РµРєРїРѕРёРЅС‚С‹ Р”Р¶РµРєР°: results/<jack_src_run>/JackLowLevelAgent/
-#   вЂ” РїРёС€РµС‚ РІ РЅРѕРІС‹Р№ run (Р°РІС‚Рѕ run_N РёР»Рё СЏРІРЅС‹Р№ 6-Р№ Р°СЂРіСѓРјРµРЅС‚); РїРѕРґСЃС‚Р°РІР»СЏРµС‚ init_path РІ _autogen_Jack_Lily.yaml
+#   РІР‚вЂќ РЎвЂЎР ВµР С”Р С—Р С•Р С‘Р Р…РЎвЂљРЎвЂ№ Р вЂєР С‘Р В»Р С‘: results/<lily_src_run>/LilyLowLevelAgent/ (checkpoint.pt Р С‘Р В»Р С‘ *-<step>.pt)
+#   РІР‚вЂќ РЎвЂЎР ВµР С”Р С—Р С•Р С‘Р Р…РЎвЂљРЎвЂ№ Р вЂќР В¶Р ВµР С”Р В°: results/<jack_src_run>/JackLowLevelAgent/
+#   РІР‚вЂќ Р С—Р С‘РЎв‚¬Р ВµРЎвЂљ Р Р† Р Р…Р С•Р Р†РЎвЂ№Р в„– run (Р В°Р Р†РЎвЂљР С• run_N Р С‘Р В»Р С‘ РЎРЏР Р†Р Р…РЎвЂ№Р в„– 6-Р в„– Р В°РЎР‚Р С–РЎС“Р СР ВµР Р…РЎвЂљ); Р С—Р С•Р Т‘РЎРѓРЎвЂљР В°Р Р†Р В»РЎРЏР ВµРЎвЂљ init_path Р Р† _autogen_Jack_Lily.yaml
 #
-# РћСЃРЅРѕРІР°РЅРѕ РЅР°: Jack_single_agent.yaml, Lily_single_agent.yaml
+# Р С›РЎРѓР Р…Р С•Р Р†Р В°Р Р…Р С• Р Р…Р В°: Jack_single_agent.yaml, Lily_single_agent.yaml
 
 default_settings: null
 behaviors:
@@ -26,12 +26,12 @@ behaviors:
       lambd: 0.95
       num_epoch: 3
       shared_critic: false
-      learning_rate_schedule: linear
+      learning_rate_schedule: constant
       beta_schedule: linear
       epsilon_schedule: linear
-    checkpoint_interval: 5000  # НЕ МЕНЯТЬ: стрим ждёт .onnx каждые N шагов
+    checkpoint_interval: 5000  # РќР• РњР•РќРЇРўР¬: СЃС‚СЂРёРј Р¶РґС‘С‚ .onnx РєР°Р¶РґС‹Рµ N С€Р°РіРѕРІ
     network_settings:
-      normalize: false
+      normalize: true
       hidden_units: 256
       num_layers: 3
       vis_encode_type: simple
@@ -41,9 +41,9 @@ behaviors:
     reward_signals:
       extrinsic:
         gamma: 0.99
-        strength: 1.0
+        strength: 0.001
         network_settings:
-          normalize: false
+          normalize: true
           hidden_units: 256
           num_layers: 3
           vis_encode_type: simple
@@ -51,9 +51,9 @@ behaviors:
           goal_conditioning_type: hyper
           deterministic: false
     init_path: null
-    keep_checkpoints: 5  # НЕ МЕНЯТЬ: 0 сразу удаляет .onnx после записи
+    keep_checkpoints: 5  # РќР• РњР•РќРЇРўР¬: 0 СЃСЂР°Р·Сѓ СѓРґР°Р»СЏРµС‚ .onnx РїРѕСЃР»Рµ Р·Р°РїРёСЃРё
     even_checkpoints: false
-    max_steps: 20000000
+    max_steps: 10000000  # betaв†’0 Рє 10M; LR constant
     time_horizon: 256
     summary_freq: 50000
     threaded: false
@@ -71,12 +71,12 @@ behaviors:
       lambd: 0.95
       num_epoch: 3
       shared_critic: false
-      learning_rate_schedule: linear
+      learning_rate_schedule: constant
       beta_schedule: linear
       epsilon_schedule: linear
-    checkpoint_interval: 5000  # НЕ МЕНЯТЬ: стрим ждёт .onnx каждые N шагов
+    checkpoint_interval: 5000  # РќР• РњР•РќРЇРўР¬: СЃС‚СЂРёРј Р¶РґС‘С‚ .onnx РєР°Р¶РґС‹Рµ N С€Р°РіРѕРІ
     network_settings:
-      normalize: false
+      normalize: true
       hidden_units: 256
       num_layers: 3
       vis_encode_type: simple
@@ -86,9 +86,9 @@ behaviors:
     reward_signals:
       extrinsic:
         gamma: 0.99
-        strength: 1.0
+        strength: 0.001
         network_settings:
-          normalize: false
+          normalize: true
           hidden_units: 256
           num_layers: 3
           vis_encode_type: simple
@@ -96,9 +96,9 @@ behaviors:
           goal_conditioning_type: hyper
           deterministic: false
     init_path: null
-    keep_checkpoints: 5  # НЕ МЕНЯТЬ: 0 сразу удаляет .onnx после записи
+    keep_checkpoints: 5  # РќР• РњР•РќРЇРўР¬: 0 СЃСЂР°Р·Сѓ СѓРґР°Р»СЏРµС‚ .onnx РїРѕСЃР»Рµ Р·Р°РїРёСЃРё
     even_checkpoints: false
-    max_steps: 50000000
+    max_steps: 10000000  # betaв†’0 Рє 10M; LR constant
     time_horizon: 256
     summary_freq: 50000
     threaded: false

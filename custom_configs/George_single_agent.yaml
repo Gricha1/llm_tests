@@ -1,6 +1,6 @@
 default_settings: null
 behaviors:
-  JackLowLevelAgent:
+  GeorgeLowLevelAgent:
     trainer_type: ppo
     hyperparameters:
       batch_size: 1024
@@ -66,7 +66,7 @@ engine_settings:
   no_graphics_monitor: false
 environment_parameters: null
 checkpoint_settings:
-  run_id: test_2
+  run_id: george_single_agent
   initialize_from: null
   load_model: false
   resume: false

@@ -2,7 +2,7 @@
 set -eu
 set -o pipefail
 
-# Jack only wood+food: 20 Unity headless, 12 wood + 8 food.
+# Jack wood+food+water+zombie: 26 Unity headless, 12 wood + 4 water + 4 food + 6 zombie.
 # Полный jack (wood/food/water/zombie) — train_headless_jack.bash.
 #
 #   RUN_ID=run_90 bash train_headless_jack_wood_food.bash
@@ -17,7 +17,7 @@ cd "${ROOT}"
 
 BUILD="${BUILD:-stream_forest_survival_2_12_07_2026}"
 RUN_ID="${RUN_ID:-jack_wood_food_1}"
-NUM_ENVS="${NUM_ENVS:-20}"
+NUM_ENVS="${NUM_ENVS:-26}"
 TIME_SCALE="${TIME_SCALE:-8}"
 TORCH_DEVICE="${TORCH_DEVICE:-cuda}"
 TRAIN_PORT="${TRAIN_PORT:-5005}"

@@ -254,11 +254,13 @@ public static class TrainingEnvSpace
         if (worker < 0)
             return -1;
 
-        // Jack-only: worker = слот задачи (0…29 → wood/food/water/zombie 2:1:2:2).
-        if (EnvTrainingConfig.IsJackOnlyTasksMode())
+        // Solo hero: worker = слот задачи.
+        if (EnvTrainingConfig.IsJackOnlyTasksMode()
+            || EnvTrainingConfig.IsLilyOnlyTasksMode()
+            || EnvTrainingConfig.IsGeorgeOnlyTasksMode())
         {
-            const int MaxJackWorker = 63;
-            if (worker > MaxJackWorker)
+            const int MaxSoloWorker = 63;
+            if (worker > MaxSoloWorker)
                 return -1;
             return worker;
         }
@@ -464,7 +466,8 @@ public static class TrainingEnvSpace
     {
         if (copyIndex < 0)
             return false;
-        return EnvTrainingConfig.ResolveAutoTaskForCopyIndex(copyIndex)
+        // Меню 0/1 — не train-слоты JackWoodFoodOnly (там 0…11 = wood).
+        return EnvTrainingConfig.ResolveFixedMenuTaskForCopyIndex(copyIndex)
             == EnvTrainingTask.PresentationFull;
     }
 
@@ -534,6 +537,11 @@ public static class TrainingEnvSpace
         if (clearZombies)
             ZombieSpawner.ClearZombiesInAllEnvs();
 
+        // Фокус до Ensure/ApplyInitialSetup: иначе при JackWoodFoodOnly
+        // ResolveAutoTask(3) = Wood (train-слот), а не JackFood из меню.
+        _debugFocusedCopyIndex = copyIndex;
+        _presentationAgentsFrame = -1;
+
         bool viewOnPresentation = IsPresentationFullViewIndex(copyIndex);
         if (copyIndex > 0 && !viewOnPresentation)
             EnsureSingleTrainEnvCopyForViewing(copyIndex);
@@ -546,9 +554,6 @@ public static class TrainingEnvSpace
             if (presentation != null && !presentation.gameObject.activeSelf)
                 presentation.gameObject.SetActive(true);
         }
-
-        _debugFocusedCopyIndex = copyIndex;
-        _presentationAgentsFrame = -1;
         if (copyIndex >= 0)
         {
             var env = FindEnvByCopyIndex(copyIndex);
@@ -1000,8 +1005,110 @@ public static class TrainingEnvSpace
     {
         if (copyIndex < 0)
             return false;
-        return EnvTrainingConfig.ResolveAutoTaskForCopyIndex(copyIndex)
+        // #env_5 в меню, не train-слот 20–25 при WoodFoodOnly.
+        return EnvTrainingConfig.ResolveFixedMenuTaskForCopyIndex(copyIndex)
             == EnvTrainingTask.JackZombie;
+    }
+
+    /// <summary>
+    /// Lily есть в presentation (даже inactive) — для меню K.
+    /// Не смотреть activeInHierarchy: Jack Food прячет Lily, но пункты меню должны остаться.
+    /// </summary>
+    public static bool HasLilyHeroConfiguredInScene()
+    {
+        var root = PresentationRoot;
+        if (root != null)
+        {
+            var lilies = root.GetComponentsInChildren<LilyScript>(true);
+            for (int i = 0; i < lilies.Length; i++)
+            {
+                var lily = lilies[i];
+                if (lily == null || lily.gameObject.name == "Lily")
+                    continue;
+                if (TwitchEphemeralEffects.IsTwitchClone(lily))
+                    continue;
+                return true;
+            }
+        }
+
+        var all = Object.FindObjectsByType<LilyScript>(FindObjectsInactive.Include, FindObjectsSortMode.None);
+        for (int i = 0; i < all.Length; i++)
+        {
+            var lily = all[i];
+            if (lily == null || lily.gameObject.name == "Lily")
+                continue;
+            if (TwitchEphemeralEffects.IsTwitchClone(lily))
+                continue;
+            return true;
+        }
+        return false;
+    }
+
+    /// <summary>George есть в presentation (даже inactive) — для меню K.</summary>
+    public static bool HasGeorgeHeroConfiguredInScene()
+    {
+        var root = PresentationRoot;
+        if (root != null)
+        {
+            var agents = root.GetComponentsInChildren<AgentGoToHouseDiscrete>(true);
+            for (int i = 0; i < agents.Length; i++)
+            {
+                var agent = agents[i];
+                if (agent == null || !IsGeorgeAgent(agent) || agent.gameObject.name == "George")
+                    continue;
+                if (TwitchEphemeralEffects.IsTwitchClone(agent))
+                    continue;
+                return true;
+            }
+        }
+
+        var all = Object.FindObjectsByType<AgentGoToHouseDiscrete>(
+            FindObjectsInactive.Include, FindObjectsSortMode.None);
+        for (int i = 0; i < all.Length; i++)
+        {
+            var agent = all[i];
+            if (agent == null || !IsGeorgeAgent(agent) || agent.gameObject.name == "George")
+                continue;
+            if (TwitchEphemeralEffects.IsTwitchClone(agent))
+                continue;
+            return true;
+        }
+        return false;
+    }
+
+    /// <summary>Есть активный LilyHero / LilyScript (не legacy «Lily»).</summary>
+    public static bool HasActiveLilyHeroInScene()
+    {
+        var lilies = Object.FindObjectsByType<LilyScript>(FindObjectsInactive.Include, FindObjectsSortMode.None);
+        for (int i = 0; i < lilies.Length; i++)
+        {
+            var lily = lilies[i];
+            if (lily == null || lily.gameObject.name == "Lily")
+                continue;
+            if (TwitchEphemeralEffects.IsTwitchClone(lily))
+                continue;
+            if (lily.gameObject.activeInHierarchy)
+                return true;
+        }
+        return false;
+    }
+
+    /// <summary>Есть активный GeorgeHero (не legacy «George»).</summary>
+    public static bool HasActiveGeorgeHeroInScene()
+    {
+        var agents = Object.FindObjectsByType<AgentGoToHouseDiscrete>(
+            FindObjectsInactive.Include, FindObjectsSortMode.None);
+        for (int i = 0; i < agents.Length; i++)
+        {
+            var agent = agents[i];
+            if (agent == null || !IsGeorgeAgent(agent) || agent.gameObject.name == "George")
+                continue;
+            if (TwitchEphemeralEffects.IsTwitchClone(agent))
+                continue;
+            if (agent.gameObject.activeInHierarchy)
+                return true;
+        }
+        return false;
     }
 
     static void SetCamAbSwitcherEnabled(bool enabled)

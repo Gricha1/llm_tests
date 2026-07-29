@@ -1,6 +1,6 @@
-default_settings: null
+﻿default_settings: null
 behaviors:
-  # Lily вЂ” РѕР±СѓС‡Р°РµС‚СЃСЏ (С†РІРµС‚С‹ + РїРѕС†РµР»СѓР№ Р”Р¶РµРєР°). Р’ Unity: Behavior Type = Default
+  # Lily РІР‚вЂќ Р С•Р В±РЎС“РЎвЂЎР В°Р ВµРЎвЂљРЎРѓРЎРЏ (РЎвЂ Р Р†Р ВµРЎвЂљРЎвЂ№ + Р С—Р С•РЎвЂ Р ВµР В»РЎС“Р в„– Р вЂќР В¶Р ВµР С”Р В°). Р вЂ™ Unity: Behavior Type = Default
   LilyLowLevelAgent:
     trainer_type: ppo
     hyperparameters:
@@ -12,12 +12,12 @@ behaviors:
       lambd: 0.95
       num_epoch: 3
       shared_critic: false
-      learning_rate_schedule: linear
+      learning_rate_schedule: constant
       beta_schedule: linear
       epsilon_schedule: linear
-    checkpoint_interval: 5000  # НЕ МЕНЯТЬ: стрим ждёт .onnx каждые N шагов
+    checkpoint_interval: 5000  # РќР• РњР•РќРЇРўР¬: СЃС‚СЂРёРј Р¶РґС‘С‚ .onnx РєР°Р¶РґС‹Рµ N С€Р°РіРѕРІ
     network_settings:
-      normalize: false
+      normalize: true
       hidden_units: 256
       num_layers: 3
       vis_encode_type: simple
@@ -27,9 +27,9 @@ behaviors:
     reward_signals:
       extrinsic:
         gamma: 0.99
-        strength: 1.0
+        strength: 0.001
         network_settings:
-          normalize: false
+          normalize: true
           hidden_units: 256
           num_layers: 3
           vis_encode_type: simple
@@ -37,9 +37,9 @@ behaviors:
           goal_conditioning_type: hyper
           deterministic: false
     init_path: null
-    keep_checkpoints: 5  # НЕ МЕНЯТЬ: 0 сразу удаляет .onnx после записи
+    keep_checkpoints: 5  # РќР• РњР•РќРЇРўР¬: 0 СЃСЂР°Р·Сѓ СѓРґР°Р»СЏРµС‚ .onnx РїРѕСЃР»Рµ Р·Р°РїРёСЃРё
     even_checkpoints: false
-    max_steps: 50000000
+    max_steps: 10000000  # betaв†’0 Рє 10M; LR constant
     time_horizon: 256
     summary_freq: 50000
     threaded: false

@@ -515,7 +515,7 @@ public sealed class TrainingMetricsBurstOverlay : MonoBehaviour
             case EnvTrainingTask.JackWater:
             case EnvTrainingTask.LilyWater:
             case EnvTrainingTask.GeorgeWater: return "Water";
-            case EnvTrainingTask.JackZombie: return "Zombie";
+            case EnvTrainingTask.JackZombie: return "ZombieCount";
             case EnvTrainingTask.LilyHeat:
             case EnvTrainingTask.GeorgeHeat: return "Fire";
             case EnvTrainingTask.LilyFlower: return "Flower";

@@ -138,8 +138,11 @@ public class LilyScript : Agent, IHasHp
     [SerializeField] private string doActionAnimTrigger = "Do";
     [Tooltip("Пауза между срабатываниями DO (сбор цветка или поцелуй).")]
     [SerializeField] private float collectActionCooldownSeconds = 0.45f;
-    [Tooltip("Штраф за DO не рядом с целью (цветок/овца/вода/зомби/человек).")]
+    [Tooltip("Штраф за DO не рядом с целью. Stage1=выкл; Stage2 (-forestLilyStage2)=−5.")]
     [SerializeField] private float emptyDoActionPenalty = -5f;
+    [SerializeField] private bool applyEmptyDoActionPenalty = false;
+    [Tooltip("Stage2: штраф за шаг назад в food/water/heat/flower.")]
+    [SerializeField] private float backwardWalkPenalty = -0.5f;
     [Tooltip("Сглаживание параметра Speed в Animator (0 = без сглаживания).")]
     [SerializeField] private float walkAnimSpeedDamp = 0f;
     private int _lastCollectAction;
@@ -306,7 +309,14 @@ public class LilyScript : Agent, IHasHp
         // Как у Jack: не снимаем HP с агента за его же DO (старые значения в сцене).
         damageOnDoIfZombieNearby = false;
         zombieDamageOnDo = 0;
+        // Food/water как у Jack: +10 овца, +8 вода. Stage2 — emptyDO / назад.
+        sheepEatReward = 10f;
+        waterCollectReward = 8f;
         emptyDoActionPenalty = -5f;
+        backwardWalkPenalty = -0.5f;
+        applyEmptyDoActionPenalty = EnvTrainingConfig.IsLilyStage2PenaltiesMode();
+        if (applyEmptyDoActionPenalty)
+            Debug.Log($"[{name}] Lily Stage2: emptyDO={emptyDoActionPenalty}, backWalk={backwardWalkPenalty}");
         collectDistance = Mathf.Clamp(collectDistance, 0.5f, 2.5f);
         freezePenaltyPerTick = -0.5f;
         hungerPenaltyPerTick = -0.5f;
@@ -1287,7 +1297,7 @@ public class LilyScript : Agent, IHasHp
             if (knockbackZombieOnDo)
                 KnockbackNearbyZombiesOnLilyDo();
 
-            if (emptyDoActionPenalty < 0f && !IsNearAnyDoInteractable())
+            if (applyEmptyDoActionPenalty && emptyDoActionPenalty < 0f && !IsNearAnyDoInteractable())
                 AddReward(emptyDoActionPenalty);
 
             if (TryCollectWater())
@@ -1319,6 +1329,15 @@ public class LilyScript : Agent, IHasHp
         float moveInput = 0f;
         if (moveAction == 1) moveInput = 1f;
         else if (moveAction == 0) moveInput = -1f;
+
+        // Stage2: штраф за ходьбу назад (food/water/heat/flower).
+        if (EnvTrainingConfig.IsLilyStage2PenaltiesMode()
+            && IsLilySimpleTraining
+            && moveInput < 0f
+            && backwardWalkPenalty < 0f)
+        {
+            AddReward(backwardWalkPenalty);
+        }
 
         float rotateInput = 0f;
         if (rotateAction == 0) rotateInput = -1f;

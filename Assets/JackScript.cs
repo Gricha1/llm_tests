@@ -311,6 +311,10 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     /// <summary>WoodOnly: полный цикл сдача дров + heat ≥ 15.</summary>
     bool _woodOnlyCompletedCycle;
     const int WoodOnlyHeatGoal = 20;
+    /// <summary>Разова бонус за первую сдачу ≥maxWood в эпизоде (иначе сеть только рубит).</summary>
+    const float WoodOnlyDeliverBonus = 15f;
+    /// <summary>За тик прогрева у костра в WoodOnly (heat&lt;20). Раньше 3 — слабее +10 за рубку.</summary>
+    const float WoodOnlyWarmTickReward = 8f;
     static int _globalManualKeysFrame = -1;
 
     // Отслеживание наград для каждой опции
@@ -326,7 +330,10 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     public int maxWoodPublic => maxWood;
     public int MaxWood => maxWood;
     public bool IsWoodGatherGoalReached => wood >= maxWood;
+    /// <summary>Полный цикл: сдал ≥maxWood и heat ≥ 20.</summary>
     public bool HasCompletedWoodDeliveryGoal => _woodOnlyCompletedCycle;
+    /// <summary>Срубил ≥maxWood и сжёг у дома (без прогрева).</summary>
+    public bool HasDeliveredWoodBurnGoal => _episodeWoodDeliveredGoal;
     public int maxHeatPublic => maxHeat;
     public int maxSatietyPublic => maxSatiety;
     public Transform houseTargetPublic => houseTarget;
@@ -365,6 +372,11 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     bool IsWoodFoodSwitchMode => _resolvedTrainingMode == JackTrainingMode.WoodFoodSwitch;
     bool IsOptionSwitchTrainingMode => IsFullTrainingMode || IsWoodFoodSwitchMode;
     bool IsZombieTrainingMode => _resolvedTrainingMode == JackTrainingMode.ZombieOnly;
+    /// <summary>Wood/Food/Water: в Stage2 штраф за ходьбу назад (зомби — нет, отступление полезно).</summary>
+    bool IsBackwardWalkPenaltyTask =>
+        _resolvedTrainingMode == JackTrainingMode.WoodOnly
+        || _resolvedTrainingMode == JackTrainingMode.FoodOnly
+        || _resolvedTrainingMode == JackTrainingMode.WaterOnly;
     bool IsSimpleTrainingMode =>
         _resolvedTrainingMode == JackTrainingMode.WoodOnly
         || _resolvedTrainingMode == JackTrainingMode.FoodOnly
@@ -422,10 +434,12 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     [SerializeField] private string doActionAnimTrigger = "Do";
     [Tooltip("Минимум секунд между срабатываниями DO (анимация + попытка добычи).")]
     [SerializeField] private float doActionCooldownSeconds = 0.45f;
-    [Tooltip("Если true — штраф emptyDoActionPenalty за DO не у цели. Для обучения wood/food пока false.")]
+    [Tooltip("Если true — штраф emptyDoActionPenalty за DO не у цели. Stage1=false; Stage2 (-forestJackStage2)=true.")]
     [SerializeField] private bool applyEmptyDoActionPenalty = false;
     [Tooltip("Штраф за DO не рядом с целью (дерево/овца/вода/зомби/человек). −5 отучает спамить DO в пустоту.")]
     [SerializeField] private float emptyDoActionPenalty = -5f;
+    [Tooltip("Stage2: штраф за шаг назад в Wood/Food/Water (не в Zombie). 0 = выкл.")]
+    [SerializeField] private float backwardWalkPenalty = -0.5f;
     [Tooltip("Сглаживание параметра Speed в Animator (0 = без сглаживания — быстрее включение walk).")]
     [SerializeField] private float walkAnimSpeedDamp = 0f;
     private int _lastChopActionForAnim;
@@ -490,9 +504,14 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         // Никогда не снимаем HP Джеку за его собственное DO (даже если в инспекторе остались старые сериализованные значения).
         damageOnDoIfZombieNearby = false;
         zombieDamageOnDo = 0;
-        // Величину штрафа оставляем; включение — applyEmptyDoActionPenalty (сейчас false для train).
+        // Stage1: штрафы выкл. Stage2 Jack/George: пустой DO + ходьба назад.
         emptyDoActionPenalty = -5f;
-        applyEmptyDoActionPenalty = false;
+        backwardWalkPenalty = -0.5f;
+        bool stage2 = EnvTrainingConfig.IsJackStage2PenaltiesMode()
+            || (UsesGeorgeSurvivalOptions && EnvTrainingConfig.IsGeorgeStage2PenaltiesMode());
+        applyEmptyDoActionPenalty = stage2;
+        if (applyEmptyDoActionPenalty)
+            Debug.Log($"[{name}] Stage2: emptyDO={emptyDoActionPenalty}, backWalk={backwardWalkPenalty}");
 
         if (zombieLayer.value == 0)
         {
@@ -2423,6 +2442,28 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
 
         currentStepReward = 0f; // сбрасываем награду за шаг
 
+        // Stage2: штраф за ходьбу назад (Jack: wood/food/water; George: food/water/heat).
+        bool backPenalty = false;
+        if (UsesGeorgeSurvivalOptions)
+        {
+            backPenalty = EnvTrainingConfig.IsGeorgeStage2PenaltiesMode()
+                && _trainingConfig != null
+                && _trainingConfig.IsGeorgeSimpleTask();
+        }
+        else
+        {
+            backPenalty = EnvTrainingConfig.IsJackStage2PenaltiesMode()
+                && IsBackwardWalkPenaltyTask;
+        }
+
+        if (backPenalty
+            && moveInput < 0f
+            && backwardWalkPenalty < 0f)
+        {
+            AddReward(backwardWalkPenalty);
+            currentStepReward += backwardWalkPenalty;
+        }
+
         // Добыча: нарастающий фронт DO + кулдаун; только цель текущей опции; дистанция по коллайдеру.
         bool choppedTree = false;
         bool gainedWoodFromChop = false;
@@ -2832,9 +2873,23 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
             var task = _trainingConfig.ResolveTask();
             if (TrainingTaskSuccessTracker.ShouldTrack(task))
             {
-                bool success = TrainingTaskSuccessTracker.EvaluateJackSuccess(
-                    task, this, _episodeSheepEaten, _episodeZombiesKilled);
-                TrainingTaskSuccessTracker.Record(task, success);
+                if (task == EnvTrainingTask.JackZombie)
+                {
+                    TrainingTaskSuccessTracker.RecordValue(task, _episodeZombiesKilled);
+                }
+                else
+                {
+                    bool success = TrainingTaskSuccessTracker.EvaluateJackSuccess(
+                        task, this, _episodeSheepEaten, _episodeZombiesKilled);
+                    TrainingTaskSuccessTracker.Record(task, success);
+                    if (task == EnvTrainingTask.JackWood)
+                    {
+                        TrainingTaskSuccessTracker.RecordMetric(
+                            TrainingTaskSuccessTracker.Metric.WoodDeliver,
+                            HasDeliveredWoodBurnGoal,
+                            task);
+                    }
+                }
             }
         }
 
@@ -2850,7 +2905,23 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
 
         var task = _trainingConfig.ResolveTask();
         if (TrainingTaskSuccessTracker.ShouldTrack(task))
-            TrainingTaskSuccessTracker.Record(task, false);
+        {
+            if (task == EnvTrainingTask.JackZombie)
+            {
+                TrainingTaskSuccessTracker.RecordValue(task, _episodeZombiesKilled);
+            }
+            else
+            {
+                TrainingTaskSuccessTracker.Record(task, false);
+                if (task == EnvTrainingTask.JackWood)
+                {
+                    TrainingTaskSuccessTracker.RecordMetric(
+                        TrainingTaskSuccessTracker.Metric.WoodDeliver,
+                        HasDeliveredWoodBurnGoal,
+                        task);
+                }
+            }
+        }
     }
 
     float GetSimpleEpisodeTimeoutSeconds()
@@ -3889,7 +3960,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
                         heat = Mathf.Min(maxHeat, heat + heatPerWood);
                     if (woodOnlyWarm || jackWoodReward)
                     {
-                        float reward = woodOnlyWarm ? 3.0f : 5.0f;
+                        float reward = woodOnlyWarm ? WoodOnlyWarmTickReward : 5.0f;
                         AddReward(reward);
                         FloatingRewardPopup.ShowWarmedUp(transform, reward);
                         currentStepReward += reward;
@@ -3928,7 +3999,18 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         ResolveCampfireVfxReference();
 
         if (_resolvedTrainingMode == JackTrainingMode.WoodOnly && wood >= maxWood)
-            _episodeWoodDeliveredGoal = true;
+        {
+            if (!_episodeWoodDeliveredGoal)
+            {
+                _episodeWoodDeliveredGoal = true;
+                // Без бонуса за сдачу сеть предпочитает снова рубить (+10), а не греться (+3).
+                AddReward(WoodOnlyDeliverBonus);
+                FloatingRewardPopup.ShowGotWood(transform, WoodOnlyDeliverBonus);
+                currentStepReward += WoodOnlyDeliverBonus;
+                accumulatedRewardForOption0 += WoodOnlyDeliverBonus;
+                lastRewardForOption0 = accumulatedRewardForOption0;
+            }
+        }
 
         _campfireBurnSecondsRemaining += wood * burnInterval * burnDurationMultiplier;
         wood = 0;

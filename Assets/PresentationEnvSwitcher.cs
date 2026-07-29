@@ -128,12 +128,18 @@ public sealed class PresentationEnvSwitcher : MonoBehaviour
             return;
 
         EnsureStyles();
-        // Все 13 пунктов без слайдера; ниже 3 HP-баров (Гера — нижний ряд).
+        // Высота по видимым пунктам (Jack-only — без Lily/George).
         const float HpBarsClearance = 190f;
         const float RowH = 20f;
         const float TitleH = 24f;
         const float Pad = 10f;
-        float contentH = TitleH + Pad + (MaxSelectableCopyIndex + 1) * RowH;
+        int visible = 0;
+        for (int i = 0; i <= MaxSelectableCopyIndex; i++)
+        {
+            if (IsMenuEntryAvailable(i))
+                visible++;
+        }
+        float contentH = TitleH + Pad + Mathf.Max(1, visible) * RowH;
         _windowRect.width = 220f;
         _windowRect.height = contentH;
         _windowRect.x = Mathf.Clamp(_windowRect.x, 0f, Screen.width - 48f);
@@ -153,12 +159,61 @@ public sealed class PresentationEnvSwitcher : MonoBehaviour
     {
         for (int i = 0; i <= MaxSelectableCopyIndex; i++)
         {
+            if (!IsMenuEntryAvailable(i))
+                continue;
             bool active = TrainingEnvSpace.IsDebugEnvFocusActive
                 && TrainingEnvSpace.DebugFocusedCopyIndex == i;
             DrawEnvButton(TaskLabels[i], i, active);
         }
         GUI.DragWindow(new Rect(0f, 0f, 10000f, 18f));
     }
+
+    /// <summary>
+    /// Jack-only / Lily-only / George-only — в меню только задачи этого героя.
+    /// </summary>
+    static bool IsMenuEntryAvailable(int copyIndex)
+    {
+        var task = EnvTrainingConfig.ResolveFixedMenuTaskForCopyIndex(copyIndex);
+
+        if (EnvTrainingConfig.IsJackOnlyTasksMode())
+        {
+            return task == EnvTrainingTask.JackWood
+                || task == EnvTrainingTask.JackFood
+                || task == EnvTrainingTask.JackWater
+                || task == EnvTrainingTask.JackZombie
+                || task == EnvTrainingTask.PresentationFull;
+        }
+
+        if (EnvTrainingConfig.IsLilyOnlyTasksMode())
+            return IsLilyMenuTask(task);
+
+        if (EnvTrainingConfig.IsGeorgeOnlyTasksMode())
+            return IsGeorgeMenuTask(task);
+
+        if (task == EnvTrainingTask.PresentationFull
+            || task == EnvTrainingTask.JackWood
+            || task == EnvTrainingTask.JackFood
+            || task == EnvTrainingTask.JackWater
+            || task == EnvTrainingTask.JackZombie)
+            return true;
+
+        if (IsLilyMenuTask(task))
+            return TrainingEnvSpace.HasLilyHeroConfiguredInScene();
+        if (IsGeorgeMenuTask(task))
+            return TrainingEnvSpace.HasGeorgeHeroConfiguredInScene();
+        return true;
+    }
+
+    static bool IsLilyMenuTask(EnvTrainingTask task) =>
+        task == EnvTrainingTask.LilyFood
+        || task == EnvTrainingTask.LilyWater
+        || task == EnvTrainingTask.LilyHeat
+        || task == EnvTrainingTask.LilyFlower;
+
+    static bool IsGeorgeMenuTask(EnvTrainingTask task) =>
+        task == EnvTrainingTask.GeorgeFood
+        || task == EnvTrainingTask.GeorgeWater
+        || task == EnvTrainingTask.GeorgeHeat;
 
     void DrawEnvButton(string label, int copyIndex, bool active)
     {
@@ -174,9 +229,14 @@ public sealed class PresentationEnvSwitcher : MonoBehaviour
             Debug.LogWarning($"[EnvSwitcher] среда {copyIndex} вне диапазона 0–{MaxSelectableCopyIndex}");
             return;
         }
+        if (!IsMenuEntryAvailable(copyIndex))
+        {
+            Debug.LogWarning($"[EnvSwitcher] среда {copyIndex} недоступна (нет героя / Jack-only)");
+            return;
+        }
 
         TrainingEnvSpace.SetDebugFocusedEnv(copyIndex);
-        var task = EnvTrainingConfig.ResolveAutoTaskForCopyIndex(copyIndex);
+        var task = EnvTrainingConfig.ResolveFixedMenuTaskForCopyIndex(copyIndex);
         var mode = task switch
         {
             EnvTrainingTask.JackWood => "режим=WoodOnly: 10 дров → дом → греться (heat<20) → снова рубить (одна опция дерево)",

@@ -1,8 +1,8 @@
-# Jack + Lily + George: РѕРґРЅРѕРІСЂРµРјРµРЅРЅРѕРµ РѕР±СѓС‡РµРЅРёРµ С‚СЂС‘С… РїРѕР»РёС‚РёРє РІ РѕРґРЅРѕР№ СЃС†РµРЅРµ.
-# Р’ Unity Сѓ РєР°Р¶РґРѕРіРѕ Р°РіРµРЅС‚Р° Behavior Name:
+﻿# Jack + Lily + George: Р С•Р Т‘Р Р…Р С•Р Р†РЎР‚Р ВµР СР ВµР Р…Р Р…Р С•Р Вµ Р С•Р В±РЎС“РЎвЂЎР ВµР Р…Р С‘Р Вµ РЎвЂљРЎР‚РЎвЂРЎвЂ¦ Р С—Р С•Р В»Р С‘РЎвЂљР С‘Р С” Р Р† Р С•Р Т‘Р Р…Р С•Р в„– РЎРѓРЎвЂ Р ВµР Р…Р Вµ.
+# Р вЂ™ Unity РЎС“ Р С”Р В°Р В¶Р Т‘Р С•Р С–Р С• Р В°Р С–Р ВµР Р…РЎвЂљР В° Behavior Name:
 #   JackLowLevelAgent, LilyLowLevelAgent, GeorgeLowLevelAgent (Behavior Type = Default).
 #
-# Р—Р°РїСѓСЃРє:
+# Р вЂ”Р В°Р С—РЎС“РЎРѓР С”:
 #   bash train_jack_lily_george.bash
 
 default_settings: null
@@ -18,12 +18,12 @@ behaviors:
       lambd: 0.95
       num_epoch: 3
       shared_critic: false
-      learning_rate_schedule: linear
+      learning_rate_schedule: constant
       beta_schedule: linear
       epsilon_schedule: linear
-    checkpoint_interval: 5000  # НЕ МЕНЯТЬ: стрим ждёт .onnx каждые N шагов
+    checkpoint_interval: 5000  # РќР• РњР•РќРЇРўР¬: СЃС‚СЂРёРј Р¶РґС‘С‚ .onnx РєР°Р¶РґС‹Рµ N С€Р°РіРѕРІ
     network_settings:
-      normalize: false
+      normalize: true
       hidden_units: 256
       num_layers: 3
       vis_encode_type: simple
@@ -33,9 +33,9 @@ behaviors:
     reward_signals:
       extrinsic:
         gamma: 0.99
-        strength: 1.0
+        strength: 0.001
         network_settings:
-          normalize: false
+          normalize: true
           hidden_units: 256
           num_layers: 3
           vis_encode_type: simple
@@ -43,9 +43,9 @@ behaviors:
           goal_conditioning_type: hyper
           deterministic: false
     init_path: null
-    keep_checkpoints: 5  # НЕ МЕНЯТЬ: 0 сразу удаляет .onnx после записи
+    keep_checkpoints: 5  # РќР• РњР•РќРЇРўР¬: 0 СЃСЂР°Р·Сѓ СѓРґР°Р»СЏРµС‚ .onnx РїРѕСЃР»Рµ Р·Р°РїРёСЃРё
     even_checkpoints: false
-    max_steps: 20000000
+    max_steps: 10000000  # betaв†’0 Рє 10M; LR constant
     time_horizon: 256
     summary_freq: 50000
     threaded: false
@@ -63,12 +63,12 @@ behaviors:
       lambd: 0.95
       num_epoch: 3
       shared_critic: false
-      learning_rate_schedule: linear
+      learning_rate_schedule: constant
       beta_schedule: linear
       epsilon_schedule: linear
-    checkpoint_interval: 5000  # НЕ МЕНЯТЬ: стрим ждёт .onnx каждые N шагов
+    checkpoint_interval: 5000  # РќР• РњР•РќРЇРўР¬: СЃС‚СЂРёРј Р¶РґС‘С‚ .onnx РєР°Р¶РґС‹Рµ N С€Р°РіРѕРІ
     network_settings:
-      normalize: false
+      normalize: true
       hidden_units: 256
       num_layers: 3
       vis_encode_type: simple
@@ -78,9 +78,9 @@ behaviors:
     reward_signals:
       extrinsic:
         gamma: 0.99
-        strength: 1.0
+        strength: 0.001
         network_settings:
-          normalize: false
+          normalize: true
           hidden_units: 256
           num_layers: 3
           vis_encode_type: simple
@@ -88,9 +88,9 @@ behaviors:
           goal_conditioning_type: hyper
           deterministic: false
     init_path: null
-    keep_checkpoints: 5  # НЕ МЕНЯТЬ: 0 сразу удаляет .onnx после записи
+    keep_checkpoints: 5  # РќР• РњР•РќРЇРўР¬: 0 СЃСЂР°Р·Сѓ СѓРґР°Р»СЏРµС‚ .onnx РїРѕСЃР»Рµ Р·Р°РїРёСЃРё
     even_checkpoints: false
-    max_steps: 50000000
+    max_steps: 10000000  # betaв†’0 Рє 10M; LR constant
     time_horizon: 256
     summary_freq: 50000
     threaded: false
@@ -108,12 +108,12 @@ behaviors:
       lambd: 0.95
       num_epoch: 3
       shared_critic: false
-      learning_rate_schedule: linear
+      learning_rate_schedule: constant
       beta_schedule: linear
       epsilon_schedule: linear
-    checkpoint_interval: 5000  # НЕ МЕНЯТЬ: стрим ждёт .onnx каждые N шагов
+    checkpoint_interval: 5000  # РќР• РњР•РќРЇРўР¬: СЃС‚СЂРёРј Р¶РґС‘С‚ .onnx РєР°Р¶РґС‹Рµ N С€Р°РіРѕРІ
     network_settings:
-      normalize: false
+      normalize: true
       hidden_units: 256
       num_layers: 3
       vis_encode_type: simple
@@ -123,9 +123,9 @@ behaviors:
     reward_signals:
       extrinsic:
         gamma: 0.99
-        strength: 1.0
+        strength: 0.001
         network_settings:
-          normalize: false
+          normalize: true
           hidden_units: 256
           num_layers: 3
           vis_encode_type: simple
@@ -133,9 +133,9 @@ behaviors:
           goal_conditioning_type: hyper
           deterministic: false
     init_path: null
-    keep_checkpoints: 5  # НЕ МЕНЯТЬ: 0 сразу удаляет .onnx после записи
+    keep_checkpoints: 5  # РќР• РњР•РќРЇРўР¬: 0 СЃСЂР°Р·Сѓ СѓРґР°Р»СЏРµС‚ .onnx РїРѕСЃР»Рµ Р·Р°РїРёСЃРё
     even_checkpoints: false
-    max_steps: 20000000
+    max_steps: 10000000  # betaв†’0 Рє 10M; LR constant
     time_horizon: 256
     summary_freq: 50000
     threaded: false
