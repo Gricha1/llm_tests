@@ -181,6 +181,9 @@ public class TreeSpawner : MonoBehaviour
         Debug.LogWarning(
             $"[TreeSpawner] watchdog: деревьев {alive}/{treeCount} (min={need}), полный сброс",
             this);
+        PresentationWorldSnapshotLogger.Note(
+            "tree_watchdog_reset",
+            $"alive={alive}/{treeCount} min={need} env={(_envRoot != null ? _envRoot.name : "?")}");
         ResetTrees();
         failedRefillTicks = 0;
     }
@@ -392,6 +395,9 @@ public class TreeSpawner : MonoBehaviour
         Debug.LogWarning(
             $"[TreeSpawner] {reason}: {trees.Count}<{minAliveTrees} — ResetTrees",
             this);
+        PresentationWorldSnapshotLogger.Note(
+            "tree_min_reset",
+            $"{reason} alive={trees.Count} min={minAliveTrees}");
         ResetTrees();
     }
 

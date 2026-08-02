@@ -267,8 +267,7 @@ public static class TrainingEnvSpace
 
         if (_presentationWorkerZero)
         {
-            // Train: worker 0 = PresentationFull (как стрим), 1 = PresentationFull train,
-            // 2–12 = узкие, 13+ = фиксированный буст.
+            // Train: worker 0–9 = PresentationFull×10, 10–13 Jack, 14–17 Lily, 18–20 George.
             // Stream — отдельный процесс (не в num-envs).
             const int MaxTrainWorker = 63;
             if (worker < 0 || worker > MaxTrainWorker)
@@ -437,7 +436,7 @@ public static class TrainingEnvSpace
 
     public static int DebugFocusedCopyIndex => _debugFocusedCopyIndex;
 
-    /// <summary>Меню K смотрит JackZombie (#env_5) — домовые спавнеры могут досыпать.</summary>
+    /// <summary>Меню K смотрит JackZombie (мульти #env_5 / Jack-only #env_4).</summary>
     public static bool IsJackZombieDebugFocus =>
         IsDebugEnvFocusActive && IsJackZombieCopyIndex(_debugFocusedCopyIndex);
 
@@ -454,7 +453,7 @@ public static class TrainingEnvSpace
         if (copyIndex <= 0)
             return PresentationRoot;
 
-        // Env 1 = PresentationFull — тот же мир, что Env 0. Клон только жрёт FPS.
+        // Мультигерой: Env 1 = PresentationFull без клона. Jack-only: Env 1 = дрова.
         if (IsPresentationFullViewIndex(copyIndex))
             return PresentationRoot;
 
@@ -467,7 +466,7 @@ public static class TrainingEnvSpace
         if (copyIndex < 0)
             return false;
         // Меню 0/1 — не train-слоты JackWoodFoodOnly (там 0…11 = wood).
-        return EnvTrainingConfig.ResolveFixedMenuTaskForCopyIndex(copyIndex)
+        return EnvTrainingConfig.ResolveActiveMenuTaskForCopyIndex(copyIndex)
             == EnvTrainingTask.PresentationFull;
     }
 
@@ -847,11 +846,15 @@ public static class TrainingEnvSpace
         return FindPresentationJack();
     }
 
-    /// <summary>Звук только на env 0 (валидация/стрим). Headless train — никогда.</summary>
+    /// <summary>Звук на presentation (стрим/validate/env 0). Headless train — никогда.</summary>
     public static bool WantAudioForFocusedEnv()
     {
         if (IsHeadlessTrainWorkerProcess)
             return false;
+        // Stream + validate: mlagents communicator включён, но это не «тихий train».
+        // Иначе GameSfx (дрова/шаги) молчат, а CampfireLoopAudio (без этого гейта) играет.
+        if (IsStreamOnlyMode || IsValidateOrInferenceMode)
+            return true;
         return _debugFocusedCopyIndex == 0
             || (_debugFocusedCopyIndex < 0 && !IsMlAgentsTrainingActive());
     }
@@ -994,7 +997,16 @@ public static class TrainingEnvSpace
 
         var task = cfg.ResolveTask();
         if (task == EnvTrainingTask.PresentationFull || task == EnvTrainingTask.Auto)
+        {
+            // Solo validate: HUD только активного героя (не Лили/Гера у Jack-only).
+            if (EnvTrainingConfig.IsJackOnlyTasksMode())
+                return role == EnvTrainingAgentRole.Jack;
+            if (EnvTrainingConfig.IsLilyOnlyTasksMode())
+                return role == EnvTrainingAgentRole.Lily;
+            if (EnvTrainingConfig.IsGeorgeOnlyTasksMode())
+                return role == EnvTrainingAgentRole.George;
             return true;
+        }
 
         return EnvTrainingConfig.ShouldAgentTrain(task, role);
     }
@@ -1005,8 +1017,8 @@ public static class TrainingEnvSpace
     {
         if (copyIndex < 0)
             return false;
-        // #env_5 в меню, не train-слот 20–25 при WoodFoodOnly.
-        return EnvTrainingConfig.ResolveFixedMenuTaskForCopyIndex(copyIndex)
+        // Меню: Jack-only #env_4, иначе #env_5 — не train-слот WoodFoodOnly.
+        return EnvTrainingConfig.ResolveActiveMenuTaskForCopyIndex(copyIndex)
             == EnvTrainingTask.JackZombie;
     }
 
@@ -1155,10 +1167,105 @@ public static class TrainingEnvSpace
         _presentationRoot = null;
         ApplyEnvRunMode();
         _parallelEnvsVisible = IsShowParallelEnvsRequested();
+        TryApplyValidateTaskFocus();
         ApplyParallelEnvPresentation();
         ApplyTrainProcessSilence();
         EnsureTrainingConfigs();
         EnsureEnvLocalHierarchyComponents();
+    }
+
+    /// <summary>
+    /// Validate UI / CLI: -forestValidateTask wood|food|water|zombie|stream
+    /// Ставит фокус меню K на нужную задачу (Jack-only: 0..4).
+    /// </summary>
+    static void TryApplyValidateTaskFocus()
+    {
+        string task = ReadValidateTaskFromArgs();
+        if (string.IsNullOrEmpty(task))
+            return;
+
+        int idx = MapValidateTaskToMenuIndex(task);
+        if (idx < 0)
+        {
+            Debug.LogWarning($"[TrainingEnvSpace] неизвестный -forestValidateTask={task}");
+            return;
+        }
+
+        Debug.Log($"[TrainingEnvSpace] validateTask={task} → debugFocus={idx}");
+        if (IsEnvViewSwitcherAllowed())
+            SetDebugFocusedEnv(idx);
+        else
+            _debugFocusedCopyIndex = idx;
+    }
+
+    static string ReadValidateTaskFromArgs()
+    {
+        var args = System.Environment.GetCommandLineArgs();
+        for (int i = 0; i < args.Length; i++)
+        {
+            string a = args[i];
+            if (a == "-forestValidateTask" || a == "--forest-validate-task")
+            {
+                if (i + 1 < args.Length)
+                    return args[i + 1].Trim().ToLowerInvariant();
+            }
+            const string prefix = "-forestValidateTask=";
+            const string prefix2 = "--forest-validate-task=";
+            if (a.StartsWith(prefix, System.StringComparison.OrdinalIgnoreCase))
+                return a.Substring(prefix.Length).Trim().ToLowerInvariant();
+            if (a.StartsWith(prefix2, System.StringComparison.OrdinalIgnoreCase))
+                return a.Substring(prefix2.Length).Trim().ToLowerInvariant();
+        }
+        return null;
+    }
+
+    static int MapValidateTaskToMenuIndex(string task)
+    {
+        // Solo-меню: 0 = стрим, дальше узкие задачи выбранного героя.
+        bool jackOnly = EnvTrainingConfig.IsJackOnlyTasksMode();
+        bool lilyOnly = EnvTrainingConfig.IsLilyOnlyTasksMode();
+        bool georgeOnly = EnvTrainingConfig.IsGeorgeOnlyTasksMode();
+        switch (task)
+        {
+            case "stream":
+            case "full":
+            case "presentation":
+                return 0;
+            case "wood":
+            case "tree":
+            case "jackwood":
+                return jackOnly ? 1 : 2;
+            case "food":
+            case "sheep":
+            case "jackfood":
+                if (lilyOnly || georgeOnly)
+                    return 1;
+                return jackOnly ? 2 : 3;
+            case "water":
+            case "jackwater":
+                if (lilyOnly || georgeOnly)
+                    return 2;
+                return jackOnly ? 3 : 4;
+            case "zombie":
+            case "jackzombie":
+                return jackOnly ? 4 : 5;
+            case "heat":
+            case "fire":
+            case "lilyheat":
+            case "georgeheat":
+                if (lilyOnly)
+                    return 3;
+                if (georgeOnly)
+                    return 3;
+                return -1;
+            case "flower":
+            case "lilyflower":
+                return lilyOnly ? 4 : -1;
+            default:
+                if (int.TryParse(task, out int n) && n >= 0 && n <= 20)
+                    return n;
+                return -1;
+        }
     }
 
     static void ApplyTrainProcessSilence()
@@ -1307,6 +1414,28 @@ public static class TrainingEnvSpace
         return envRoot == PresentationRoot && !IsMlAgentsTrainingActive();
     }
 
+    /// <summary>
+    /// Смягчение нужд только на стрим/ручной presentation — не на train (в т.ч. PresentationFull train).
+    /// Ресурсы ×2 дольше, HP от голода/жажды/холода ×2 реже, тепло у костра ×2 быстрее.
+    /// </summary>
+    public static bool UsesStreamPresentationSurvivalPace(Transform agent)
+    {
+        if (agent == null || IsHeadlessTrainWorkerProcess)
+            return false;
+        // Train с communicator: даже если Env = PresentationRoot / PresentationFull — не трогаем темп.
+        if (IsMlAgentsTrainingActive() && !IsStreamOnlyMode && !IsValidateOrInferenceMode)
+            return false;
+        return IsPresentationTransform(agent);
+    }
+
+    public const float StreamPresentationNeedsDecayIntervalMul = 2f;
+    public const float StreamPresentationHpDamageIntervalMul = 2f;
+    public const float StreamPresentationWarmthGainIntervalMul = 0.5f;
+    /// <summary>Jack на стриме греется почти сразу у костра — политика не умеет ждать.</summary>
+    public const float StreamPresentationJackWarmthGainIntervalMul = 0.06f;
+    public const int StreamPresentationJackWarmthPerTick = 5;
+    public const int StreamPresentationJackWarmthOnDeposit = 10;
+
     public static bool IsPresentationEnv(Transform envRoot) =>
         envRoot != null && envRoot == PresentationRoot;
 
@@ -1396,6 +1525,10 @@ public static class TrainingEnvSpace
         if ((IsTrainCopiesOnlyMode || IsSingleEnvByPortMode) && !IsPresentationWorkerProcess)
             return false;
 
+        // Стрим/validate: SFX всегда (даже если source=null или вне presentation).
+        if (IsStreamOnlyMode || IsValidateOrInferenceMode)
+            return true;
+
         var presentationRoot = PresentationRoot;
         if (presentationRoot == null)
             return true;
@@ -1457,6 +1590,19 @@ public static class TrainingEnvSpace
             var anyJack = Object.FindFirstObjectByType<AgentGoToHouseDiscrete>();
             if (anyJack != null && !IsGeorgeAgent(anyJack))
                 _cachedFallbackJack = anyJack;
+
+            // Раньше George здесь не искали → FindPresentationGeorge()=null → Reward EMA пустой.
+            var all = Object.FindObjectsByType<AgentGoToHouseDiscrete>(
+                FindObjectsInactive.Exclude, FindObjectsSortMode.None);
+            for (int i = 0; i < all.Length; i++)
+            {
+                if (all[i] != null && IsGeorgeAgent(all[i]))
+                {
+                    _cachedGeorge = all[i];
+                    if (all[i].gameObject.name.IndexOf("Hero", System.StringComparison.OrdinalIgnoreCase) >= 0)
+                        break;
+                }
+            }
             return;
         }
 
@@ -1502,10 +1648,9 @@ public static class TrainingEnvSpace
             if (agent == null || !IsGeorgeAgent(agent))
                 continue;
 
-            if (agent.gameObject.name == "GeorgeHero" && agent.gameObject.activeInHierarchy)
+            bool isHero = agent.gameObject.name.IndexOf("Hero", System.StringComparison.OrdinalIgnoreCase) >= 0;
+            if (isHero && agent.gameObject.activeInHierarchy)
                 georgeHero = agent;
-            else if (agent.gameObject.name == "George")
-                georgeAny = agent;
             else if (georgeAny == null)
                 georgeAny = agent;
         }

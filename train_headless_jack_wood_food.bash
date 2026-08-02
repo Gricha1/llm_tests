@@ -175,6 +175,9 @@ if [ -n "${LAB_IP}" ]; then
   echo "[train_jack_wf] TensorBoard: http://${LAB_IP}:${TB_PORT}/"
 fi
 
+mkdir -p "${ROOT}/results"
+printf '%s\n' "${RUN_ID}" > "${ROOT}/results/.last_jack_stage1_run_id"
+
 echo "[train_jack_wf] run-id=${RUN_ID} num-envs=${NUM_ENVS} port=${TRAIN_PORT} time-scale=${TIME_SCALE} resume=${RESUME}"
 echo "[train_jack_wf] задачи: wood×12 food×8 (без water/zombie)"
 echo "[train_jack_wf] CPU affinity: train=${FOREST_TRAIN_CPUS}"

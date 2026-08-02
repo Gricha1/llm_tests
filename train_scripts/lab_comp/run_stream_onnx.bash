@@ -248,17 +248,23 @@ export FOREST_RESULTS_DIR="${ROOT}/results/${RUN_ID}"
 export FOREST_STREAM_RESTART_FLAG="${FLAG}"
 export __GL_SYNC_TO_VBLANK="${__GL_SYNC_TO_VBLANK:-0}"
 export vblank_mode="${vblank_mode:-0}"
+# Звук стрима → отдельный null-sink (не S/PDIF ~300мс). OBS берёт forest_stream.monitor.
+export PULSE_SINK="${PULSE_SINK:-forest_stream}"
+export PULSE_LATENCY_MSEC="${PULSE_LATENCY_MSEC:-80}"
+bash "${ROOT}/train_scripts/lab_comp/mute_train_pulse_audio.bash" >/tmp/forest_mute_audio.log 2>&1 || true
 
 # shellcheck source=cpu_affinity.env.bash
 source "${ROOT}/train_scripts/lab_comp/cpu_affinity.env.bash"
 echo "[stream_onnx] CPU affinity: stream=${FOREST_STREAM_CPUS} train=${FOREST_TRAIN_CPUS} obs=${FOREST_OBS_CPUS}"
-renice -n -10 $$ >/dev/null 2>&1 || renice -n -5 $$ >/dev/null 2>&1 || true
+echo "[stream_onnx] audio: PULSE_SINK=${PULSE_SINK} PULSE_LATENCY_MSEC=${PULSE_LATENCY_MSEC}"
+renice -n "${FOREST_STREAM_NICE}" $$ >/dev/null 2>&1 || renice -n -10 $$ >/dev/null 2>&1 || true
 
 if pgrep -x obs >/dev/null 2>&1; then
   for pid in $(pgrep -x obs); do
     taskset -cp "${FOREST_OBS_CPUS}" "${pid}" >/dev/null 2>&1 || true
+    forest_renice_pid "${FOREST_OBS_NICE}" "${pid}"
   done
-  echo "[stream_onnx] OBS pinned to CPU ${FOREST_OBS_CPUS}"
+  echo "[stream_onnx] OBS pinned to CPU ${FOREST_OBS_CPUS} nice=${FOREST_OBS_NICE}"
 fi
 
 STREAM_CMD=(

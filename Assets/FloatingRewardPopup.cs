@@ -170,4 +170,17 @@ public sealed class FloatingRewardPopup : MonoBehaviour
         if (textGo != null)
             Destroy(textGo);
     }
+
+    void OnDisable()
+    {
+        // Если хост выключили mid-popup — не оставляем сироты на Canvas.
+        if (_canvas == null)
+            return;
+        for (int i = _canvas.transform.childCount - 1; i >= 0; i--)
+        {
+            var child = _canvas.transform.GetChild(i);
+            if (child != null && child.name == "RewardPopup")
+                Destroy(child.gameObject);
+        }
+    }
 }

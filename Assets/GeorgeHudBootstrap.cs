@@ -86,12 +86,8 @@ public static class GeorgeHudBootstrap
 
     static void CreateGeorgeReward(Transform parent)
     {
-        foreach (var rd in Resources.FindObjectsOfTypeAll<RewardDisplay>())
-        {
-            if (rd != null && rd.gameObject.scene.IsValid() && rd.gameObject.scene.isLoaded
-                && rd.gameObject.name.IndexOf("George", System.StringComparison.OrdinalIgnoreCase) >= 0)
-                return;
-        }
+        if (RewardDisplay.CountLoaded(RewardDisplay.AgentKind.George) > 0)
+            return;
 
         var go = new GameObject("GeorgeRewardText");
         var rt = go.AddComponent<RectTransform>();
@@ -111,6 +107,7 @@ public static class GeorgeHudBootstrap
         var reward = go.AddComponent<RewardDisplay>();
         reward.ConfigureForGeorge();
         EnsureHudVisible(reward);
+        RewardDisplay.DeduplicateAll();
     }
 
     static bool HasLoadedDisplay<T>() where T : Component

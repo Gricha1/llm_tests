@@ -478,7 +478,32 @@ public class LilyScript : Agent, IHasHp
     void Start()
     {
         NormalizeFoodHeatDecayIntervals();
+        ApplyStreamPresentationSurvivalPace();
         TrainingEnvSpace.CapturePresentationSpawn(transform);
+    }
+
+    bool _streamPresentationPaceApplied;
+
+    /// <summary>Только stream presentation: нужды медленнее, HP от нужд реже, тепло у костра быстрее.</summary>
+    protected void ApplyStreamPresentationSurvivalPace()
+    {
+        if (_streamPresentationPaceApplied)
+            return;
+        if (!TrainingEnvSpace.UsesStreamPresentationSurvivalPace(transform))
+            return;
+
+        _streamPresentationPaceApplied = true;
+        float needsMul = TrainingEnvSpace.StreamPresentationNeedsDecayIntervalMul;
+        float hpMul = TrainingEnvSpace.StreamPresentationHpDamageIntervalMul;
+        float warmthMul = TrainingEnvSpace.StreamPresentationWarmthGainIntervalMul;
+
+        satietyDecayInterval *= needsMul;
+        heatDecayInterval *= needsMul;
+        waterDecayInterval *= needsMul;
+        hungerDamageInterval *= hpMul;
+        thirstDamageInterval *= hpMul;
+        freezeDamageInterval *= hpMul;
+        warmthGainInterval *= warmthMul;
     }
 
     protected void NormalizeFoodHeatDecayIntervals()
@@ -815,7 +840,20 @@ public class LilyScript : Agent, IHasHp
 
     void ApplyLilyEpisodeStartNeeds()
     {
-        // Как у Jack/George: случайные еда/вода/тепло в начале каждого эпизода.
+        // Presentation: как Jack/George — по 15 еды/воды/тепла.
+        if (TrainingEnvSpace.IsPresentationTransform(transform))
+        {
+            var config = EnvTrainingConfig.Get(transform);
+            if (config == null || config.ResolveTask() == EnvTrainingTask.PresentationFull)
+            {
+                const int start = 15;
+                Satiety = start;
+                WaterCount = start;
+                Heat = start;
+                return;
+            }
+        }
+
         Satiety = Random.Range(2, Mathf.Max(3, maxSatiety));
         WaterCount = Random.Range(2, Mathf.Max(3, maxSatiety + 10));
         Heat = Random.Range(1, Mathf.Max(2, startHeat > 0 ? startHeat : 20));
@@ -1642,7 +1680,10 @@ public class LilyScript : Agent, IHasHp
 
     bool IsFoodNeedSatisfied() => Satiety >= Mathf.Max(1, maxSatiety / 2);
 
-    bool IsHeatNeedSatisfied() => Heat >= Mathf.Max(1, startHeat / 2);
+    bool IsHeatNeedSatisfied() =>
+        // Раньше startHeat/2 (10 при startHeat=20): при старте presentation=15 опция Fire
+        // сразу «закрыта», Лили почти не идёт к костру. Нужно почти полное тепло.
+        Heat >= Mathf.Max(1, startHeat > 0 ? startHeat - 2 : 18);
 
     bool IsSurvivalOptionNeedSatisfied(int option) => option switch
     {
@@ -2141,11 +2182,9 @@ public class LilyScript : Agent, IHasHp
         if (jack == null || jack.CampfireBurnSecondsRemaining <= 0f)
             return false;
 
-        ResolveHouseTarget();
-        if (houseTarget == null)
-            return false;
-
-        return Vector3.Distance(transform.position, houseTarget.position) <= campfireWarmthRadius;
+        // Как у Геры: якорь = огонь, не центр дома.
+        Vector3 warmthPos = jack.GetCampfireWarmthWorldPosition();
+        return Vector3.Distance(transform.position, warmthPos) <= campfireWarmthRadius;
     }
 
     public bool IsOnHousePublic() => IsOnHouse();
@@ -2184,8 +2223,10 @@ public class LilyScript : Agent, IHasHp
             return;
 
         _warmthGainTimer = 0f;
+        int before = Heat;
         Heat++;
-        if (warmthRewardAtCampfire != 0f && currentOption == OptionHeat)
+        // Ревард при любом нагреве: иначе при опции еда/вода костёр греет без сигнала.
+        if (warmthRewardAtCampfire != 0f && Heat > before)
         {
             AddReward(warmthRewardAtCampfire);
             FloatingRewardPopup.ShowWarmedUp(transform, warmthRewardAtCampfire);

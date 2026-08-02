@@ -9,18 +9,20 @@ set -o pipefail
 # INIT_FROM только читается (init_path). Чекпоинты пишутся в новый RUN_ID
 # (свободный run_N, если RUN_ID не задан). results/run_97 не перезаписывается.
 #
-#   INIT_FROM=run_97 bash train_headless_jack_stage2.bash
-#   INIT_FROM=run_97 RUN_ID=run_98 bash train_headless_jack_stage2.bash
-#   RUN_ID=run_98 bash train_headless_jack_stage2.bash --resume
+#   INIT_FROM=97 bash train_headless_jack_stage2.bash
+#   → пишет в results/97_stage2 (INIT_FROM не трогает)
+#   INIT_FROM=97 RUN_ID=97_stage2_b bash train_headless_jack_stage2.bash
+#   RUN_ID=97_stage2 bash train_headless_jack_stage2.bash --resume
 #
-# Lab: INIT_FROM=run_97 bash train_scripts/lab_comp/train_headless_jack_stage2.bash
+# Lab: INIT_FROM=97 bash train_scripts/lab_comp/train_headless_jack_stage2.bash
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 cd "${ROOT}"
 
 BUILD="${BUILD:-stream_forest_survival_2_12_07_2026}"
-RUN_ID="${RUN_ID:-jack_stage2}"
 INIT_FROM="${INIT_FROM:-}"
+# Дефолт: <INIT_FROM>_stage2 (например 97_stage2). Явный RUN_ID перекрывает.
+RUN_ID="${RUN_ID:-}"
 NUM_ENVS="${NUM_ENVS:-26}"
 TIME_SCALE="${TIME_SCALE:-8}"
 TORCH_DEVICE="${TORCH_DEVICE:-cuda}"
@@ -171,17 +173,20 @@ if [ "${RESUME}" -eq 0 ]; then
   fi
 fi
 
-# INIT_FROM только читаем; чекпоинты пишем в другой RUN_ID.
 if [ -n "${INIT_FROM}" ] && [ "${RUN_ID}" = "${INIT_FROM}" ]; then
   echo "ERROR: RUN_ID=${RUN_ID} совпадает с INIT_FROM — так затрём веса Stage1." >&2
-  echo "  Не задавай RUN_ID (возьмётся свободный run_N) или укажи другой, напр. RUN_ID=run_98" >&2
+  echo "  Не задавай RUN_ID (будет ${INIT_FROM}_stage2) или укажи другой" >&2
   exit 1
 fi
 
-# Дефолтный id → сразу свободный run_N (не jack_stage2), чтобы явно было «новое обучение».
-if [ "${RESUME}" -eq 0 ] && { [ "${RUN_ID}" = "jack_stage2" ] || [ -z "${RUN_ID}" ]; }; then
-  RUN_ID="$(pick_free_run_id)"
-  echo "[jack_stage2] новый RUN_ID=${RUN_ID} (веса из INIT_FROM=${INIT_FROM} не трогаем)"
+# Дефолт: results/<INIT_FROM>_stage2
+if [ -z "${RUN_ID}" ]; then
+  if [ -n "${INIT_FROM}" ]; then
+    RUN_ID="${INIT_FROM}_stage2"
+  else
+    RUN_ID="jack_stage2"
+  fi
+  echo "[jack_stage2] RUN_ID=${RUN_ID} (веса из INIT_FROM=${INIT_FROM:-—} не трогаем)"
 fi
 
 if [ -d "results/${RUN_ID}" ] && ! run_has_checkpoints "${RUN_ID}"; then
@@ -197,7 +202,7 @@ if [ -d "results/${RUN_ID}" ] && [ "${RESUME}" -eq 0 ] && [ "${FORCE}" -eq 0 ]; 
   echo "ERROR: results/${RUN_ID} уже есть (с чекпоинтами)." >&2
   echo "  --resume  продолжить Stage2" >&2
   echo "  --force   начать заново в этом RUN_ID (INIT_FROM не удаляется)" >&2
-  echo "  RUN_ID=run_N  другой id" >&2
+  echo "  RUN_ID=...  другой id" >&2
   exit 1
 fi
 
@@ -306,12 +311,15 @@ echo "[jack_stage2] num-envs=${NUM_ENVS} port=${TRAIN_PORT} time-scale=${TIME_SC
 echo "[jack_stage2] Stage2: emptyDO=-5, backWalk=-0.5 (wood/food/water)"
 echo "============================================================"
 
+mkdir -p "${ROOT}/results"
+printf '%s\n' "${RUN_ID}" > "${ROOT}/results/.last_jack_stage2_run_id"
+
 MUTE_SCRIPT="${ROOT}/train_scripts/lab_comp/mute_train_pulse_audio.bash"
 if [ -f "${MUTE_SCRIPT}" ]; then
   bash "${MUTE_SCRIPT}" >/tmp/forest_mute_audio.log 2>&1 || true
   (
     while true; do
-      sleep 8
+      sleep 3
       bash "${MUTE_SCRIPT}" >>/tmp/forest_mute_audio.log 2>&1 || true
     done
   ) &

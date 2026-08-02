@@ -62,7 +62,12 @@ if [ "${STAGE}" = "2" ]; then
     lily) export FOREST_LILY_STAGE2=1 ;;
     george) export FOREST_GEORGE_STAGE2=1 ;;
   esac
-  DEFAULT_RUN_ID="${TAG}_stage2"
+  # Дефолт: <INIT_FROM>_stage2 (например 97_stage2)
+  if [ -n "${INIT_FROM}" ]; then
+    DEFAULT_RUN_ID="${INIT_FROM}_stage2"
+  else
+    DEFAULT_RUN_ID="${TAG}_stage2"
+  fi
   CONFIG="custom_configs/_autogen_${TAG}_stage2.yaml"
 else
   case "${HERO_LC}" in
@@ -197,8 +202,16 @@ if [ "${STAGE}" = "2" ] && [ "${RESUME}" -eq 0 ]; then
   fi
 fi
 
-if [ "${RESUME}" -eq 0 ] && { [ "${RUN_ID}" = "${DEFAULT_RUN_ID}" ] || [ -z "${RUN_ID}" ]; }; then
-  RUN_ID="$(pick_free_run_id)"
+if [ "${RESUME}" -eq 0 ] && [ -z "${RUN_ID}" ]; then
+  RUN_ID="${DEFAULT_RUN_ID}"
+fi
+
+# Stage2: не подменять на run_N — оставляем <INIT_FROM>_stage2.
+# Stage1 без явного RUN_ID: свободный run_N, если default уже занят.
+if [ "${STAGE}" = "1" ] && [ "${RESUME}" -eq 0 ] && [ "${RUN_ID}" = "${DEFAULT_RUN_ID}" ]; then
+  if [ -d "results/${RUN_ID}" ] && run_has_checkpoints "${RUN_ID}"; then
+    RUN_ID="$(pick_free_run_id)"
+  fi
 fi
 
 if [ -d "results/${RUN_ID}" ] && ! run_has_checkpoints "${RUN_ID}"; then
@@ -268,7 +281,8 @@ export FOREST_RESULTS_DIR="${ROOT}/results/${RUN_ID}"
 mkdir -p "${FOREST_RESULTS_DIR}"
 
 TB_PORT="${TB_PORT:-6006}"
-RUN_ID="${RUN_ID}" PORT="${TB_PORT}" bash "${ROOT}/train_scripts/lab_comp/run_tensorboard.bash" --daemon || true
+# Весь results/ — иначе TB смотрит только текущий RUN_ID и UI теряет Jack/Lily чужие графики.
+PORT="${TB_PORT}" bash "${ROOT}/train_scripts/lab_comp/run_tensorboard.bash" --daemon --all || true
 
 echo "============================================================"
 echo "[${TAG}_stage${STAGE}] HERO=${HERO_LC} STAGE=${STAGE}"
@@ -293,6 +307,13 @@ printf '%s\n' "${RUN_ID}" > "${ROOT}/results/.last_${TAG}_stage${STAGE}_run_id"
 MUTE_SCRIPT="${ROOT}/train_scripts/lab_comp/mute_train_pulse_audio.bash"
 if [ -f "${MUTE_SCRIPT}" ]; then
   bash "${MUTE_SCRIPT}" >/tmp/forest_mute_audio.log 2>&1 || true
+  (
+    while true; do
+      sleep 3
+      bash "${MUTE_SCRIPT}" >>/tmp/forest_mute_audio.log 2>&1 || true
+    done
+  ) &
+  disown 2>/dev/null || true
 fi
 
 if command -v taskset >/dev/null 2>&1; then

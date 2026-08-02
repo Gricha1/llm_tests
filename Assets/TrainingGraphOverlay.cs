@@ -21,9 +21,10 @@ public sealed class TrainingGraphOverlay : MonoBehaviour
     const float EmaAlpha = 0.03f;
     // Сколько завершённых эпизодов (по всем параллельным env) усредняем в одну точку графика.
     const int RewardAggregateEpisodes = 8;
-    // Presentation-only (стрим): длинные эпизоды — снимаем reward по окну, затем усредняем как обычно.
-    // 8 окон × ~45 с ≈ одна точка графика раз в ~6 мин (плавная динамика, не «пила»).
-    const float PresentationRewardSampleSeconds = 45f;
+    // Presentation-only (стрим): длинные эпизоды — снимаем reward по окну, затем усредняем.
+    // Раньше 8×45с ≈ 6 мин до первой точки — на #show metrics казалось, что Reward «пустой».
+    const float PresentationRewardSampleSeconds = 15f;
+    const int PresentationRewardAggregate = 2;
 
     static readonly Color JackColor = new Color(0.22f, 0.48f, 0.95f, 1f);
     static readonly Color LilyColor = new Color(0.98f, 0.38f, 0.62f, 1f);
@@ -405,7 +406,9 @@ public sealed class TrainingGraphOverlay : MonoBehaviour
         bool usePresentationSampling,
         string heroName)
     {
-        int aggregateTarget = RewardAggregateEpisodes;
+        int aggregateTarget = usePresentationSampling
+            ? PresentationRewardAggregate
+            : RewardAggregateEpisodes;
 
         for (int i = 0; i < trackers.Count; i++)
         {
@@ -537,6 +540,22 @@ public sealed class TrainingGraphOverlay : MonoBehaviour
         var jack = TrainingEnvSpace.FindPresentationJack();
         return jack != null ? jack.GetCumulativeReward() : 0f;
     }
+
+    public static float GetPresentationGeorgeCumulativeReward()
+    {
+        var george = TrainingEnvSpace.FindPresentationGeorge();
+        return george != null ? george.GetCumulativeReward() : 0f;
+    }
+
+    public static float GetPresentationLilyCumulativeReward()
+    {
+        var lily = TrainingEnvSpace.FindPresentationLily();
+        return lily != null ? lily.GetCumulativeReward() : 0f;
+    }
+
+    /// <summary>Сколько трекеров сейчас пишет reward (для отладки пустого EMA).</summary>
+    public static int GeorgeTrackerCount => _instance != null ? _instance._georgeTrackers.Count : 0;
+    public static int GeorgeRewardPointCount => _instance != null ? _instance._georgeRewards.Count : 0;
 
     static AgentGoToHouseDiscrete FindPresentationJack()
     {

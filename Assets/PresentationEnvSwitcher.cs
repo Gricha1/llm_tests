@@ -4,12 +4,14 @@ using UnityEngine.InputSystem;
 #endif
 
 /// <summary>
-/// K / #menu — меню переключения между средами Env (0 = стрим, 1 = Jack дрова, …).
+/// K / #menu — меню переключения между средами Env (0 = стрим, …).
 /// #env_N — сразу выбрать среду N.
+/// Jack-only: 0 стрим, 1 дрова, 2 еда, 3 вода, 4 зомби.
 /// </summary>
 public sealed class PresentationEnvSwitcher : MonoBehaviour
 {
     const int MaxSelectableCopyIndex = 12;
+    const int JackOnlyMaxCopyIndex = 4;
 
     static readonly string[] TaskLabels =
     {
@@ -27,6 +29,18 @@ public sealed class PresentationEnvSwitcher : MonoBehaviour
         "11 — George: вода  #env_11",
         "12 — George: костёр  #env_12",
     };
+
+    static readonly string[] JackOnlyTaskLabels =
+    {
+        "0 — Стрим  #env_0",
+        "1 — Дрова  #env_1",
+        "2 — Еда  #env_2",
+        "3 — Вода  #env_3",
+        "4 — Зомби  #env_4",
+    };
+
+    static int MaxCopyIndex =>
+        EnvTrainingConfig.IsJackOnlyTasksMode() ? JackOnlyMaxCopyIndex : MaxSelectableCopyIndex;
 
     static PresentationEnvSwitcher _instance;
     static GUIStyle _boxStyle;
@@ -128,25 +142,26 @@ public sealed class PresentationEnvSwitcher : MonoBehaviour
             return;
 
         EnsureStyles();
-        // Высота по видимым пунктам (Jack-only — без Lily/George).
+        // Высота по видимым пунктам (Jack-only — 5 сред).
         const float HpBarsClearance = 190f;
-        const float RowH = 20f;
-        const float TitleH = 24f;
+        const float RowH = 24f;
+        const float TitleH = 26f;
         const float Pad = 10f;
         int visible = 0;
-        for (int i = 0; i <= MaxSelectableCopyIndex; i++)
+        int maxIdx = MaxCopyIndex;
+        for (int i = 0; i <= maxIdx; i++)
         {
             if (IsMenuEntryAvailable(i))
                 visible++;
         }
         float contentH = TitleH + Pad + Mathf.Max(1, visible) * RowH;
-        _windowRect.width = 220f;
+        _windowRect.width = EnvTrainingConfig.IsJackOnlyTasksMode() ? 200f : 220f;
         _windowRect.height = contentH;
         _windowRect.x = Mathf.Clamp(_windowRect.x, 0f, Screen.width - 48f);
         _windowRect.y = Mathf.Clamp(_windowRect.y, HpBarsClearance, Screen.height - 48f);
 
         var prevWindow = GUI.skin.window.fontSize;
-        GUI.skin.window.fontSize = 12;
+        GUI.skin.window.fontSize = 14;
         _windowRect = GUILayout.Window(
             GetInstanceID(),
             _windowRect,
@@ -157,13 +172,15 @@ public sealed class PresentationEnvSwitcher : MonoBehaviour
 
     void DrawWindow(int id)
     {
-        for (int i = 0; i <= MaxSelectableCopyIndex; i++)
+        int maxIdx = MaxCopyIndex;
+        var labels = EnvTrainingConfig.IsJackOnlyTasksMode() ? JackOnlyTaskLabels : TaskLabels;
+        for (int i = 0; i <= maxIdx; i++)
         {
             if (!IsMenuEntryAvailable(i))
                 continue;
             bool active = TrainingEnvSpace.IsDebugEnvFocusActive
                 && TrainingEnvSpace.DebugFocusedCopyIndex == i;
-            DrawEnvButton(TaskLabels[i], i, active);
+            DrawEnvButton(labels[i], i, active);
         }
         GUI.DragWindow(new Rect(0f, 0f, 10000f, 18f));
     }
@@ -173,16 +190,10 @@ public sealed class PresentationEnvSwitcher : MonoBehaviour
     /// </summary>
     static bool IsMenuEntryAvailable(int copyIndex)
     {
-        var task = EnvTrainingConfig.ResolveFixedMenuTaskForCopyIndex(copyIndex);
-
         if (EnvTrainingConfig.IsJackOnlyTasksMode())
-        {
-            return task == EnvTrainingTask.JackWood
-                || task == EnvTrainingTask.JackFood
-                || task == EnvTrainingTask.JackWater
-                || task == EnvTrainingTask.JackZombie
-                || task == EnvTrainingTask.PresentationFull;
-        }
+            return copyIndex >= 0 && copyIndex <= JackOnlyMaxCopyIndex;
+
+        var task = EnvTrainingConfig.ResolveFixedMenuTaskForCopyIndex(copyIndex);
 
         if (EnvTrainingConfig.IsLilyOnlyTasksMode())
             return IsLilyMenuTask(task);
@@ -218,15 +229,16 @@ public sealed class PresentationEnvSwitcher : MonoBehaviour
     void DrawEnvButton(string label, int copyIndex, bool active)
     {
         var style = active ? _activeButtonStyle : _buttonStyle;
-        if (GUILayout.Button(label, style, GUILayout.Height(20f)))
+        if (GUILayout.Button(label, style, GUILayout.Height(24f)))
             SelectEnv(copyIndex);
     }
 
     void SelectEnv(int copyIndex)
     {
-        if (copyIndex < 0 || copyIndex > MaxSelectableCopyIndex)
+        int maxIdx = MaxCopyIndex;
+        if (copyIndex < 0 || copyIndex > maxIdx)
         {
-            Debug.LogWarning($"[EnvSwitcher] среда {copyIndex} вне диапазона 0–{MaxSelectableCopyIndex}");
+            Debug.LogWarning($"[EnvSwitcher] среда {copyIndex} вне диапазона 0–{maxIdx}");
             return;
         }
         if (!IsMenuEntryAvailable(copyIndex))
@@ -236,13 +248,16 @@ public sealed class PresentationEnvSwitcher : MonoBehaviour
         }
 
         TrainingEnvSpace.SetDebugFocusedEnv(copyIndex);
-        var task = EnvTrainingConfig.ResolveFixedMenuTaskForCopyIndex(copyIndex);
+        var task = EnvTrainingConfig.ResolveActiveMenuTaskForCopyIndex(copyIndex);
         var mode = task switch
         {
             EnvTrainingTask.JackWood => "режим=WoodOnly: 10 дров → дом → греться (heat<20) → снова рубить (одна опция дерево)",
             EnvTrainingTask.JackFood => "режим=FoodOnly (фикс. шаги, не конец на 1 овце)",
             EnvTrainingTask.JackWater => "режим=WaterOnly (фикс. шаги, награда за воду, не конец на 1й добыче)",
             EnvTrainingTask.JackZombie => "режим=ZombieOnly",
+            EnvTrainingTask.PresentationFull => EnvTrainingConfig.IsJackOnlyTasksMode()
+                ? "стрим (только Jack, со звуком)"
+                : "стрим / presentation (все герои)",
             _ => $"task={task}"
         };
         Debug.Log($"[EnvSwitcher] Среда {copyIndex}: {task}. {mode}");
@@ -250,31 +265,31 @@ public sealed class PresentationEnvSwitcher : MonoBehaviour
 
     static void EnsureStyles()
     {
-        // Всегда обновляем размеры — иначе после правок Play держит старый fontSize=18.
+        // Всегда обновляем размеры — иначе после правок Play держит старый fontSize.
         _boxStyle = new GUIStyle(GUI.skin.box)
         {
-            fontSize = 12,
+            fontSize = 14,
             alignment = TextAnchor.UpperLeft,
         };
 
         _labelStyle = new GUIStyle(GUI.skin.label)
         {
-            fontSize = 12,
+            fontSize = 14,
             wordWrap = true,
         };
 
         _buttonStyle = new GUIStyle(GUI.skin.button)
         {
-            fontSize = 12,
+            fontSize = 14,
             alignment = TextAnchor.MiddleLeft,
             richText = true,
-            fixedHeight = 22f,
+            fixedHeight = 26f,
         };
 
         _activeButtonStyle = new GUIStyle(_buttonStyle)
         {
             fontStyle = FontStyle.Bold,
-            fontSize = 12,
+            fontSize = 14,
         };
     }
 

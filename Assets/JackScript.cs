@@ -615,8 +615,37 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     void Start()
     {
         NormalizeFoodHeatDecayIntervals();
+        ApplyStreamPresentationSurvivalPace();
         TrainingEnvSpace.CapturePresentationSpawn(transform);
         EnsureGeorgeOptionVisuals();
+    }
+
+    bool _streamPresentationPaceApplied;
+
+    /// <summary>Только stream presentation: нужды медленнее, HP от нужд реже, тепло у костра быстрее.</summary>
+    protected void ApplyStreamPresentationSurvivalPace()
+    {
+        if (_streamPresentationPaceApplied)
+            return;
+        if (!TrainingEnvSpace.UsesStreamPresentationSurvivalPace(transform))
+            return;
+
+        _streamPresentationPaceApplied = true;
+        float needsMul = TrainingEnvSpace.StreamPresentationNeedsDecayIntervalMul;
+        float hpMul = TrainingEnvSpace.StreamPresentationHpDamageIntervalMul;
+        float warmthMul = TrainingEnvSpace.StreamPresentationWarmthGainIntervalMul;
+
+        satietyDecayInterval *= needsMul;
+        heatDecayInterval *= needsMul;
+        waterDecayInterval *= needsMul;
+        hungerDamageInterval *= hpMul;
+        thirstDamageInterval *= hpMul;
+        freezeDamageInterval *= hpMul;
+        // Jack — сильно быстрее (не ждёт у костра); Lily/George — умеренно.
+        if (UsesGeorgeSurvivalOptions)
+            warmthGainInterval *= warmthMul;
+        else
+            warmthGainInterval *= TrainingEnvSpace.StreamPresentationJackWarmthGainIntervalMul;
     }
 
     /// <summary>
@@ -783,7 +812,16 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
             return;
         }
 
-        // Все среды / герои: случайные нужды в начале эпизода (стрим тоже).
+        // Presentation/стрим: фиксированный запас, иначе рандом часто даёт почти пустые нужды.
+        if (UsesPresentationFullStartNeeds())
+        {
+            const int start = 15;
+            satiety = start;
+            water = start;
+            heat = start;
+            return;
+        }
+
         ApplyRandomEpisodeStartNeeds();
     }
 
@@ -1090,8 +1128,13 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
             return;
 
         _warmthGainTimer = 0f;
-        if (heat < maxHeat)
-            heat = Mathf.Min(maxHeat, heat + 1);
+        if (heat >= maxHeat)
+            return;
+
+        int gain = 1;
+        if (TrainingEnvSpace.UsesStreamPresentationSurvivalPace(transform))
+            gain = TrainingEnvSpace.StreamPresentationJackWarmthPerTick;
+        heat = Mathf.Min(maxHeat, heat + gain);
     }
 
     void UpdateNightmareBossSpawns()
@@ -3527,17 +3570,39 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         if (envRoot == null)
             return null;
 
-        // true: в GeorgeHeat Jack выключен (SetActive false), но костёр горит на нём.
+        // Как у Lily: не первый попавшийся (часто выключенный stub с burn=0),
+        // а JackHero / активный / с горящим костром — иначе Гера «замерзает» у живого огня.
+        AgentGoToHouseDiscrete hero = null;
+        AgentGoToHouseDiscrete burning = null;
+        AgentGoToHouseDiscrete active = null;
+        AgentGoToHouseDiscrete fallback = null;
+
         var agents = envRoot.GetComponentsInChildren<AgentGoToHouseDiscrete>(true);
         for (int i = 0; i < agents.Length; i++)
         {
             var agent = agents[i];
             if (agent == null || TrainingEnvSpace.IsGeorgeAgent(agent) || TwitchEphemeralEffects.IsTwitchClone(agent))
                 continue;
-            return agent;
+
+            if (agent.gameObject.name == "JackHero" && agent.gameObject.activeInHierarchy)
+                hero = agent;
+            else if (agent.CampfireBurnSecondsRemaining > 0f && burning == null)
+                burning = agent;
+            else if (agent.gameObject.activeInHierarchy && active == null)
+                active = agent;
+            else if (fallback == null)
+                fallback = agent;
         }
 
-        return null;
+        if (hero != null && hero.CampfireBurnSecondsRemaining > 0f)
+            return hero;
+        if (burning != null)
+            return burning;
+        if (hero != null)
+            return hero;
+        if (active != null)
+            return active;
+        return fallback;
     }
 
     bool IsGeorgeNearBurningCampfire()
@@ -3942,7 +4007,10 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
             if (ControlsSharedCampfire)
                 SetCampfireVisible(true);
             if (!TwitchPermanentFire.ShouldKeepLit(this))
+            {
+                TwitchPermanentFire.SanitizePresentationBurn(this, ref _campfireBurnSecondsRemaining);
                 _campfireBurnSecondsRemaining -= Time.deltaTime;
+            }
             else
                 _campfireBurnSecondsRemaining = TwitchPermanentFire.BurnSeconds;
 
@@ -4012,10 +4080,28 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
             }
         }
 
-        _campfireBurnSecondsRemaining += wood * burnInterval * burnDurationMultiplier;
+        // Сначала срезать хвост вечного костра, потом добавить дрова, потом потолок.
+        TwitchPermanentFire.SanitizePresentationBurn(this, ref _campfireBurnSecondsRemaining);
+        float add = wood * burnInterval * burnDurationMultiplier;
+        _campfireBurnSecondsRemaining += add;
+        if (TrainingEnvSpace.IsPresentationTransform(transform)
+            && !TwitchPermanentFire.ShouldKeepLit(this)
+            && _campfireBurnSecondsRemaining > TwitchPermanentFire.MaxPresentationBurnSeconds)
+        {
+            _campfireBurnSecondsRemaining = TwitchPermanentFire.MaxPresentationBurnSeconds;
+        }
         wood = 0;
         if (ControlsSharedCampfire)
             SetCampfireVisible(true);
+        // Стрим: при сдаче дров сразу подгреть — Jack не стоит ждать у огня.
+        if (!UsesGeorgeSurvivalOptions
+            && TrainingEnvSpace.UsesStreamPresentationSurvivalPace(transform)
+            && heat < maxHeat)
+        {
+            heat = Mathf.Min(
+                maxHeat,
+                heat + TrainingEnvSpace.StreamPresentationJackWarmthOnDeposit);
+        }
         _woodOnlyWarmupActive = IsWoodOnlyWarmingNearCampfire;
         RefreshTrainingOption(force: true);
     }
@@ -4023,10 +4109,12 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
 
     protected virtual bool IsManualWasdControlActive()
     {
-        if (TrainingEnvSpace.IsStreamOnlyMode)
+        // Локальный тест presentation (кнопка / -forestPresentationManual): WASD даже при stream-флаге.
+        bool presentationManual = ManualPlayControl.IsPresentationManualPlayActive();
+        if (!presentationManual && TrainingEnvSpace.IsStreamOnlyMode)
             return false;
-        // Обучение через mlagents — только нейросеть, без клавиатуры.
-        if (Academy.IsInitialized && Academy.Instance.IsCommunicatorOn)
+        // Обучение через mlagents — только нейросеть, без клавиатуры (кроме явного manual-теста).
+        if (!presentationManual && Academy.IsInitialized && Academy.Instance.IsCommunicatorOn)
             return false;
 
         if (TrainingEnvSpace.IsDebugEnvFocusActive)

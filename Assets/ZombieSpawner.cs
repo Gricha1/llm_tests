@@ -36,6 +36,8 @@ public class ZombieSpawner : MonoBehaviour
     float _spawnMoveSpeedMultiplier = 1f;
     bool _bootstrapDone;
     RuntimeAnimatorController _cachedZombieAnimator;
+    /// <summary>После Twitch #add zombie — не досыпать в Update до maxZombies.</summary>
+    bool _periodicSpawnSuppressed;
 
     public int AliveCount
     {
@@ -122,6 +124,8 @@ public class ZombieSpawner : MonoBehaviour
         if (ResolveZombiePrefab() == null)
             return;
         if (spawn_idle)
+            return;
+        if (_periodicSpawnSuppressed)
             return;
 
         // Меню K: досыпать только на JackZombie, раз в 2 сек (не hills-армия).
@@ -707,7 +711,8 @@ public class ZombieSpawner : MonoBehaviour
             return 0;
 
         // Twitch #add zombie: спавнер мог быть выключен ClearZombiesInAllEnvs.
-        if (!gameObject.activeSelf)
+        bool wasInactive = !gameObject.activeSelf;
+        if (wasInactive)
             gameObject.SetActive(true);
 
         count = Mathf.Clamp(count, 1, 10);
@@ -734,6 +739,12 @@ public class ZombieSpawner : MonoBehaviour
             spawned++;
         }
 
+        // Только N зомби из чата — не включать бесконечный Update-респавн до maxZombies.
+        _periodicSpawnSuppressed = true;
+        nextRespawnTime = float.PositiveInfinity;
+        if (wasInactive && gameObject.activeSelf)
+            gameObject.SetActive(false);
+
         return spawned;
     }
 
@@ -746,6 +757,7 @@ public class ZombieSpawner : MonoBehaviour
             && Time.unscaledTime - _lastTrainingEpisodeStartTime < 1f)
             return zombies.Count;
 
+        _periodicSpawnSuppressed = false;
         ClearZombies(scanOrphanRoots: false);
         if (ResolveZombiePrefab() == null)
         {
@@ -758,6 +770,9 @@ public class ZombieSpawner : MonoBehaviour
             immediateCount = 1;
         else
             immediateCount = Mathf.Clamp(immediateCount, 1, maxZombies);
+
+        if (!gameObject.activeSelf)
+            gameObject.SetActive(true);
 
         for (int i = 0; i < immediateCount; i++)
             SpawnOne();

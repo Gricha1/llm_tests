@@ -4,6 +4,8 @@
 #
 # На сервере вручную:
 #   RUN_ID=run_75 bash train_scripts/lab_comp/run_tensorboard.bash --daemon
+# Весь results/ (для UI Jack+Lily+George сразу):
+#   bash train_scripts/lab_comp/run_tensorboard.bash --daemon --all
 
 set -eu
 set -o pipefail
@@ -16,13 +18,17 @@ source "${ROOT}/train_scripts/lab_comp/lab_comp_env.bash"
 
 PORT="${PORT:-6006}"
 DAEMON=0
+ALL_RUNS=0
 RUN_ARGS=()
 
 for arg in "$@"; do
   case "${arg}" in
     --daemon) DAEMON=1 ;;
+    --all|all|.)
+      ALL_RUNS=1
+      ;;
     --help|-h)
-      sed -n '2,8p' "$0"
+      sed -n '2,10p' "$0"
       exit 0
       ;;
     *)
@@ -31,13 +37,18 @@ for arg in "$@"; do
   esac
 done
 
-if [ "${#RUN_ARGS[@]}" -eq 0 ] && [ -n "${RUN_ID:-}" ]; then
-  RUN_ARGS=("${RUN_ID}")
+if [ "${ALL_RUNS}" = "0" ] && [ "${#RUN_ARGS[@]}" -eq 0 ] && [ -n "${RUN_ID:-}" ]; then
+  if [ "${RUN_ID}" = "all" ] || [ "${RUN_ID}" = "." ]; then
+    ALL_RUNS=1
+  else
+    RUN_ARGS=("${RUN_ID}")
+  fi
 fi
 
-if [ "${#RUN_ARGS[@]}" -eq 0 ]; then
-  echo "Укажи run: RUN_ID=run_75 $0 --daemon" >&2
-  exit 1
+# Train/UI: по умолчанию смотрим весь results/, иначе новый запуск затирает TB
+# и в UI пропадают Jack/Lily чужие runs.
+if [ "${ALL_RUNS}" = "0" ] && [ "${#RUN_ARGS[@]}" -eq 0 ]; then
+  ALL_RUNS=1
 fi
 
 if [ -f "${HOME}/anaconda3/etc/profile.d/conda.sh" ]; then
@@ -55,28 +66,38 @@ fi
 # Несколько run → --logdir_spec name1:path1,name2:path2
 LOGDIR=""
 LOGDIR_SPEC=""
-for run_id in "${RUN_ARGS[@]}"; do
-  run_id="${run_id#results/}"
-  dir="${ROOT}/results/${run_id}"
-  if [ ! -d "${dir}" ]; then
-    echo "WARN: ${dir} нет — создаю (обучение ещё не писало events)" >&2
-    mkdir -p "${dir}"
-  fi
-  n_events="$(find "${dir}" -name 'events.out.tfevents*' 2>/dev/null | wc -l | tr -d ' ')"
-  if [ "${n_events}" = "0" ]; then
-    echo "WARN: ${dir} без events.out.tfevents.* (обучение ещё не писало?)" >&2
-  else
-    echo "[tensorboard] ${run_id}: ${n_events} event-файлов"
-  fi
-  if [ -z "${LOGDIR}" ]; then
-    LOGDIR="${dir}"
-  fi
-  if [ -n "${LOGDIR_SPEC}" ]; then
-    LOGDIR_SPEC="${LOGDIR_SPEC},${run_id}:${dir}"
-  else
-    LOGDIR_SPEC="${run_id}:${dir}"
-  fi
-done
+USE_PARENT=0
+
+if [ "${ALL_RUNS}" = "1" ]; then
+  LOGDIR="${ROOT}/results"
+  mkdir -p "${LOGDIR}"
+  USE_PARENT=1
+  n_events="$(find "${LOGDIR}" -name 'events.out.tfevents*' 2>/dev/null | wc -l | tr -d ' ')"
+  echo "[tensorboard] ALL results/: ${n_events} event-файлов → runs вида <run>/<Behavior>"
+else
+  for run_id in "${RUN_ARGS[@]}"; do
+    run_id="${run_id#results/}"
+    dir="${ROOT}/results/${run_id}"
+    if [ ! -d "${dir}" ]; then
+      echo "WARN: ${dir} нет — создаю (обучение ещё не писало events)" >&2
+      mkdir -p "${dir}"
+    fi
+    n_events="$(find "${dir}" -name 'events.out.tfevents*' 2>/dev/null | wc -l | tr -d ' ')"
+    if [ "${n_events}" = "0" ]; then
+      echo "WARN: ${dir} без events.out.tfevents.* (обучение ещё не писало?)" >&2
+    else
+      echo "[tensorboard] ${run_id}: ${n_events} event-файлов"
+    fi
+    if [ -z "${LOGDIR}" ]; then
+      LOGDIR="${dir}"
+    fi
+    if [ -n "${LOGDIR_SPEC}" ]; then
+      LOGDIR_SPEC="${LOGDIR_SPEC},${run_id}:${dir}"
+    else
+      LOGDIR_SPEC="${run_id}:${dir}"
+    fi
+  done
+fi
 
 TB_PID_FILE="/tmp/forest_tensorboard_${PORT}.pid"
 TB_LOG="/tmp/forest_tensorboard_${PORT}.log"
@@ -94,17 +115,29 @@ stop_old() {
   sleep 0.3
 }
 
-if [ "${DAEMON}" -eq 1 ]; then
-  stop_old
-  if [ "${#RUN_ARGS[@]}" -eq 1 ]; then
+start_tb() {
+  if [ "${USE_PARENT}" = "1" ] || [ "${#RUN_ARGS[@]}" -le 1 ]; then
     echo "[tensorboard] --logdir ${LOGDIR} port=${PORT}"
-    nohup tensorboard --logdir "${LOGDIR}" --bind_all --port "${PORT}" --reload_interval 30 \
-      >"${TB_LOG}" 2>&1 &
+    if [ "${DAEMON}" -eq 1 ]; then
+      nohup tensorboard --logdir "${LOGDIR}" --bind_all --port "${PORT}" --reload_interval 30 \
+        >"${TB_LOG}" 2>&1 &
+    else
+      exec tensorboard --logdir "${LOGDIR}" --bind_all --port "${PORT}" --reload_interval 30
+    fi
   else
     echo "[tensorboard] --logdir_spec ${LOGDIR_SPEC} port=${PORT}"
-    nohup tensorboard --logdir_spec "${LOGDIR_SPEC}" --bind_all --port "${PORT}" --reload_interval 30 \
-      >"${TB_LOG}" 2>&1 &
+    if [ "${DAEMON}" -eq 1 ]; then
+      nohup tensorboard --logdir_spec "${LOGDIR_SPEC}" --bind_all --port "${PORT}" --reload_interval 30 \
+        >"${TB_LOG}" 2>&1 &
+    else
+      exec tensorboard --logdir_spec "${LOGDIR_SPEC}" --bind_all --port "${PORT}" --reload_interval 30
+    fi
   fi
+}
+
+if [ "${DAEMON}" -eq 1 ]; then
+  stop_old
+  start_tb
   echo $! >"${TB_PID_FILE}"
   sleep 1.5
   if kill -0 "$(cat "${TB_PID_FILE}")" 2>/dev/null; then
@@ -118,9 +151,4 @@ if [ "${DAEMON}" -eq 1 ]; then
   exit 0
 fi
 
-if [ "${#RUN_ARGS[@]}" -eq 1 ]; then
-  echo "[tensorboard] --logdir ${LOGDIR} port=${PORT}"
-  exec tensorboard --logdir "${LOGDIR}" --bind_all --port "${PORT}" --reload_interval 30
-fi
-echo "[tensorboard] --logdir_spec ${LOGDIR_SPEC} port=${PORT}"
-exec tensorboard --logdir_spec "${LOGDIR_SPEC}" --bind_all --port "${PORT}" --reload_interval 30
+start_tb

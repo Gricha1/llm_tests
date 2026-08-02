@@ -2,17 +2,16 @@
 set -eu
 set -o pipefail
 
-# Jack+Lily+George: 27 Unity headless (num-envs=27) + стрим отдельно (run_stream_onnx.bash).
-# worker 0  = PresentationFull (как на стриме)
-# worker 1  = PresentationFull train (все трое)
-# workers 2–12 = узкие задачи (headless)
-# workers 13–27 = буст по 3 копии:
-#   JackWood×3, JackWater×3, JackZombie×3, LilyWater×3, GeorgeWater×3
+# Jack+Lily+George: 21 Unity headless (num-envs=21) + стрим отдельно (run_stream_onnx.bash).
+# workers 0–9  = PresentationFull (все трое вместе)
+# workers 10–13 = Jack wood/food/water/zombie (по 1)
+# workers 14–17 = Lily food/water/heat/flower (по 1)
+# workers 18–20 = George food/water/heat (по 1)
 #
 #   RUN_ID=run_72 bash train_headless_jack_lily_george.bash --resume
 #   RUN_ID=run_72 bash train_scripts/lab_comp/run_stream_onnx.bash
 #
-# Без PresentationFull worker0/1 (11 envs):
+# Без PresentationFull (только узкие, 11 envs):
 #   TRAIN_MODE=multi bash train_headless_jack_lily_george.bash
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
@@ -42,7 +41,7 @@ export FOREST_TRAIN_ALL_HEADLESS=1
 if [ "${TRAIN_MODE}" = "multi" ]; then
   NUM_ENVS="${NUM_ENVS:-11}"
 else
-  NUM_ENVS="${NUM_ENVS:-28}"
+  NUM_ENVS="${NUM_ENVS:-21}"
 fi
 
 CONFIG="custom_configs/Jack_Lily_George.yaml"
@@ -206,7 +205,7 @@ echo "[train] С ПК (туннель): RUN_ID=${RUN_ID} bash train_scripts/lab_
 echo "[train] mode=${TRAIN_MODE} DISPLAY=${DISPLAY} run-id=${RUN_ID} num-envs=${NUM_ENVS} port=${TRAIN_PORT} time-scale=${TIME_SCALE} resume=${RESUME}"
 echo "[train] CPU affinity: train=${FOREST_TRAIN_CPUS} (stream reserved=${FOREST_STREAM_CPUS})"
 if [ "${TRAIN_MODE}" = "presentation" ]; then
-  echo "[train] 28 headless: w0=stream-PresentationFull, w1=train-PresentationFull, w2-12=узкие, w13-27=буст×3"
+  echo "[train] 21 headless: w0-9=PresentationFull×10, w10-13=Jack×4, w14-17=Lily×4, w18-20=George×3"
   echo "[train] Стрим отдельно: RUN_ID=${RUN_ID} bash train_scripts/lab_comp/run_stream_onnx.bash"
 fi
 if command -v taskset >/dev/null 2>&1; then

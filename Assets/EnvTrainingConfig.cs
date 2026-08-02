@@ -31,6 +31,11 @@ public enum EnvTrainingAgentRole
     George,
 }
 
+/// <summary>
+/// Раньше Agent.OnEnable (LazyInitialize): иначе Lily/George остаются Default
+/// и mlagents падает TrainerConfigError на Jack-only validate/train.
+/// </summary>
+[DefaultExecutionOrder(-2000)]
 public sealed class EnvTrainingConfig : MonoBehaviour
 {
     const float TrainingCampfireSeconds = 99999f;
@@ -66,6 +71,18 @@ public sealed class EnvTrainingConfig : MonoBehaviour
 
     public static void SetForcedCopyIndex(int copyIndex) => _forcedCopyIndex = copyIndex;
     public static void ClearForcedCopyIndex() => _forcedCopyIndex = -1;
+
+    void Awake()
+    {
+        // Solo yaml (Jack/Lily/George only): выключить чужих до Agent.OnEnable.
+        if (!IsAnySoloHeroTasksMode())
+            return;
+
+        _visibilityTaskApplied = (EnvTrainingTask)(-1);
+        var resolved = ResolveTask();
+        ApplyAgentRoles(resolved);
+        ApplyAgentVisibility(resolved);
+    }
 
     public EnvTrainingTask Task => task;
     public int SimpleMaxSteps => simpleMaxSteps;
@@ -114,28 +131,6 @@ public sealed class EnvTrainingConfig : MonoBehaviour
 
         return ResolveAutoTaskForCopyIndex(copyIndex);
     }
-
-    /// <summary>
-    /// w12+: 3× JackWood, 3× JackWater, 3× JackZombie, 3× LilyWater, 3× GeorgeWater (далее цикл).
-    /// </summary>
-    static readonly EnvTrainingTask[] FixedBoostTasks =
-    {
-        EnvTrainingTask.JackWood,
-        EnvTrainingTask.JackWood,
-        EnvTrainingTask.JackWood,
-        EnvTrainingTask.JackWater,
-        EnvTrainingTask.JackWater,
-        EnvTrainingTask.JackWater,
-        EnvTrainingTask.JackZombie,
-        EnvTrainingTask.JackZombie,
-        EnvTrainingTask.JackZombie,
-        EnvTrainingTask.LilyWater,
-        EnvTrainingTask.LilyWater,
-        EnvTrainingTask.LilyWater,
-        EnvTrainingTask.GeorgeWater,
-        EnvTrainingTask.GeorgeWater,
-        EnvTrainingTask.GeorgeWater,
-    };
 
     /// <summary>
     /// Jack-only: wood:food:water:zombie ≈ 2:1:2:2.
@@ -310,41 +305,97 @@ public sealed class EnvTrainingConfig : MonoBehaviour
     }
 
     /// <summary>
-    /// Карта меню K / #env_N: 0–1 presentation, 2–5 Jack, 6–9 Lily, 10–12 George.
-    /// Не путать с train-слотами (12×wood… при JackWoodFoodOnly).
+    /// Совместное обучение Jack+Lily+George (и меню K / #env_N):
+    /// 0–9 PresentationFull (все трое вместе),
+    /// затем по 1 среде на каждую узкую задачу героев.
+    /// Итого 21 слот: 10 вместе + 4 Jack + 4 Lily + 3 George.
     /// </summary>
     public static EnvTrainingTask ResolveFixedMenuTaskForCopyIndex(int copyIndex)
+    {
+        if (copyIndex < 0)
+            return EnvTrainingTask.JackWood;
+
+        // 10 сред «все вместе»
+        if (copyIndex <= 9)
+            return EnvTrainingTask.PresentationFull;
+
+        switch (copyIndex)
+        {
+            case 10: return EnvTrainingTask.JackWood;
+            case 11: return EnvTrainingTask.JackFood;
+            case 12: return EnvTrainingTask.JackWater;
+            case 13: return EnvTrainingTask.JackZombie;
+            case 14: return EnvTrainingTask.LilyFood;
+            case 15: return EnvTrainingTask.LilyWater;
+            case 16: return EnvTrainingTask.LilyHeat;
+            case 17: return EnvTrainingTask.LilyFlower;
+            case 18: return EnvTrainingTask.GeorgeFood;
+            case 19: return EnvTrainingTask.GeorgeWater;
+            case 20: return EnvTrainingTask.GeorgeHeat;
+            default:
+                // Лишние worker'ы (если num-envs > 21) — снова PresentationFull.
+                return EnvTrainingTask.PresentationFull;
+        }
+    }
+
+    /// <summary>Jack-only validate: 0 стрим, 1 дрова, 2 еда, 3 вода, 4 зомби.</summary>
+    public static EnvTrainingTask ResolveJackOnlyMenuTaskForCopyIndex(int copyIndex)
     {
         switch (copyIndex)
         {
             case 0: return EnvTrainingTask.PresentationFull;
-            case 1: return EnvTrainingTask.PresentationFull;
-            case 2: return EnvTrainingTask.JackWood;
-            case 3: return EnvTrainingTask.JackFood;
-            case 4: return EnvTrainingTask.JackWater;
-            case 5: return EnvTrainingTask.JackZombie;
-            case 6: return EnvTrainingTask.LilyFood;
-            case 7: return EnvTrainingTask.LilyWater;
-            case 8: return EnvTrainingTask.LilyHeat;
-            case 9: return EnvTrainingTask.LilyFlower;
-            case 10: return EnvTrainingTask.GeorgeFood;
-            case 11: return EnvTrainingTask.GeorgeWater;
-            case 12: return EnvTrainingTask.GeorgeHeat;
-            default:
-                if (copyIndex >= 13)
-                {
-                    int i = (copyIndex - 13) % FixedBoostTasks.Length;
-                    return FixedBoostTasks[i];
-                }
-                return EnvTrainingTask.JackWood;
+            case 1: return EnvTrainingTask.JackWood;
+            case 2: return EnvTrainingTask.JackFood;
+            case 3: return EnvTrainingTask.JackWater;
+            case 4: return EnvTrainingTask.JackZombie;
+            default: return EnvTrainingTask.JackWood;
         }
+    }
+
+    /// <summary>Lily-only validate: 0 стрим, 1 еда, 2 вода, 3 тепло, 4 цветы.</summary>
+    public static EnvTrainingTask ResolveLilyOnlyMenuTaskForCopyIndex(int copyIndex)
+    {
+        switch (copyIndex)
+        {
+            case 0: return EnvTrainingTask.PresentationFull;
+            case 1: return EnvTrainingTask.LilyFood;
+            case 2: return EnvTrainingTask.LilyWater;
+            case 3: return EnvTrainingTask.LilyHeat;
+            case 4: return EnvTrainingTask.LilyFlower;
+            default: return EnvTrainingTask.LilyFood;
+        }
+    }
+
+    /// <summary>George-only validate: 0 стрим, 1 еда, 2 вода, 3 тепло.</summary>
+    public static EnvTrainingTask ResolveGeorgeOnlyMenuTaskForCopyIndex(int copyIndex)
+    {
+        switch (copyIndex)
+        {
+            case 0: return EnvTrainingTask.PresentationFull;
+            case 1: return EnvTrainingTask.GeorgeFood;
+            case 2: return EnvTrainingTask.GeorgeWater;
+            case 3: return EnvTrainingTask.GeorgeHeat;
+            default: return EnvTrainingTask.GeorgeFood;
+        }
+    }
+
+    /// <summary>Активная карта меню K / #env_N (solo Jack/Lily/George ≠ мультигерой).</summary>
+    public static EnvTrainingTask ResolveActiveMenuTaskForCopyIndex(int copyIndex)
+    {
+        if (IsJackOnlyTasksMode())
+            return ResolveJackOnlyMenuTaskForCopyIndex(copyIndex);
+        if (IsLilyOnlyTasksMode())
+            return ResolveLilyOnlyMenuTaskForCopyIndex(copyIndex);
+        if (IsGeorgeOnlyTasksMode())
+            return ResolveGeorgeOnlyMenuTaskForCopyIndex(copyIndex);
+        return ResolveFixedMenuTaskForCopyIndex(copyIndex);
     }
 
     public static EnvTrainingTask ResolveAutoTaskForCopyIndex(int copyIndex)
     {
-        // Меню K / #env_N: всегда 0–12, иначе train-слоты ≠ пункты меню.
+        // Меню K / #env_N: карта меню, иначе train-слоты ≠ пункты меню.
         if (TrainingEnvSpace.IsDebugEnvFocusActive)
-            return ResolveFixedMenuTaskForCopyIndex(copyIndex);
+            return ResolveActiveMenuTaskForCopyIndex(copyIndex);
 
         if (IsJackOnlyTasksMode())
             return ResolveJackOnlyTaskForCopyIndex(copyIndex);
@@ -356,7 +407,7 @@ public sealed class EnvTrainingConfig : MonoBehaviour
         return ResolveFixedMenuTaskForCopyIndex(copyIndex);
     }
 
-    /// <summary>Раньше фиксировал dynamic boost на эпизод; сейчас w12+ заданы жёстко в FixedBoostTasks.</summary>
+    /// <summary>Раньше фиксировал dynamic boost на эпизод; карта задач сейчас в ResolveFixedMenuTaskForCopyIndex.</summary>
     public void CommitBoostTaskIfNeeded()
     {
     }
@@ -646,7 +697,8 @@ public sealed class EnvTrainingConfig : MonoBehaviour
         EnsureHeroCache();
         HideLegacyHeroShells();
 
-        bool showAll = resolved == EnvTrainingTask.PresentationFull;
+        // Solo validate: даже PresentationFull (стрим) — только этот герой, без Лили/Геры.
+        bool showAll = resolved == EnvTrainingTask.PresentationFull && !IsAnySoloHeroTasksMode();
         SetRoleVisible(EnvTrainingAgentRole.Jack,
             showAll || ShouldAgentTrain(resolved, EnvTrainingAgentRole.Jack));
         SetRoleVisible(EnvTrainingAgentRole.Lily,

@@ -51,6 +51,10 @@ public static class PresentationWorldReset
 
         if (zombieOnly)
             TrainingEnvSpace.ForceStartJackZombieSpawners(envRoot);
+
+        PresentationWorldSnapshotLogger.LogEvent(
+            "reset_spawners",
+            $"force={force} {DescribeState(envRoot)}");
     }
 
     static void VerifyAndRetry(TreeSpawner trees, SheepSpawner sheep)

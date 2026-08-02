@@ -56,10 +56,21 @@ public sealed class PresentationDebugInput : MonoBehaviour
 
         if (WasKeyPressed(KeyCode.P))
         {
-            TrainingEnvSpace.ToggleParallelEnvsVisible();
-            Debug.Log(TrainingEnvSpace.ParallelEnvsVisible
-                ? "[Debug] P: параллельные Env видны (рендер включён)."
-                : "[Debug] P: параллельные Env скрыты.");
+            // В manual-режиме P = Jack↔Гера; иначе — видимость параллельных Env.
+            if (ManualPlayControl.IsPresentationManualPlayActive())
+            {
+                ManualPlayControl.ToggleGeorgeManual();
+                Debug.Log(ManualPlayControl.GeorgeManualActive
+                    ? "[Debug] P: WASD → Гера"
+                    : "[Debug] P: WASD → Jack");
+            }
+            else
+            {
+                TrainingEnvSpace.ToggleParallelEnvsVisible();
+                Debug.Log(TrainingEnvSpace.ParallelEnvsVisible
+                    ? "[Debug] P: параллельные Env видны (рендер включён)."
+                    : "[Debug] P: параллельные Env скрыты.");
+            }
         }
     }
 

@@ -231,9 +231,6 @@ public sealed class TwitchChatGameBridge : MonoBehaviour
             Debug.Log("[TwitchChat] add zombie: нет активного Jack — спавн у спавнера");
         }
 
-        if (!spawner.gameObject.activeSelf)
-            spawner.gameObject.SetActive(true);
-
         Vector3 near = jack != null ? jack.transform.position : spawner.transform.position;
         int spawned = spawner.SpawnZombiesNear(near, count, zombieSpawnRadius);
         if (spawned == 0)

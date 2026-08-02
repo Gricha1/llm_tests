@@ -518,29 +518,55 @@ public sealed class CommandLineEvalCapture : MonoBehaviour
         yield return new WaitForEndOfFrame();
         try
         {
-            // Backbuffer includes Overlay UI; ReadPixels reads from current screen.
-            RenderTexture prev = RenderTexture.active;
-            RenderTexture.active = null;
-            _captureTexture.ReadPixels(new Rect(0, 0, _captureWidth, _captureHeight), 0, 0);
-            _captureTexture.Apply(false, false);
-            RenderTexture.active = prev;
-
-            byte[] bytes;
-            string ext;
-            if (string.Equals(_captureFormat, "png", StringComparison.OrdinalIgnoreCase))
+            // Backbuffer includes Overlay UI. Нельзя ReadPixels(0,0,capW,capH):
+            // origin снизу — при Screen выше capture (xvfb 1280x1024 vs 720) срезается верх.
+            // Читаем весь экран и масштабируем в capture-размер.
+            int sw = Screen.width;
+            int sh = Screen.height;
+            if (sw >= 2 && sh >= 2 && _captureTexture != null)
             {
-                bytes = _captureTexture.EncodeToPNG();
-                ext = "png";
-            }
-            else
-            {
-                bytes = ImageConversion.EncodeToJPG(_captureTexture, Mathf.Clamp(_jpgQuality, 1, 100));
-                ext = "jpg";
-            }
+                RenderTexture prev = RenderTexture.active;
+                RenderTexture.active = null;
 
-            var path = Path.Combine(_captureDir, $"frame_{_frameIndexA:D06}.{ext}");
-            File.WriteAllBytes(path, bytes);
-            _frameIndexA++;
+                if (sw == _captureWidth && sh == _captureHeight)
+                {
+                    _captureTexture.ReadPixels(new Rect(0, 0, sw, sh), 0, 0);
+                    _captureTexture.Apply(false, false);
+                }
+                else
+                {
+                    var full = new Texture2D(sw, sh, TextureFormat.RGB24, false);
+                    full.ReadPixels(new Rect(0, 0, sw, sh), 0, 0);
+                    full.Apply(false, false);
+                    var rt = RenderTexture.GetTemporary(_captureWidth, _captureHeight, 0, RenderTextureFormat.ARGB32);
+                    Graphics.Blit(full, rt);
+                    RenderTexture.active = rt;
+                    _captureTexture.ReadPixels(new Rect(0, 0, _captureWidth, _captureHeight), 0, 0);
+                    _captureTexture.Apply(false, false);
+                    RenderTexture.active = prev;
+                    RenderTexture.ReleaseTemporary(rt);
+                    Destroy(full);
+                }
+
+                RenderTexture.active = prev;
+
+                byte[] bytes;
+                string ext;
+                if (string.Equals(_captureFormat, "png", StringComparison.OrdinalIgnoreCase))
+                {
+                    bytes = _captureTexture.EncodeToPNG();
+                    ext = "png";
+                }
+                else
+                {
+                    bytes = ImageConversion.EncodeToJPG(_captureTexture, Mathf.Clamp(_jpgQuality, 1, 100));
+                    ext = "jpg";
+                }
+
+                var path = Path.Combine(_captureDir, $"frame_{_frameIndexA:D06}.{ext}");
+                File.WriteAllBytes(path, bytes);
+                _frameIndexA++;
+            }
         }
         finally
         {

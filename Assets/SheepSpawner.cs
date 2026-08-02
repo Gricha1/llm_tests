@@ -78,8 +78,40 @@ public class SheepSpawner : MonoBehaviour
         sheeps.RemoveAll(s => !IsAlive(s));
     }
 
+    GameObject ResolveSheepPrefab()
+    {
+        if (sheepPrefab != null)
+            return sheepPrefab;
+
+        // Prefab мог стать null после ClearSheep, если в инспекторе был scene-object.
+        var all = Object.FindObjectsByType<SheepSpawner>(FindObjectsInactive.Include, FindObjectsSortMode.None);
+        for (int i = 0; i < all.Length; i++)
+        {
+            var other = all[i];
+            if (other == null || other == this || other.sheepPrefab == null)
+                continue;
+            sheepPrefab = other.sheepPrefab;
+            Debug.LogWarning($"[SheepSpawner] восстановил sheepPrefab с {other.name}", this);
+            return sheepPrefab;
+        }
+
+        var fromResources = Resources.Load<GameObject>("Sheep_1");
+        if (fromResources != null)
+        {
+            sheepPrefab = fromResources;
+            return sheepPrefab;
+        }
+
+        Debug.LogError("[SheepSpawner] sheepPrefab=null — овцы не спавнятся", this);
+        return null;
+    }
+
     private bool SpawnOneSheep()
     {
+        var prefab = ResolveSheepPrefab();
+        if (prefab == null)
+            return false;
+
         for (int attempt = 0; attempt < 100; attempt++)
         {
             Vector3 pos = ToWorld(new Vector3(
@@ -104,7 +136,7 @@ public class SheepSpawner : MonoBehaviour
             if (!tooClose)
             {
                 GameObject sheep = Instantiate(
-                    sheepPrefab,
+                    prefab,
                     pos,
                     Quaternion.Euler(0f, Random.Range(0f, 360f), 0f),
                     transform
@@ -158,6 +190,9 @@ public class SheepSpawner : MonoBehaviour
 
     public void ResetSheep()
     {
+        PresentationWorldSnapshotLogger.Note(
+            "sheep_reset",
+            $"before={sheeps.Count} target={sheepCount} env={(_envRoot != null ? _envRoot.name : "?")}");
         ClearSheep();
         SpawnSheep();
     }
@@ -182,12 +217,16 @@ public class SheepSpawner : MonoBehaviour
         }
         sheeps.Clear();
 
-        // После Instantiate(Env) остаются «сироты»-дети не в списке — иначе зона забита, новых овец нет.
+        // Сироты после Instantiate(Env): только овцы (SheepWander), не весь child-иерархию
+        // (иначе можно снести scene-template и обнулить sheepPrefab).
         for (int i = transform.childCount - 1; i >= 0; i--)
         {
             var child = transform.GetChild(i).gameObject;
-            if (!IsUnityNull(child))
-                Destroy(child);
+            if (IsUnityNull(child))
+                continue;
+            if (child.GetComponent<SheepWander>() == null)
+                continue;
+            Destroy(child);
         }
     }
 
@@ -196,7 +235,7 @@ public class SheepSpawner : MonoBehaviour
     /// <summary>Спавн count овец вокруг worldPos (Twitch). Не удаляет существующих.</summary>
     public int SpawnSheepNear(Vector3 worldPos, int count, float radius = 7f)
     {
-        if (sheepPrefab == null)
+        if (ResolveSheepPrefab() == null)
             return 0;
 
         count = Mathf.Clamp(count, 1, 20);

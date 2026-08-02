@@ -122,6 +122,12 @@ public sealed class CampfireBurnTimerDisplay : MonoBehaviour
 
     static string FormatRemaining(float seconds)
     {
+        if (seconds < 0f)
+            seconds = 0f;
+        // Вечный / битый хвост — не пугаем гигантским числом.
+        if (seconds >= TwitchPermanentFire.BurnSeconds * 0.5f)
+            return "∞";
+
         if (seconds >= 60f)
         {
             int total = Mathf.CeilToInt(seconds);

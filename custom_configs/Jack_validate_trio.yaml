@@ -1,4 +1,5 @@
-﻿# Jack + Lily + George joint training (clean UTF-8).
+# Validate Jack-only runs on builds that still register Lily/George as Default.
+# Hyperparams match Jack/Lily/George_single_agent.yaml.
 default_settings: null
 behaviors:
   JackLowLevelAgent:
@@ -158,12 +159,12 @@ engine_settings:
   no_graphics_monitor: false
 environment_parameters: null
 checkpoint_settings:
-  run_id: jack_lily_george
+  run_id: jack_validate_trio
   initialize_from: null
   load_model: false
   resume: false
   force: false
-  train_model: true
+  train_model: false
   inference: false
   results_dir: results
 torch_settings:

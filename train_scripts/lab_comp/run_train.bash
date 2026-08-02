@@ -31,7 +31,7 @@ ARGS=()
 [ "${RESUME}" -eq 1 ] && ARGS+=(--resume)
 [ "${FORCE}" -eq 1 ] && ARGS+=(--force)
 
-echo "[run_train] BUILD=${BUILD} RUN_ID=${RUN_ID} DISPLAY=${DISPLAY} (num-envs=28 headless + TensorBoard; stream: run_stream_onnx.bash)"
+echo "[run_train] BUILD=${BUILD} RUN_ID=${RUN_ID} DISPLAY=${DISPLAY} (num-envs=21 headless + TensorBoard; stream: run_stream_onnx.bash)"
 
 # Старые mlagents/Unity headless часто остаются после Ctrl+C и жрут RAM.
 echo "[run_train] чищу предыдущий train (стрим не трогаю)..."

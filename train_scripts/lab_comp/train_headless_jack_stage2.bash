@@ -2,9 +2,10 @@
 # Jack Stage2 на lab_comp: fine-tune от Stage1 + emptyDO / backward penalties.
 # Нужен билд с -forestJackStage2.
 #
-#   INIT_FROM=run_97 bash train_scripts/lab_comp/train_headless_jack_stage2.bash
-#   INIT_FROM=run_97 RUN_ID=run_98 bash train_scripts/lab_comp/train_headless_jack_stage2.bash
-#   RUN_ID=run_98 bash train_scripts/lab_comp/train_headless_jack_stage2.bash --resume
+#   INIT_FROM=97 bash train_scripts/lab_comp/train_headless_jack_stage2.bash
+#   → results/97_stage2
+#   INIT_FROM=97 RUN_ID=97_stage2_b bash ...
+#   RUN_ID=97_stage2 bash ... --resume
 
 set -eu
 set -o pipefail

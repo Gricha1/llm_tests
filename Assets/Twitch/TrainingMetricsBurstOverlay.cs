@@ -412,20 +412,30 @@ public sealed class TrainingMetricsBurstOverlay : MonoBehaviour
 
         var rewardSeries = RewardSeriesForHero(_hero);
         float rewardEma = RewardEmaForHero(_hero);
+        float liveReward = LiveCumulativeForHero(_hero);
         var entropySeries = TrainingPolicyStats.EntropySeries;
+
+        // Пока live-EMA ещё не набрала точки — показываем текущий cumulative (как «R гера»),
+        // чтобы #show metrics не выглядел пустым рядом с SR из jsonl.
+        string rewardTitle = rewardSeries != null && rewardSeries.Count > 0
+            ? $"Reward EMA — {rewardEma:F2}"
+            : $"Reward live — {liveReward:F2} (EMA копится…)";
 
         // Слот 0 — reward, 1 — entropy, дальше задачи героя.
         DrawGraph(_slots[0], rewardSeries, new Color(0.22f, 0.48f, 0.95f, 1f),
-            $"Reward EMA — {rewardEma:F2}", isPercent: false);
+            rewardTitle, isPercent: false);
         DrawGraph(_slots[1], entropySeries, new Color(0.35f, 0.95f, 0.55f, 1f),
             $"Entropy — {TrainingPolicyStats.LastEntropy:F2}", isPercent: false);
         if (_slots[0]?.Root != null) _slots[0].Root.SetActive(true);
         if (_slots[1]?.Root != null) _slots[1].Root.SetActive(true);
 
         _sb.Clear();
-        _sb.Append(heroName)
-            .Append("  Reward EMA: ").Append(rewardEma.ToString("F2"))
-            .Append(" · Entropy: ").Append(TrainingPolicyStats.LastEntropy.ToString("F2"))
+        _sb.Append(heroName);
+        if (rewardSeries != null && rewardSeries.Count > 0)
+            _sb.Append("  Reward EMA: ").Append(rewardEma.ToString("F2"));
+        else
+            _sb.Append("  Reward live: ").Append(liveReward.ToString("F2"));
+        _sb.Append(" · Entropy: ").Append(TrainingPolicyStats.LastEntropy.ToString("F2"))
             .Append(" · SR: ");
 
         for (int i = 0; i < MaxSlots - 2; i++)
@@ -479,6 +489,19 @@ public sealed class TrainingMetricsBurstOverlay : MonoBehaviour
             case MetricsHero.Lily: return TrainingGraphOverlay.LilyEma;
             case MetricsHero.George: return TrainingGraphOverlay.GeorgeEma;
             default: return TrainingGraphOverlay.JackEma;
+        }
+    }
+
+    static float LiveCumulativeForHero(MetricsHero hero)
+    {
+        switch (hero)
+        {
+            case MetricsHero.Lily:
+                return TrainingGraphOverlay.GetPresentationLilyCumulativeReward();
+            case MetricsHero.George:
+                return TrainingGraphOverlay.GetPresentationGeorgeCumulativeReward();
+            default:
+                return TrainingGraphOverlay.GetPresentationJackCumulativeReward();
         }
     }
 
