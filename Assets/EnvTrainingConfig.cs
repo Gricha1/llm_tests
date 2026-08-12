@@ -526,6 +526,12 @@ public sealed class EnvTrainingConfig : MonoBehaviour
     /// </summary>
     void EnsureJackZombieSpawnersRunning(EnvTrainingTask resolved)
     {
+        if (TrainingEnvSpace.IsStreamingSurvivalMode)
+        {
+            StopJackZombieSpawnersInThisEnv();
+            return;
+        }
+
         if (resolved != EnvTrainingTask.JackZombie)
         {
             StopJackZombieSpawnersInThisEnv();

@@ -38,6 +38,10 @@ class TwitchClient:
     def can_send(self) -> bool:
         return bool(self.oauth) and not self.nick.startswith("justinfan")
 
+    @property
+    def connected(self) -> bool:
+        return bool(self._connected)
+
     def start(self) -> None:
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, name="twitch-irc", daemon=True)

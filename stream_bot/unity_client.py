@@ -78,3 +78,15 @@ class UnityClient:
                 "timestamp": int(time.time()),
             }
         )
+
+    def send_character_behavior(self, program: Dict[str, Any]) -> None:
+        self.send_payload(program)
+
+    def send_behavior_program(self, program: Dict[str, Any]) -> None:
+        self.send_payload(program)
+
+    def send_payload(self, payload: Dict[str, Any]) -> None:
+        data = dict(payload)
+        data.setdefault("timestamp", int(time.time()))
+        self._send(data)
+        log.info("UDP → Unity type=%s user=%s", data.get("type"), data.get("username"))

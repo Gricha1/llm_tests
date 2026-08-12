@@ -33,13 +33,18 @@ public static class BuildStreamLinux
             return;
         }
 
+        // CleanBuildCache forces managed assemblies to recompile (incremental can skip script changes).
+        var buildOpts = BuildOptions.CleanBuildCache;
+        if (GetArg("-cleanBuild") == "0")
+            buildOpts = BuildOptions.None;
+
         var options = new BuildPlayerOptions
         {
             scenes = scenes,
             locationPathName = locationPath,
             target = BuildTarget.StandaloneLinux64,
             subtarget = (int)StandaloneBuildSubtarget.Player,
-            options = BuildOptions.None,
+            options = buildOpts,
         };
 
         Debug.Log($"[BuildStreamLinux] Building Linux Player -> {locationPath}");

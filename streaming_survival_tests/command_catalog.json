@@ -1,0 +1,121 @@
+{
+  "version": 1,
+  "notes": "Catalog of Streaming Survival actions for tests and docs. Parser must distinguish movement vs resource.",
+  "actions": {
+    "go_to_water": {
+      "type": "movement",
+      "target_type": "water_source",
+      "success_condition": "character within water interaction radius",
+      "resource_delta": {},
+      "examples": ["иди к воде", "подойди к воде", "беги к воде"]
+    },
+    "collect_water": {
+      "type": "resource",
+      "target_type": "water_source",
+      "success_condition": "resource_guard_pass and water += count",
+      "resource_delta": {"water": 1},
+      "examples": ["добудь воду", "набери воды", "собери 2 воды"]
+    },
+    "go_home": {
+      "type": "movement",
+      "target_type": "home_interaction_point",
+      "success_condition": "character near home interaction point",
+      "aliases": ["go_to_base"],
+      "examples": ["иди домой", "вернись к дому", "подойди к базе"]
+    },
+    "go_to_base": {
+      "type": "movement",
+      "target_type": "home_interaction_point",
+      "success_condition": "alias of go_home",
+      "canonical": "go_home",
+      "examples": ["иди к базе"]
+    },
+    "go_to_campfire": {
+      "type": "movement",
+      "target_type": "campfire_slot",
+      "success_condition": "character near campfire slot",
+      "examples": ["иди к костру", "подойди к костру"]
+    },
+    "build_campfire": {
+      "type": "interaction",
+      "target_type": "campfire_slot",
+      "success_condition": "campfire action completed near slot",
+      "examples": ["поставь костер", "разведи костер", "ставь костёр"]
+    },
+    "go_to_tree": {
+      "type": "movement",
+      "target_type": "tree",
+      "success_condition": "character near tree",
+      "examples": ["иди к дереву", "подойди к дереву"]
+    },
+    "collect_wood": {
+      "type": "resource",
+      "target_type": "tree",
+      "resource_delta": {"wood": 1},
+      "examples": ["добудь дерево", "руби дерево", "собери 5 дерева", "5 раз добудь дерево"]
+    },
+    "go_to_sheep": {
+      "type": "movement",
+      "target_type": "sheep",
+      "success_condition": "character near sheep",
+      "examples": ["иди к овцам", "подойди к овечкам"]
+    },
+    "collect_food": {
+      "type": "resource",
+      "target_type": "sheep",
+      "resource_delta": {"food": 1},
+      "examples": ["собирай еду"]
+    },
+    "kill_sheep": {
+      "type": "resource",
+      "target_type": "sheep",
+      "resource_delta": {"food": 1},
+      "examples": ["убивай овечек"]
+    },
+    "collect_stone": {
+      "type": "resource",
+      "target_type": "stone",
+      "disabled": true,
+      "examples": ["добывай камень"]
+    },
+    "idle": {
+      "type": "behavior",
+      "target_type": "home",
+      "examples": ["жди", "ничего не делай", "гуляй у базы"]
+    },
+    "circle": {
+      "type": "behavior",
+      "canonical": "walk_circle",
+      "examples": ["ходи по кругу"]
+    },
+    "walk_circle": {
+      "type": "behavior",
+      "examples": ["ходи кругом", "ходи по кругу"]
+    },
+    "patrol": {
+      "type": "behavior",
+      "examples": ["вперёд и назад", "патрулируй"]
+    },
+    "walk_forward": {
+      "type": "behavior",
+      "examples": ["иди вперёд"]
+    },
+    "walk_back": {
+      "type": "behavior",
+      "examples": ["иди назад"]
+    },
+    "spin_in_place": {
+      "type": "behavior",
+      "examples": ["крутись на месте"]
+    },
+    "manual_respawn": {
+      "type": "system",
+      "aliases": ["respawn_character"],
+      "examples": ["перезагрузи персонажа"]
+    },
+    "attack_user": {
+      "type": "interaction",
+      "examples": ["атакуй mysticggx"]
+    }
+  }
+}

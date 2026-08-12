@@ -69,3 +69,34 @@ class EventLog:
                 conn.commit()
             finally:
                 conn.close()
+
+    def recent(self, limit: int = 20) -> list:
+        limit = max(1, min(100, int(limit)))
+        with self._lock:
+            conn = self._connect()
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT timestamp, type, username, command, value, message, raw_json
+                    FROM events
+                    ORDER BY id DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
+            finally:
+                conn.close()
+        out = []
+        for ts, etype, user, cmd, val, msg, raw in rows:
+            out.append(
+                {
+                    "timestamp": ts,
+                    "type": etype,
+                    "username": user,
+                    "command": cmd,
+                    "value": val,
+                    "message": msg,
+                    "raw_json": raw,
+                }
+            )
+        return out

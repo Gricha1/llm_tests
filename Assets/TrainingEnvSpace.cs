@@ -46,6 +46,8 @@ public static class TrainingEnvSpace
     static bool _envCountsCached;
 
     public static bool IsStreamOnlyMode => _runMode == EnvRunMode.StreamOnly;
+    /// <summary>Отдельный стрим без ML-Agents: зрители #join/#do. Не трогает train.</summary>
+    public static bool IsStreamingSurvivalMode { get; private set; }
     public static string StreamWeightsDirectory => _streamWeightsDirectory;
 
     /// <summary>
@@ -146,6 +148,18 @@ public static class TrainingEnvSpace
     static bool IsTruthyEnv(string value) =>
         value == "1" || string.Equals(value, "true", System.StringComparison.OrdinalIgnoreCase);
 
+    static bool DetectStreamingSurvivalFlag()
+    {
+        if (IsTruthyEnv(System.Environment.GetEnvironmentVariable("FOREST_STREAMING_SURVIVAL")))
+            return true;
+        foreach (var arg in System.Environment.GetCommandLineArgs())
+        {
+            if (arg == "-forestStreamingSurvival" || arg == "--forest-streaming-survival")
+                return true;
+        }
+        return false;
+    }
+
     /// Stream: только Env (presentation).
     /// TrainCopiesOnly: Env (1)…(11) в одном процессе.
     /// SingleEnvByPort: один Env в процессе, задача по (--mlagents-port - forestBasePort).
@@ -154,6 +168,8 @@ public static class TrainingEnvSpace
         if (IsTruthyEnv(System.Environment.GetEnvironmentVariable("FOREST_TRAIN_WITH_PRESENTATION")))
             return EnvRunMode.TrainWithPresentation;
         if (IsTruthyEnv(System.Environment.GetEnvironmentVariable("FOREST_STREAM_ONLY")))
+            return EnvRunMode.StreamOnly;
+        if (IsTruthyEnv(System.Environment.GetEnvironmentVariable("FOREST_STREAMING_SURVIVAL")))
             return EnvRunMode.StreamOnly;
         if (IsTruthyEnv(System.Environment.GetEnvironmentVariable("FOREST_TRAIN_COPIES_ONLY")))
             return EnvRunMode.TrainCopiesOnly;
@@ -165,6 +181,8 @@ public static class TrainingEnvSpace
         {
             var arg = args[i];
             if (arg == "-forestStreamOnly" || arg == "--forest-stream-only")
+                return EnvRunMode.StreamOnly;
+            if (arg == "-forestStreamingSurvival" || arg == "--forest-streaming-survival")
                 return EnvRunMode.StreamOnly;
             if (arg == "-forestTrainWithPresentation" || arg == "--forest-train-with-presentation")
                 return EnvRunMode.TrainWithPresentation;
@@ -295,7 +313,10 @@ public static class TrainingEnvSpace
 
     static void ApplyEnvRunMode()
     {
+        IsStreamingSurvivalMode = DetectStreamingSurvivalFlag();
         _runMode = ResolveEnvRunMode();
+        if (IsStreamingSurvivalMode)
+            _runMode = EnvRunMode.StreamOnly;
         _singleEnvTaskCopyIndex = -1;
         _singleEnvWorkerIndex = -1;
         _presentationWorkerZero = _runMode == EnvRunMode.SingleEnvByPort
@@ -863,6 +884,9 @@ public static class TrainingEnvSpace
     {
         if (env == null)
             return;
+        // Streaming Survival: зомби-этапы только для train.
+        if (IsStreamingSurvivalMode)
+            return;
 
         if (!IsDebugEnvFocusActive)
         {
@@ -1149,7 +1173,10 @@ public static class TrainingEnvSpace
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.BeforeSceneLoad)]
     static void InitializeRunModeEarly()
     {
+        IsStreamingSurvivalMode = DetectStreamingSurvivalFlag();
         _runMode = ResolveEnvRunMode();
+        if (IsStreamingSurvivalMode)
+            _runMode = EnvRunMode.StreamOnly;
         _presentationWorkerZero = _runMode == EnvRunMode.SingleEnvByPort
             && IsPresentationWorkerZeroRequested();
         _singleEnvWorkerIndex = _runMode == EnvRunMode.SingleEnvByPort

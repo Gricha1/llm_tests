@@ -1,113 +1,100 @@
-"""Парсер: активируется только с обращения «бот …»."""
+"""Публичные команды Streaming Survival: #join, #do, #exit."""
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional, Tuple
+from typing import Optional
 
 
 class ParsedKind(str, Enum):
-    HELP = "help"
-    PROFILE = "profile"
-    POINTS = "points"
-    TOP = "top"
-    STATUS = "status"
-    COMMAND = "command"
-    ASK = "ask"
-    UNKNOWN = "unknown"
+    JOIN = "join"
+    DO = "do"
+    EXIT = "exit"
     IGNORE = "ignore"
+    NEED_JOIN = "need_join"
 
 
 @dataclass
 class ParsedMessage:
     kind: ParsedKind
     raw: str
-    command: Optional[str] = None
-    value: Optional[float] = None
     text: Optional[str] = None
 
 
-# тело после «бот»
-_WAKE_RE = re.compile(r"^\s*бот[\s,.:!\-]+(.*)$", re.I | re.S)
-_WAKE_ONLY_RE = re.compile(r"^\s*бот\s*$", re.I)
-
-_NATURAL_COMMANDS: Tuple[Tuple[re.Pattern[str], str, float], ...] = (
-    (re.compile(r"(зомб|zombie)", re.I), "add_zombie", 2.0),
-    (re.compile(r"(еда|овц|food|sheep|корм)", re.I), "food_rain", 1.0),
-    (re.compile(r"(ночь|night|темн)", re.I), "night", 60.0),
-    (re.compile(r"(хаос|chaos|безумие)", re.I), "chaos", 30.0),
-    (re.compile(r"(хил|heal|вылеч|лечен)", re.I), "heal_agent", 15.0),
-    (re.compile(r"(сброс|reset|заново)", re.I), "reset", 0.0),
-)
-
-_HELP_RE = re.compile(r"(помог|команд|что\s+умеешь|help)", re.I)
-_PROFILE_RE = re.compile(r"(профиль|очк|points|profile)", re.I)
-_TOP_RE = re.compile(r"(^\s*топ\b|\btop\b)", re.I)
-_STATUS_RE = re.compile(r"(статус|status)", re.I)
-_ASK_RE = re.compile(r"(почему|зачем|why|что\s+происходит)", re.I)
+_HASH_RE = re.compile(r"^\s*#([a-zA-Zа-яА-ЯёЁ0-9_]+)(?:\s+(.*))?$", re.S)
+_DO_ALIASES = frozenset({"do", "behavior", "behaviour"})
+_EXIT_ALIASES = frozenset({"exit", "leave", "quit", "leave_game", "delete"})
 
 
-def parse_message(message: str, bot_nick: str = "") -> ParsedMessage:
+def parse_message(message: str, *, has_joined: bool = False) -> ParsedMessage:
     text = (message or "").strip()
-    if not text or text.lstrip().startswith("#"):
+    if not text:
         return ParsedMessage(ParsedKind.IGNORE, text)
-
-    lower = text.lower()
-    nick = (bot_nick or "").lstrip("@").lower()
-
-    body = ""
-    # @nick … тоже считаем обращением к боту
-    if nick and lower.startswith(f"@{nick}"):
-        body = re.sub(rf"^@{re.escape(nick)}\s*", "", text, flags=re.I).strip()
-    elif _WAKE_ONLY_RE.match(text):
-        return ParsedMessage(ParsedKind.HELP, text)
-    else:
-        m = _WAKE_RE.match(text)
-        if not m:
-            return ParsedMessage(ParsedKind.IGNORE, text)
-        body = (m.group(1) or "").strip()
-
-    if not body:
-        return ParsedMessage(ParsedKind.HELP, text)
-
-    return parse_bot_body(body, raw=text)
+    m = _HASH_RE.match(text)
+    if not m:
+        return ParsedMessage(ParsedKind.IGNORE, text)
+    cmd = (m.group(1) or "").lower()
+    arg = (m.group(2) or "").strip()
+    if cmd == "join":
+        return ParsedMessage(ParsedKind.JOIN, text, text=arg)
+    if cmd in _EXIT_ALIASES:
+        return ParsedMessage(ParsedKind.EXIT, text, text=arg)
+    if cmd in _DO_ALIASES:
+        if not has_joined:
+            return ParsedMessage(ParsedKind.NEED_JOIN, text, text=arg)
+        return ParsedMessage(ParsedKind.DO, text, text=arg)
+    return ParsedMessage(ParsedKind.IGNORE, text)
 
 
-def parse_bot_body(body: str, raw: str = "") -> ParsedMessage:
-    """Разбор текста после слова «бот»."""
-    raw = raw or body
-    if _HELP_RE.search(body):
-        return ParsedMessage(ParsedKind.HELP, raw, text=body)
-    if _TOP_RE.search(body):
-        return ParsedMessage(ParsedKind.TOP, raw, text=body)
-    if _PROFILE_RE.search(body):
-        return ParsedMessage(ParsedKind.PROFILE, raw, text=body)
-    if _STATUS_RE.search(body):
-        return ParsedMessage(ParsedKind.STATUS, raw, text=body)
-    if _ASK_RE.search(body):
-        return ParsedMessage(ParsedKind.ASK, raw, text=body)
-
-    for pattern, cmd, val in _NATURAL_COMMANDS:
-        if pattern.search(body):
-            num = re.search(r"\b([1-9]|10)\b", body)
-            use_val = float(num.group(1)) if num and cmd == "add_zombie" else val
-            if cmd == "night" and num:
-                use_val = float(max(10, min(120, int(num.group(1)))))
-            return ParsedMessage(ParsedKind.COMMAND, raw, command=cmd, value=use_val, text=body)
-
-    # не распознали — всё равно UNKNOWN, чтобы бот ответил
-    return ParsedMessage(ParsedKind.UNKNOWN, raw, text=body)
-
-
-HELP_TEXT = (
-    "Пиши: бот зомби | бот еда | бот ночь | бот хаос | бот хил | бот сброс | бот помощь"
+JOIN_PROMPT = "Пиши #join, чтобы войти в игру"
+JOIN_OK = "Ты добавлен в игру. Напиши #do добывай воду, чтобы задать действие."
+JOIN_ALREADY = "Ты уже в игре. Напиши #do <действие>, чтобы сменить действие."
+EXIT_OK = "Ты вышел из игры. Чтобы вернуться — #join."
+EXIT_NOT_IN = "Ты не в игре. Пиши #join, чтобы войти."
+FOLLOWER_ONLY = (
+    "Только фолловеры могут добавлять персонажей. Нажми Follow и попробуй ещё раз."
 )
-
+DO_EMPTY = "Напиши: #do <действие> (например: #do добывай воду)"
+HELP_TEXT = "#join — войти | #do <действие> — поведение | #exit — выйти"
 CHAT_TIPS = (
-    "бот зомби — добавить зомби",
-    "бот еда — еда рядом",
-    "бот ночь — ночь",
-    "бот помощь — список команд",
+    "Пиши #join, чтобы войти в игру",
+    "Пиши #do добывай воду / руби дерево / убивай овечек",
+    "Пиши #exit, чтобы выйти из игры",
 )
+
+# Публичный список для UI / тестов / подсказок
+AVAILABLE_ACTIONS = (
+    ("go_to_water", "иди к воде (без добычи)"),
+    ("go_to_campfire", "иди к костру (без постройки)"),
+    ("go_to_tree", "иди к дереву"),
+    ("go_to_sheep", "иди к овцам"),
+    ("go_home", "иди к дому / к базе"),
+    ("collect_water", "добывай воду / принеси воды"),
+    ("collect_wood", "руби дерево / дрова"),
+    ("collect_stone", "добывай камень"),
+    ("collect_food", "собирай еду"),
+    ("kill_sheep", "убивай овечек"),
+    ("build_campfire", "поставь костёр"),
+    ("manual_respawn", "перезагрузи персонажа"),
+    ("walk_circle", "ходи кругом / по кругу"),
+    ("walk_forward", "иди вперёд"),
+    ("walk_back", "иди назад"),
+    ("patrol", "вперёд и назад"),
+    ("spin_in_place", "крутись на месте"),
+    ("idle", "жди / гуляй у базы / кружись"),
+    ("attack_user", "атакуй игрока"),
+)
+
+
+def available_actions_text() -> str:
+    lines = ["Доступные #do действия:"]
+    for action, tip in AVAILABLE_ACTIONS:
+        lines.append(f"  • {action} — {tip}")
+    return "\n".join(lines)
+
+
+def cooldown_reply(seconds_left: int) -> str:
+    n = max(1, int(seconds_left))
+    return f"Подожди {n} сек. перед сменой действия."

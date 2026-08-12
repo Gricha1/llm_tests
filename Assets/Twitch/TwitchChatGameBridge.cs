@@ -63,45 +63,28 @@ public sealed class TwitchChatGameBridge : MonoBehaviour
 
     public void HandleCommand(TwitchChatCommand cmd)
     {
+        // MVP Follower Characters: чат больше не ломает мир зомби/едой/ресетом.
+        // Игровые #add/#zombie/#reset и т.п. игнорируем; персонажи идут через stream_bot (#join/#do).
         switch (cmd.CommandName)
         {
             case "add_tree":
-                HandleAddTree(cmd);
-                break;
             case "add_sheep":
-                HandleAddSheep(cmd);
-                break;
             case "up":
-                HandleUp(cmd);
-                break;
             case "forward":
-                HandleForward(cmd);
-                break;
             case "add_zombie":
-            case "zombie": // старый чат #zombie=
-                HandleAddZombie(cmd);
-                break;
+            case "zombie":
             case "clone_jack":
-                // Временно отключено: клон сбрасывает зомби/среду.
-                Debug.LogWarning("[TwitchChat] #clone_jack временно отключён");
-                break;
             case "size":
-                HandleSize(cmd);
-                break;
             case "speed_up":
-                HandleSpeedUp(cmd);
+            case "add_fire":
+            case "reset":
+                Debug.Log($"[TwitchChat] MVP ignore world cmd: #{cmd.CommandName}");
                 break;
             case "show_metrics":
             case "show_metrics_jack":
             case "show_metrics_lily":
             case "show_metrics_george":
                 HandleShowMetrics(cmd);
-                break;
-            case "add_fire":
-                HandleAddFire(cmd);
-                break;
-            case "reset":
-                HandleReset(cmd);
                 break;
             case "restart_stream":
                 HandleRestartStream(cmd);
@@ -195,6 +178,9 @@ public sealed class TwitchChatGameBridge : MonoBehaviour
 
     void HandleAddZombie(TwitchChatCommand cmd)
     {
+        if (TrainingEnvSpace.IsStreamingSurvivalMode)
+            return;
+
         int count = Mathf.Clamp(cmd.IntValue, 1, MaxZombiesPerCommand);
         var envRoot = TrainingEnvSpace.ActiveViewEnvRoot ?? TrainingEnvSpace.PresentationRoot;
         var jack = TrainingEnvSpace.FindViewJack();

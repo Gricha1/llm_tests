@@ -1,0 +1,272 @@
+[
+  {
+    "id": "collect_water_simple",
+    "chat_command": "#do добывай воду",
+    "expected_plan": [
+      {"action": "collect_water", "count": 1}
+    ],
+    "expected_target_type": "water_source",
+    "expected_resource_delta": {"water": 1},
+    "max_seconds": 90
+  },
+  {
+    "id": "collect_water_no_teleport",
+    "chat_command": "#do добывай воду",
+    "start_at": "home",
+    "expected_plan": [
+      {"action": "collect_water", "count": 1}
+    ],
+    "expected_target_type": "water_source",
+    "expected_resource_delta": {"water": 1},
+    "max_seconds": 90
+  },
+  {
+    "id": "go_home_no_teleport",
+    "chat_command": "#do иди к дому",
+    "start_at": "water",
+    "expected_plan": [
+      {"action": "go_home", "count": 1}
+    ],
+    "expected_target_type": "home_interaction_point",
+    "max_seconds": 60
+  },
+  {
+    "id": "go_home_no_teleport_strict",
+    "chat_command": "#do иди к дому",
+    "start_at": "water",
+    "expected_plan": [
+      {"action": "go_home", "count": 1}
+    ],
+    "expected_target_type": "home_interaction_point",
+    "forbid_controlled_teleport": true,
+    "max_seconds": 60
+  },
+  {
+    "id": "stuck_near_fence_no_target_teleport",
+    "chat_command": "#do иди к дому",
+    "start_at": "near_fence",
+    "expected_plan": [
+      {"action": "go_home", "count": 1}
+    ],
+    "expected_target_type": "home_interaction_point",
+    "max_seconds": 55
+  },
+  {
+    "id": "collect_wood_simple",
+    "chat_command": "#do добывай дерево",
+    "expected_plan": [
+      {"action": "collect_wood", "count": 1}
+    ],
+    "expected_target_type": "tree",
+    "expected_resource_delta": {"wood": 1},
+    "max_seconds": 60
+  },
+  {
+    "id": "stone_disabled_no_collection",
+    "chat_command": "#do добывай камень",
+    "expected_plan": [
+      {"action": "collect_stone", "count": 1}
+    ],
+    "negative_test": "force_complete_far",
+    "expect_no_resource_credit": true,
+    "expected_resource_delta": {"stone": 0},
+    "max_seconds": 5
+  },
+  {
+    "id": "cannot_collect_water_from_forest",
+    "chat_command": "#do добывай воду",
+    "expected_plan": [
+      {"action": "collect_water", "count": 1}
+    ],
+    "negative_test": "force_complete_far",
+    "expect_no_resource_credit": true,
+    "expected_resource_delta": {"water": 0},
+    "max_seconds": 5
+  },
+  {
+    "id": "cannot_collect_wood_far_from_tree",
+    "chat_command": "#do добывай дерево",
+    "expected_plan": [
+      {"action": "collect_wood", "count": 1}
+    ],
+    "negative_test": "force_complete_far",
+    "expect_no_resource_credit": true,
+    "expected_resource_delta": {"wood": 0},
+    "max_seconds": 5
+  },
+  {
+    "id": "cannot_collect_food_far_from_sheep",
+    "chat_command": "#do убивай овечек",
+    "expected_plan": [
+      {"action": "kill_sheep", "count": 1}
+    ],
+    "negative_test": "force_complete_far",
+    "expect_no_resource_credit": true,
+    "expected_resource_delta": {"food": 0},
+    "max_seconds": 5
+  },
+  {
+    "id": "water_then_campfire",
+    "chat_command": "#do набери 2 штуки воды и иди ставь костер",
+    "expected_plan": [
+      {"action": "collect_water", "count": 2},
+      {"action": "build_campfire", "count": 1}
+    ],
+    "expected_resource_delta": {"water": 2},
+    "max_seconds": 200
+  },
+  {
+    "id": "water_home_wood_chain",
+    "chat_command": "#do иди к воде собери 5 штук а потом к дому а потом собери 5 дерева",
+    "expected_plan": [
+      {"action": "collect_water", "count": 5},
+      {"action": "go_home", "count": 1},
+      {"action": "collect_wood", "count": 5}
+    ],
+    "expected_resource_delta": {"water": 5, "wood": 5},
+    "max_seconds": 480
+  },
+  {
+    "id": "circle",
+    "chat_command": "#do ходи по кругу",
+    "expected_plan": [
+      {"action": "circle", "count": 1}
+    ],
+    "expected_motion_pattern": "circle",
+    "max_seconds": 28
+  },
+  {
+    "id": "forward_backward",
+    "chat_command": "#do хочу чтобы ты шел вперед а потом шел назад",
+    "expected_plan": [
+      {"action": "patrol", "count": 1}
+    ],
+    "expected_motion_pattern": "patrol",
+    "max_seconds": 20
+  },
+  {
+    "id": "idle",
+    "chat_command": "#do ничего не делай",
+    "expected_plan": [
+      {"action": "idle", "count": 1}
+    ],
+    "expected_motion_pattern": "idle",
+    "max_seconds": 10
+  },
+  {
+    "id": "join_default_idle",
+    "chat_command": "#join",
+    "expected_plan": [
+      {"action": "idle", "count": 1}
+    ],
+    "expected_motion_pattern": "idle",
+    "expected_resource_delta": {"water": 0, "wood": 0, "food": 0},
+    "expect_join_default_idle": true,
+    "max_seconds": 12
+  },
+  {
+    "id": "join_idempotent",
+    "chat_command": "#join",
+    "expected_plan": [],
+    "expect_join": true,
+    "expect_no_duplicate_on_repeat_join": true,
+    "max_seconds": 5
+  },
+    {
+    "id": "action_cooldown",
+    "chat_command": "#do добывай воду",
+    "expected_plan": [
+      {"action": "collect_water", "count": 1}
+    ],
+    "expect_cooldown_reject_second_do": true,
+    "cooldown_seconds": 10,
+    "max_seconds": 15
+  },
+  {
+    "id": "seq_campfire_wood_water",
+    "chat_command": "#do иди к костру, затем 5 раз добудь дерево затем иди к воде",
+    "expected_plan": [
+      {"action": "go_to_campfire", "count": 1},
+      {"action": "collect_wood", "count": 5},
+      {"action": "go_to_water", "count": 1}
+    ],
+    "expected_resource_delta": {"wood": 5, "water": 0},
+    "forbid_controlled_teleport": true,
+    "max_seconds": 420
+  },
+  {
+    "id": "go_to_water_only",
+    "chat_command": "#do иди к воде",
+    "expected_plan": [
+      {"action": "go_to_water", "count": 1}
+    ],
+    "expected_target_type": "water_source",
+    "expected_resource_delta": {"water": 0},
+    "forbid_controlled_teleport": true,
+    "max_seconds": 90
+  },
+  {
+    "id": "collect_water_only",
+    "chat_command": "#do добудь воду",
+    "expected_plan": [
+      {"action": "collect_water", "count": 1}
+    ],
+    "expected_target_type": "water_source",
+    "expected_resource_delta": {"water": 1},
+    "max_seconds": 90
+  },
+  {
+    "id": "go_home_only",
+    "chat_command": "#do иди домой",
+    "start_at": "water",
+    "expected_plan": [
+      {"action": "go_home", "count": 1}
+    ],
+    "expected_target_type": "home_interaction_point",
+    "forbid_controlled_teleport": true,
+    "max_seconds": 60
+  },
+  {
+    "id": "go_to_campfire_only",
+    "chat_command": "#do иди к костру",
+    "expected_plan": [
+      {"action": "go_to_campfire", "count": 1}
+    ],
+    "expected_target_type": "campfire_slot",
+    "forbid_controlled_teleport": true,
+    "max_seconds": 45
+  },
+  {
+    "id": "collect_wood_5",
+    "chat_command": "#do 5 раз добудь дерево",
+    "expected_plan": [
+      {"action": "collect_wood", "count": 5}
+    ],
+    "expected_target_type": "tree",
+    "expected_resource_delta": {"wood": 5},
+    "max_seconds": 240
+  },
+  {
+    "id": "water_2_then_campfire",
+    "chat_command": "#do набери 2 воды и иди ставь костер",
+    "expected_plan": [
+      {"action": "collect_water", "count": 2},
+      {"action": "build_campfire", "count": 1}
+    ],
+    "expected_resource_delta": {"water": 2},
+    "max_seconds": 200
+  },
+  {
+    "id": "wrong_target_visual_water",
+    "chat_command": "#do иди к воде",
+    "expected_plan": [
+      {"action": "go_to_water", "count": 1}
+    ],
+    "expected_target_type": "water_source",
+    "expected_resource_delta": {"water": 0},
+    "require_visual_check": true,
+    "visual_question": "Персонаж действительно находится около воды/пруда?",
+    "forbid_controlled_teleport": true,
+    "max_seconds": 90
+  }
+]

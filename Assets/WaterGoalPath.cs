@@ -183,6 +183,71 @@ public sealed class WaterGoalPath : MonoBehaviour
         return progress.CurrentIndex >= _goals.Length;
     }
 
+    /// <summary>
+    /// Для Streaming Survival: текущий GoalWater чекпоинт; при подходе — следующий.
+    /// false = путь пройден (можно идти к WaterSource).
+    /// centerOnly: arrive by XZ distance to goal pivot (ignore huge training trigger volumes).
+    /// </summary>
+    public bool TryGetFollowerWaypoint(Transform agent, float arriveDist, out Vector3 worldPos)
+    {
+        return TryGetFollowerWaypoint(agent, arriveDist, out worldPos, centerOnly: false);
+    }
+
+    public bool TryGetFollowerWaypoint(
+        Transform agent, float arriveDist, out Vector3 worldPos, bool centerOnly)
+    {
+        worldPos = default;
+        if (agent == null || !HasAnyGoal())
+            return false;
+
+        AgentProgress progress = GetProgress(agent);
+        AdvancePastMissingGoals(progress);
+        if (progress.CurrentIndex >= _goals.Length)
+            return false;
+
+        Transform goal = _goals[progress.CurrentIndex];
+        if (goal == null)
+            return false;
+
+        Collider goalCol = _goalColliders[progress.CurrentIndex];
+        Bounds goalBounds = _goalBounds[progress.CurrentIndex].size.sqrMagnitude > 0.01f
+            ? _goalBounds[progress.CurrentIndex]
+            : BuildGoalBounds(goal);
+
+        bool arrived;
+        if (centerOnly)
+        {
+            // SS followers must visit GoalWater1 center before GoalWater2.
+            // Training GoalWater triggers are often huge → ClosestPoint would skip GW1.
+            Vector3 a = agent.position;
+            Vector3 g = goal.position;
+            float dx = a.x - g.x;
+            float dz = a.z - g.z;
+            arrived = (dx * dx + dz * dz) <= arriveDist * arriveDist;
+        }
+        else
+        {
+            arrived = IsInsideGoal(agent.position, goalCol, goal, goalBounds)
+                || GetDistanceToGoal(agent.position, goalCol, goal, goalBounds) <= arriveDist;
+        }
+
+        if (arrived)
+        {
+            progress.CurrentIndex++;
+            progress.PrevDist = -1f;
+            AdvancePastMissingGoals(progress);
+            RefreshGoalRayVisibility();
+            if (progress.CurrentIndex >= _goals.Length)
+                return false;
+            goal = _goals[progress.CurrentIndex];
+            if (goal == null)
+                return false;
+        }
+
+        worldPos = goal.position;
+        return true;
+    }
+
     void Initialize()
     {
         if (_initialized)

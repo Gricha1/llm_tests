@@ -8,16 +8,20 @@
 """
 from __future__ import annotations
 
+import html
 import json
 import os
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -25,8 +29,17 @@ from typing import Any
 HOST = os.environ.get("FOREST_UI_HOST", "0.0.0.0")
 PORT = int(os.environ.get("FOREST_UI_PORT", "8877"))
 ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+# lab_comp scripts dir for llm_bot_manager
+_LAB_SCRIPTS = Path(__file__).resolve().parent
+if str(_LAB_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_LAB_SCRIPTS))
+
 CFG_PATH = ROOT / ".train_lab_ui.json"
 LOG_DIR = ROOT / ".train_lab_ui" / "logs"
+SS_PREVIEW_DIR = ROOT / ".train_lab_ui" / "ss_preview"
+SS_PREVIEW_FRAME = SS_PREVIEW_DIR / "frame.jpg"
 REMOTE_DIR = "~/lab_work_space/forest_survival"
 DEFAULT_BUILD = "stream_forest_survival_2_12_07_2026"
 DEFAULT_TB = "http://10.43.71.7:6006"
@@ -106,6 +119,28 @@ _cfg_lock = threading.Lock()
 _jobs_lock = threading.Lock()
 _jobs: dict[str, dict[str, Any]] = {}
 _ssh_host_cache: str | None = None
+_ssh_gate = threading.Semaphore(2)  # не больше 2 параллельных ssh — иначе UI на Windows клинит
+_ssh_active_lock = threading.Lock()
+# pid -> {proc, started, remote, host}
+_ssh_active: dict[int, dict[str, Any]] = {}
+_ssh_reaper_started = False
+_SSH_STALE_SEC = 35.0  # висячий ssh старше этого — kill
+_stats_lock = threading.Lock()
+_stats_cache: dict[str, Any] = {"t": 0.0, "data": None}
+_stats_inflight = False
+_STATS_CACHE_TTL = 6.0
+_STATS_STALE_MAX = 90.0
+_EMPTY_ACTIVITY = {
+    "jack": False,
+    "lily": False,
+    "george": False,
+    "joint": False,
+    "validate": False,
+    "stream": False,
+    "streaming_survival": False,
+    "llm_bot": False,
+    "tasks": [],
+}
 
 
 # ── config ──────────────────────────────────────────────────────────
@@ -137,14 +172,80 @@ def deep_merge(dst: dict, src: dict) -> None:
 
 # ── ssh / shell ─────────────────────────────────────────────────────
 
-# lab_comp в ssh-config часто = только ZeroTier; второй путь — 192.168.194.7.
+# Сначала ssh-config alias (обычно живой), потом запасные IP.
 SSH_FALLBACK_HOSTS = (
     "lab_comp",
-    "reedgern@10.43.71.7",
     "reedgern@192.168.194.7",
+    "reedgern@10.43.71.7",
     "lab_comp_local",
     "reedgern@192.168.50.18",
 )
+_LAB_SELF_IPS = frozenset(
+    {
+        "192.168.194.7",
+        "10.43.71.7",
+        "192.168.50.18",
+    }
+)
+_SSH_HOST_FILE = ROOT / ".train_lab_ui_ssh_host"
+_ui_local_mode: bool | None = None
+
+
+def ui_runs_on_lab() -> bool:
+    """True when this UI process already runs ON lab_comp.
+
+    In that case Windows→lab SSH keys are irrelevant: the UI must not SSH to
+    itself (BatchMode → Permission denied). Run shell commands locally instead.
+    """
+    global _ui_local_mode
+    if _ui_local_mode is not None:
+        return _ui_local_mode
+    env = (os.environ.get("FOREST_UI_LOCAL") or "").strip().lower()
+    if env in ("1", "true", "yes", "on"):
+        _ui_local_mode = True
+        return True
+    if env in ("0", "false", "no", "off") or (
+        os.environ.get("FOREST_UI_FORCE_SSH") or ""
+    ).strip().lower() in ("1", "true", "yes"):
+        _ui_local_mode = False
+        return False
+    try:
+        root_s = str(ROOT).replace("\\", "/")
+        if "/lab_work_space/forest_survival" in root_s or root_s.endswith(
+            "/lab_work_space/forest_survival"
+        ):
+            _ui_local_mode = True
+            return True
+    except Exception:
+        pass
+    try:
+        import socket
+
+        hn = socket.gethostname().lower()
+        if "server1" in hn or hn in ("lab_comp", "labcomp"):
+            _ui_local_mode = True
+            return True
+        ips: set[str] = set()
+        try:
+            for info in socket.getaddrinfo(socket.gethostname(), None):
+                ips.add(info[4][0])
+        except Exception:
+            pass
+        # Also common primary interface guess
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ips.add(s.getsockname()[0])
+            s.close()
+        except Exception:
+            pass
+        if ips & _LAB_SELF_IPS:
+            _ui_local_mode = True
+            return True
+    except Exception:
+        pass
+    _ui_local_mode = False
+    return False
 
 
 def ssh_candidates(preferred: str | None = None) -> list[str]:
@@ -177,13 +278,39 @@ def _ssh_bins() -> list[str]:
 def _ssh_probe(bin_: str, host: str, connect_timeout: int = 6) -> bool:
     try:
         r = subprocess.run(
-            [bin_, "-o", "BatchMode=yes", "-o", f"ConnectTimeout={connect_timeout}", host, "true"],
+            [
+                bin_,
+                "-o", "BatchMode=yes",
+                "-o", f"ConnectTimeout={connect_timeout}",
+                "-o", "ConnectionAttempts=1",
+                "-o", "ServerAliveInterval=3",
+                "-o", "ServerAliveCountMax=2",
+                host,
+                "true",
+            ],
             capture_output=True,
             timeout=connect_timeout + 6,
         )
         return r.returncode == 0
     except Exception:
         return False
+
+
+def _load_saved_ssh_host() -> str | None:
+    try:
+        if _SSH_HOST_FILE.is_file():
+            h = _SSH_HOST_FILE.read_text(encoding="utf-8").strip()
+            return h or None
+    except Exception:
+        pass
+    return None
+
+
+def _save_ssh_host(host: str) -> None:
+    try:
+        _SSH_HOST_FILE.write_text(host.strip() + "\n", encoding="utf-8")
+    except Exception:
+        pass
 
 
 def clear_ssh_host_cache() -> None:
@@ -194,18 +321,33 @@ def clear_ssh_host_cache() -> None:
 def resolve_ssh_host(preferred: str = "lab_comp", *, force: bool = False) -> str:
     """Пробует alias + оба IP (ZT / 194). Не кэширует мёртвый хост."""
     global _ssh_host_cache
+    if ui_runs_on_lab():
+        _ssh_host_cache = "local"
+        return "local"
     if _ssh_host_cache and not force:
         return _ssh_host_cache
+    saved = _load_saved_ssh_host()
+    if saved == "local" and ui_runs_on_lab():
+        _ssh_host_cache = "local"
+        return "local"
+    if saved and saved != "local" and not force and _ssh_probe(ssh_bin(), saved, connect_timeout=4):
+        _ssh_host_cache = saved
+        return saved
     for bin_ in _ssh_bins():
         for host in ssh_candidates(preferred):
+            if host == "local":
+                continue
             if _ssh_probe(bin_, host):
                 _ssh_host_cache = host
+                _save_ssh_host(host)
                 os.environ["FOREST_UI_SSH_BIN"] = bin_
                 return host
     # Не кэшируем preferred при полном фейле — иначе второй IP больше не пробуется.
     raise RuntimeError(
         "SSH: не достучались ни до одного адреса lab_comp "
-        f"({', '.join(ssh_candidates(preferred))})"
+        f"({', '.join(ssh_candidates(preferred))}). "
+        "Если UI уже запущен НА lab_comp — поставь FOREST_UI_LOCAL=1 "
+        "(или обнови train_lab_ui.py: локальный режим без SSH к себе)."
     )
 
 
@@ -217,22 +359,189 @@ def scp_bin() -> str:
     return os.environ.get("FOREST_UI_SCP_BIN") or ("scp.exe" if shutil.which("scp.exe") else "scp")
 
 
+def _ssh_common_opts() -> list[str]:
+    """Быстрее рвём мёртвые коннекты, без долгих retry."""
+    return [
+        "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=5",
+        "-o", "ConnectionAttempts=1",
+        "-o", "ServerAliveInterval=3",
+        "-o", "ServerAliveCountMax=2",
+        "-o", "StrictHostKeyChecking=accept-new",
+    ]
+
+
+def _kill_ssh_proc(proc: subprocess.Popen) -> None:
+    """Жёстко гасим ssh + дочерние (на Windows иначе остаются висячие ssh.exe)."""
+    if proc is None:
+        return
+    try:
+        if proc.poll() is not None:
+            return
+    except Exception:
+        return
+    pid = getattr(proc, "pid", None)
+    try:
+        proc.kill()
+    except Exception:
+        pass
+    if pid and os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                capture_output=True,
+                timeout=5,
+            )
+        except Exception:
+            pass
+    else:
+        try:
+            if pid:
+                os.killpg(pid, 9)  # type: ignore[attr-defined]
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+    try:
+        proc.wait(timeout=2)
+    except Exception:
+        pass
+
+
+def cleanup_stale_ssh(max_age: float | None = None) -> int:
+    """Убивает висячие SSH, запущенные этим UI. Возвращает число убитых."""
+    age = float(_SSH_STALE_SEC if max_age is None else max_age)
+    now = time.time()
+    killed = 0
+    with _ssh_active_lock:
+        items = list(_ssh_active.items())
+    for pid, meta in items:
+        proc = meta.get("proc")
+        started = float(meta.get("started") or 0)
+        try:
+            alive = proc is not None and proc.poll() is None
+        except Exception:
+            alive = False
+        if not alive:
+            with _ssh_active_lock:
+                _ssh_active.pop(pid, None)
+            continue
+        if now - started < age:
+            continue
+        _kill_ssh_proc(proc)
+        with _ssh_active_lock:
+            _ssh_active.pop(pid, None)
+        killed += 1
+    return killed
+
+
+def _ensure_ssh_reaper() -> None:
+    global _ssh_reaper_started
+    if _ssh_reaper_started:
+        return
+    _ssh_reaper_started = True
+
+    def loop() -> None:
+        while True:
+            try:
+                cleanup_stale_ssh()
+            except Exception:
+                pass
+            time.sleep(8.0)
+
+    threading.Thread(target=loop, name="ssh-stale-reaper", daemon=True).start()
+
+
+def _ssh_popen(host: str, remote_cmd: str) -> subprocess.Popen:
+    kwargs: dict[str, Any] = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+    }
+    if os.name != "nt":
+        kwargs["start_new_session"] = True
+    return subprocess.Popen(
+        [ssh_bin(), *_ssh_common_opts(), host, remote_cmd],
+        **kwargs,
+    )
+
+
+def _ssh_communicate(proc: subprocess.Popen, timeout: float | None) -> subprocess.CompletedProcess:
+    pid = int(proc.pid)
+    # Never pass 0 — subprocess reports "timed out after 0.0 seconds" and looks broken.
+    eff_timeout: float | None
+    if timeout is None:
+        eff_timeout = None
+    else:
+        eff_timeout = max(3.0, float(timeout))
+    with _ssh_active_lock:
+        _ssh_active[pid] = {
+            "proc": proc,
+            "started": time.time(),
+            "host": "",
+            "remote": "",
+        }
+    try:
+        try:
+            out, err = proc.communicate(timeout=eff_timeout)
+        except subprocess.TimeoutExpired as e:
+            _kill_ssh_proc(proc)
+            try:
+                out, err = proc.communicate(timeout=2)
+            except Exception:
+                out, err = "", ""
+            raise subprocess.TimeoutExpired(e.cmd, eff_timeout or 0, output=out, stderr=err) from None
+        return subprocess.CompletedProcess(
+            proc.args, proc.returncode if proc.returncode is not None else -1, out, err
+        )
+    finally:
+        with _ssh_active_lock:
+            _ssh_active.pop(pid, None)
+
+
 def _is_ssh_connect_error(r: subprocess.CompletedProcess | None, exc: BaseException | None = None) -> bool:
     text = ""
     if r is not None:
-        text = f"{r.stderr or ''}{r.stdout or ''}".lower()
+        text = ((r.stderr or "") + "\n" + (r.stdout or "")).lower()
     if exc is not None:
-        text += f" {exc}".lower()
+        text += "\n" + str(exc).lower()
     keys = (
-        "connection timed out",
+        "timed out",
+        "timeout",
         "connection refused",
+        "connection timed out",
         "no route to host",
         "network is unreachable",
         "could not resolve hostname",
+        "name or service not known",
         "connection reset by peer",
         "connection closed by remote host",
+        "kex_exchange_identification",
+        "banner exchange",
+        "ssh_exchange_identification",
     )
     return any(k in text for k in keys)
+
+
+def _local_shell_run(
+    remote_cmd: str, timeout: float | None = 120
+) -> subprocess.CompletedProcess:
+    """Run a lab shell snippet locally (UI already on lab_comp)."""
+    global _ssh_host_cache
+    _ssh_host_cache = "local"
+    # Expand ~/ for login-shell consistency with remote ssh snippets.
+    cmd = f"cd {sh_quote(str(ROOT))} && {remote_cmd}"
+    return subprocess.run(
+        ["bash", "-lc", cmd],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=None if timeout is None else max(3.0, float(timeout)),
+    )
 
 
 def ssh_run(
@@ -241,57 +550,254 @@ def ssh_run(
     timeout: float | None = 120,
     *,
     preferred: str | None = None,
+    gate_timeout: float = 12.0,
+    skip_if_busy: bool = False,
 ) -> subprocess.CompletedProcess:
-    """SSH с failover: при timeout/refusal пробует остальные IP lab_comp."""
+    """SSH с failover: при timeout/refusal пробует остальные IP lab_comp.
+
+    Если UI уже на lab — выполняет команду локально (без SSH к себе).
+    Висячие ssh убиваются по timeout процесса и фоновым reaper'ом.
+    skip_if_busy=True — для частых health-probe: не ждать слот, а сразу выйти.
+    """
     global _ssh_host_cache
+    if ui_runs_on_lab() or host == "local":
+        try:
+            return _local_shell_run(remote_cmd, timeout=timeout)
+        except subprocess.TimeoutExpired as e:
+            raise TimeoutError(f"local lab cmd timeout: {e}") from e
+
+    _ensure_ssh_reaper()
+    cleanup_stale_ssh()
+
     preferred = preferred or "lab_comp"
     try:
         preferred = (load_cfg().get("ssh_host") or preferred)
     except Exception:
         pass
     hosts: list[str] = []
-    if host:
+    if host and host != "local":
         hosts.append(host)
     for h in ssh_candidates(preferred):
-        if h not in hosts:
+        if h and h != "local" and h not in hosts:
             hosts.append(h)
 
     last: subprocess.CompletedProcess | None = None
     last_exc: BaseException | None = None
     tried: list[str] = []
-    for h in hosts:
-        tried.append(h)
-        try:
-            r = subprocess.run(
-                [ssh_bin(), "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", h, remote_cmd],
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                encoding="utf-8",
-                errors="replace",
-            )
-            last = r
-            if r.returncode == 0:
-                _ssh_host_cache = h
-                return r
-            if not _is_ssh_connect_error(r):
-                # Команда на сервере упала — хост живой, не крутим IP.
-                _ssh_host_cache = h
-                return r
-            clear_ssh_host_cache()
-        except Exception as e:
-            last_exc = e
-            if not _is_ssh_connect_error(None, e):
-                raise
-            clear_ssh_host_cache()
-            continue
 
-    err = (last.stderr or last.stdout or "") if last else str(last_exc or "ssh failed")
-    raise RuntimeError(f"[ssh tried {', '.join(tried)}] {err.strip()}")
+    got_gate = _ssh_gate.acquire(timeout=max(0.05, float(gate_timeout)))
+    if not got_gate:
+        cleanup_stale_ssh(max_age=12.0)  # агрессивнее чистим, если слот занят
+        got_gate = _ssh_gate.acquire(timeout=2.0 if not skip_if_busy else 0.05)
+    if not got_gate:
+        raise TimeoutError("SSH занят (слишком много параллельных запросов к lab_comp)")
+    try:
+        for h in hosts:
+            tried.append(h)
+            proc: subprocess.Popen | None = None
+            try:
+                proc = _ssh_popen(h, remote_cmd)
+                r = _ssh_communicate(proc, timeout)
+                last = r
+                if r.returncode == 0:
+                    _ssh_host_cache = h
+                    _save_ssh_host(h)
+                    return r
+                if not _is_ssh_connect_error(r):
+                    # Команда на сервере упала — хост живой, не крутим IP.
+                    _ssh_host_cache = h
+                    _save_ssh_host(h)
+                    return r
+                clear_ssh_host_cache()
+            except Exception as e:
+                last_exc = e
+                if proc is not None:
+                    _kill_ssh_proc(proc)
+                if not _is_ssh_connect_error(None, e):
+                    raise
+                clear_ssh_host_cache()
+                continue
+    finally:
+        _ssh_gate.release()
+
+    if last is not None:
+        return last
+    raise RuntimeError(f"SSH fail after {tried}: {last_exc}")
 
 
 def sh_quote(s: str) -> str:
     return "'" + s.replace("'", "'\"'\"'") + "'"
+
+
+try:
+    from llm_bot_manager import LabBotManager
+
+    LLM_BOT = LabBotManager(
+        ssh_run=ssh_run,
+        resolve_ssh_host=resolve_ssh_host,
+        load_cfg=load_cfg,
+        remote_dir=REMOTE_DIR,
+        sh_quote=sh_quote,
+    )
+    _LLM_BOT_IMPORT_ERROR = ""
+    _ensure_ssh_reaper()
+except Exception as _llm_imp_err:  # pragma: no cover
+    LLM_BOT = None  # type: ignore
+    _LLM_BOT_IMPORT_ERROR = str(_llm_imp_err)
+    _ensure_ssh_reaper()
+
+
+class SsLabPreview:
+    """Live screenshot of lab_comp DISPLAY=:1 (Streaming Survival Unity window)."""
+
+    CAPTURE_CMD = (
+        "DISPLAY=:1 import -window root -resize 960x -quality 50 jpeg:- 2>/dev/null"
+    )
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+        self._running = False
+        self._last_ok_at = 0.0
+        self._last_err = ""
+        self._frames = 0
+        self._interval = 1.6
+        self._display = ":1"
+        SS_PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+
+    def status(self) -> dict[str, Any]:
+        with self._lock:
+            sz = SS_PREVIEW_FRAME.stat().st_size if SS_PREVIEW_FRAME.is_file() else 0
+            return {
+                "running": self._running,
+                "display": self._display,
+                "interval_sec": self._interval,
+                "frames": self._frames,
+                "last_ok_at": self._last_ok_at,
+                "last_error": self._last_err,
+                "frame_bytes": sz,
+                "frame_url": "/api/ss_preview/frame.jpg",
+                "has_frame": sz > 1000,
+            }
+
+    def start(self, interval_sec: float = 1.6) -> dict[str, Any]:
+        with self._lock:
+            self._interval = max(0.8, min(5.0, float(interval_sec or 1.6)))
+            if self._running:
+                return self.status()
+            self._stop.clear()
+            self._running = True
+            self._last_err = ""
+            self._thread = threading.Thread(
+                target=self._loop, name="ss-lab-preview", daemon=True
+            )
+            self._thread.start()
+        # Immediate first frame (best-effort)
+        try:
+            self.capture_once()
+        except Exception as e:
+            with self._lock:
+                self._last_err = str(e)
+        return self.status()
+
+    def stop(self) -> dict[str, Any]:
+        with self._lock:
+            self._stop.set()
+            self._running = False
+            th = self._thread
+        if th and th.is_alive():
+            th.join(timeout=3.0)
+        with self._lock:
+            self._thread = None
+        return self.status()
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self.capture_once()
+            except Exception as e:
+                with self._lock:
+                    self._last_err = str(e)
+            self._stop.wait(self._interval)
+        with self._lock:
+            self._running = False
+
+    def capture_once(self) -> Path:
+        data = self._ssh_capture_jpeg()
+        if len(data) < 800 or data[:2] != b"\xff\xd8":
+            raise RuntimeError(
+                f"bad jpeg from lab ({len(data)} bytes) — is DISPLAY=:1 / Unity up?"
+            )
+        tmp = SS_PREVIEW_DIR / "frame.jpg.tmp"
+        tmp.write_bytes(data)
+        tmp.replace(SS_PREVIEW_FRAME)
+        with self._lock:
+            self._frames += 1
+            self._last_ok_at = time.time()
+            self._last_err = ""
+        return SS_PREVIEW_FRAME
+
+    def _ssh_capture_jpeg(self) -> bytes:
+        """Binary capture of DISPLAY=:1. Local when UI runs on lab_comp."""
+        if ui_runs_on_lab() or resolve_ssh_host() == "local":
+            proc = subprocess.run(
+                ["bash", "-lc", self.CAPTURE_CMD],
+                capture_output=True,
+                timeout=18,
+            )
+            out = proc.stdout or b""
+            if proc.returncode not in (0, None) and not out:
+                msg = (proc.stderr or b"").decode("utf-8", "replace")[:240]
+                raise RuntimeError(f"import failed rc={proc.returncode}: {msg}")
+            return out
+
+        _ensure_ssh_reaper()
+        cleanup_stale_ssh()
+        host = resolve_ssh_host()
+        got = _ssh_gate.acquire(timeout=4.0)
+        if not got:
+            raise TimeoutError("SSH занят — preview пропустил кадр")
+        try:
+            kwargs: dict[str, Any] = {
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.PIPE,
+            }
+            if os.name != "nt":
+                kwargs["start_new_session"] = True
+            proc = subprocess.Popen(
+                [ssh_bin(), *_ssh_common_opts(), host, self.CAPTURE_CMD],
+                **kwargs,
+            )
+            pid = int(proc.pid)
+            with _ssh_active_lock:
+                _ssh_active[pid] = {
+                    "proc": proc,
+                    "started": time.time(),
+                    "host": host,
+                    "remote": "ss_preview_import",
+                }
+            try:
+                out, err = proc.communicate(timeout=18)
+            except subprocess.TimeoutExpired:
+                _kill_ssh_proc(proc)
+                try:
+                    out, err = proc.communicate(timeout=2)
+                except Exception:
+                    out, err = b"", b""
+                raise TimeoutError("preview SSH timeout") from None
+            finally:
+                with _ssh_active_lock:
+                    _ssh_active.pop(pid, None)
+            if proc.returncode not in (0, None) and not out:
+                msg = (err or b"").decode("utf-8", "replace")[:240]
+                raise RuntimeError(f"import failed rc={proc.returncode}: {msg}")
+            return out or b""
+        finally:
+            _ssh_gate.release()
+
+
+SS_PREVIEW = SsLabPreview()
 
 
 def remote_expand_cmd(path: str) -> str:
@@ -615,11 +1121,38 @@ def list_result_dirs(host: str) -> list[str]:
         return []
 
 
-def fetch_lab_activity(host: str | None = None) -> dict[str, Any]:
-    """Что сейчас крутится на lab: train/validate/stream (для подсветки карточек)."""
-    # Важно: в remote-скрипте нельзя писать маркер целиком (_ui + _val_), иначе
-    # bash -c сам матчится как «validate» и карточка мигает ложно.
-    remote = r"""
+def _parse_activity_json(raw: str) -> dict[str, Any]:
+    empty = dict(_EMPTY_ACTIVITY)
+    empty["tasks"] = []
+    try:
+        data = json.loads(raw) if raw.startswith("{") else empty
+    except Exception:
+        data = empty
+    for k in _EMPTY_ACTIVITY:
+        if k == "tasks":
+            data["tasks"] = list(data.get("tasks") or [])
+        else:
+            data[k] = bool(data.get(k))
+    data["ok"] = True
+    return data
+
+
+# Remote: RAM + GPU + activity JSON в ОДНОМ ssh (иначе UI висит на двух вызовах).
+_REMOTE_STATS_AND_ACTIVITY = r"""
+set +e
+echo '=== RAM ==='
+free -h | awk '/Mem:/{printf "Mem used %s / %s (avail %s)\n", $3, $2, $7}'
+free -h | awk '/Swap:/{printf "Swap used %s / %s\n", $3, $2}'
+echo
+echo '=== nvidia-smi ==='
+nvidia-smi --query-gpu=index,name,memory.used,memory.total,utilization.gpu,temperature.gpu --format=csv,noheader,nounits 2>/dev/null \
+  | awk -F',' '{gsub(/^ +| +$/,"",$1); gsub(/^ +| +$/,"",$2); gsub(/^ +| +$/,"",$3); gsub(/^ +| +$/,"",$4); gsub(/^ +| +$/,"",$5); gsub(/^ +| +$/,"",$6); printf "GPU%s %s | VRAM %s/%s MiB | util %s%% | temp %sC\n", $1, $2, $3, $4, $5, $6}'
+if [ $? -ne 0 ]; then echo '(nvidia-smi недоступен)'; fi
+echo
+echo '=== top processes (cpu) ==='
+ps -eo pid,pcpu,pmem,comm --sort=-pcpu | head -n 8
+echo
+echo '=== ACTIVITY_JSON ==='
 python3 - <<'PY'
 import json, os, re
 me = str(os.getpid())
@@ -638,15 +1171,13 @@ for pid in os.listdir("/proc"):
 
 def is_ui_noise(c):
     cl = c.lower()
-    # tail логов UI-слотов и сам ssh-probe activity
     if "forest_ui_fui_" in cl and ("tail" in cl or "tmux" in cl):
         return True
-    if "os.listdir(\"/proc\")" in c or "fetch_lab_activity" in c:
+    if "os.listdir(\"/proc\")" in c or "ACTIVITY_JSON" in c:
         return True
     return False
 
 def train_yaml(name):
-    # Только живой mlagents-learn + yaml (не tail/fui_* и не --inference).
     for c in cmds:
         if is_ui_noise(c):
             continue
@@ -658,7 +1189,6 @@ def train_yaml(name):
     return False
 
 def is_joint_train():
-    # Один процесс mlagents на троих. Не матчить tail /tmp/forest_ui_fui_joint_*.log
     for c in cmds:
         if is_ui_noise(c):
             continue
@@ -674,18 +1204,31 @@ def is_joint_train():
             return True
     return False
 
-# Маркер без цельной строки в исходнике (иначе self-match через ssh cmdline).
 ui_val = "_" + "ui_val_"
 validate = any(
     (not is_ui_noise(c)) and (("validate_ui_one.bash" in c) or ("forestValidate" in c) or (ui_val in c))
     for c in cmds
 )
 stream = any(
-    (not is_ui_noise(c)) and (("forestStreamOnly" in c) or ("stream_onnx_infer.py" in c))
+    (not is_ui_noise(c))
+    and (("stream_onnx_infer.py" in c) or ("forestStreamOnly" in c))
+    and ("forestStreamingSurvival" not in c)
+    for c in cmds
+)
+streaming_survival = any(
+    (not is_ui_noise(c)) and ("forestStreamingSurvival" in c)
+    for c in cmds
+)
+llm_bot = any(
+    (not is_ui_noise(c))
+    and (
+        ("-m stream_bot.main" in c)
+        or ("stream_bot/main.py" in c)
+        or ("python" in c.lower() and "stream_bot.main" in c)
+    )
     for c in cmds
 )
 joint = is_joint_train()
-# Solo: только живой mlagents + свой yaml (fui_* tail больше не считаем train).
 jack = (not joint) and train_yaml("Jack_single_agent")
 lily = (not joint) and train_yaml("Lily_single_agent")
 george = (not joint) and train_yaml("George_single_agent")
@@ -720,6 +1263,10 @@ if validate:
     tasks.append({"id": "validate", "kind": "validate", "label": "Validate (mp4)", "kill": "validate"})
 if stream:
     tasks.append({"id": "stream", "kind": "stream", "label": "Stream Presentation" + ((" · " + rid) if rid else ""), "kill": "stream"})
+if streaming_survival:
+    tasks.append({"id": "streaming_survival", "kind": "streaming_survival", "label": "Streaming Survival", "kill": "streaming_survival"})
+if llm_bot:
+    tasks.append({"id": "llm_bot", "kind": "llm_bot", "label": "LLM Bot", "kill": "llm_bot"})
 
 print(json.dumps({
     "jack": bool(jack),
@@ -728,69 +1275,161 @@ print(json.dumps({
     "joint": bool(joint),
     "validate": bool(validate),
     "stream": bool(stream),
+    "streaming_survival": bool(streaming_survival),
+    "llm_bot": bool(llm_bot),
     "tasks": tasks,
 }))
 PY
 """
-    empty = {
-        "jack": False,
-        "lily": False,
-        "george": False,
-        "joint": False,
-        "validate": False,
-        "stream": False,
-        "tasks": [],
-    }
+
+
+def fetch_lab_activity(host: str | None = None) -> dict[str, Any]:
+    """Activity из кэша stats (отдельный SSH больше не делаем)."""
+    with _stats_lock:
+        cached = _stats_cache.get("data")
+    if isinstance(cached, dict) and isinstance(cached.get("activity"), dict):
+        return dict(cached["activity"])
+    empty = dict(_EMPTY_ACTIVITY)
+    empty["tasks"] = []
+    empty["ok"] = False
+    return empty
+
+
+def _fetch_server_stats_uncached(host: str | None = None) -> dict[str, Any]:
+    """RAM + nvidia-smi + activity JSON (SSH или local, если UI на lab)."""
     try:
-        r = ssh_run(host, remote, timeout=35)
-        text = (r.stdout or "").strip().splitlines()
-        raw = text[-1] if text else ""
-        data = json.loads(raw) if raw.startswith("{") else empty
-        for k in empty:
-            if k == "tasks":
-                data["tasks"] = list(data.get("tasks") or [])
-            else:
-                data[k] = bool(data.get(k))
-        data["ok"] = True
-        return data
+        r = ssh_run(host, _REMOTE_STATS_AND_ACTIVITY, timeout=18, gate_timeout=8.0)
+        used = "local" if ui_runs_on_lab() else (_ssh_host_cache or host or "?")
+        full = ((r.stdout or "") + (r.stderr or "")).strip()
+        marker = "=== ACTIVITY_JSON ==="
+        if marker in full:
+            head, _, tail = full.partition(marker)
+            text = head.strip()
+            act_line = ""
+            for ln in reversed(tail.strip().splitlines()):
+                ln = ln.strip()
+                if ln.startswith("{"):
+                    act_line = ln
+                    break
+            activity = _parse_activity_json(act_line)
+        else:
+            text = full
+            activity = dict(_EMPTY_ACTIVITY)
+            activity["tasks"] = []
+            activity["ok"] = False
+        return {
+            "ok": r.returncode == 0 and bool(text),
+            "text": text or "(пусто)",
+            "host": used,
+            "mode": "local" if ui_runs_on_lab() else "ssh",
+            "activity": activity,
+            "pending": False,
+            "tried": ["local"] if ui_runs_on_lab() else [],
+        }
     except Exception as e:
-        out = dict(empty)
-        out["ok"] = False
-        out["error"] = str(e)
-        return out
+        clear_ssh_host_cache()
+        act = dict(_EMPTY_ACTIVITY)
+        act["tasks"] = []
+        act["ok"] = False
+        act["error"] = str(e)
+        return {
+            "ok": False,
+            "text": f"[{'local' if ui_runs_on_lab() else 'ssh'}] {e}",
+            "host": "local" if ui_runs_on_lab() else (host or "?"),
+            "mode": "local" if ui_runs_on_lab() else "ssh",
+            "activity": act,
+            "pending": False,
+            "tried": list(ssh_candidates("lab_comp")),
+        }
+
+
+def _stats_pending_payload(host: str | None = None) -> dict[str, Any]:
+    act = dict(_EMPTY_ACTIVITY)
+    act["tasks"] = []
+    return {
+        "ok": False,
+        "pending": True,
+        "text": "загрузка RAM / nvidia-smi c lab_comp...",
+        "host": host or _ssh_host_cache or "lab_comp",
+        "activity": act,
+    }
+
+
+def _stats_refresh_worker(host: str | None = None) -> None:
+    global _stats_inflight
+    try:
+        # Не звать resolve_ssh_host_fast здесь — он сам может висеть минутами.
+        # ssh_run уже перебирает IP при ошибке коннекта.
+        h = host or _ssh_host_cache or "lab_comp"
+        out = _fetch_server_stats_uncached(h)
+        with _stats_lock:
+            _stats_cache["t"] = time.time()
+            _stats_cache["data"] = out
+    except Exception as e:
+        with _stats_lock:
+            fail = _stats_pending_payload(host)
+            fail["pending"] = False
+            fail["text"] = f"[ssh] {e}"
+            # не затираем хороший stale при ошибке refresh
+            if _stats_cache.get("data") is None:
+                _stats_cache["t"] = time.time()
+                _stats_cache["data"] = fail
+    finally:
+        with _stats_lock:
+            _stats_inflight = False
 
 
 def fetch_server_stats(host: str | None = None) -> dict[str, Any]:
-    """RAM + nvidia-smi на lab_comp (короткий ssh, failover по IP)."""
-    remote = r"""
-set +e
-echo '=== RAM ==='
-free -h | awk '/Mem:/{printf "Mem used %s / %s (avail %s)\n", $3, $2, $7}'
-free -h | awk '/Swap:/{printf "Swap used %s / %s\n", $3, $2}'
-echo
-echo '=== nvidia-smi ==='
-nvidia-smi --query-gpu=index,name,memory.used,memory.total,utilization.gpu,temperature.gpu --format=csv,noheader,nounits 2>/dev/null \
-  | awk -F',' '{gsub(/^ +| +$/,"",$1); gsub(/^ +| +$/,"",$2); gsub(/^ +| +$/,"",$3); gsub(/^ +| +$/,"",$4); gsub(/^ +| +$/,"",$5); gsub(/^ +| +$/,"",$6); printf "GPU%s %s | VRAM %s/%s MiB | util %s%% | temp %sC\n", $1, $2, $3, $4, $5, $6}'
-if [ $? -ne 0 ]; then echo '(nvidia-smi недоступен)'; fi
-echo
-echo '=== top processes (cpu) ==='
-ps -eo pid,pcpu,pmem,comm --sort=-pcpu | head -n 8
-"""
-    try:
-        r = ssh_run(host, remote, timeout=40)
-        used = _ssh_host_cache or host or "?"
-        text = ((r.stdout or "") + (r.stderr or "")).strip()
-        out = {"ok": r.returncode == 0 and bool(text), "text": text or "(пусто)", "host": used}
-        out["activity"] = fetch_lab_activity(used)
+    """Никогда не блокирует HTTP: кэш сразу, SSH только в фоне."""
+    global _stats_inflight
+    now = time.time()
+    kick = False
+    with _stats_lock:
+        cached = _stats_cache.get("data")
+        age = now - float(_stats_cache.get("t") or 0)
+        # если worker завис — сбросить флаг
+        if _stats_inflight and age > 45 and cached is not None:
+            _stats_inflight = False
+        if _stats_inflight and cached is None and age > 45:
+            _stats_inflight = False
+        fresh = cached is not None and age < _STATS_CACHE_TTL
+        stale_ok = cached is not None and age < _STATS_STALE_MAX
+        if not fresh and not _stats_inflight:
+            _stats_inflight = True
+            kick = True
+            if cached is None:
+                _stats_cache["t"] = now  # точка отсчёта для watchdog
+        out = cached if (fresh or stale_ok) else None
+    if kick:
+        threading.Thread(
+            target=_stats_refresh_worker,
+            args=(host,),
+            name="lab-stats-refresh",
+            daemon=True,
+        ).start()
+    if out is not None:
         return out
-    except Exception as e:
-        clear_ssh_host_cache()
-        return {
-            "ok": False,
-            "text": f"[ssh] {e}",
-            "host": host or "?",
-            "activity": fetch_lab_activity(host),
-        }
+    return _stats_pending_payload(host)
+
+
+def start_stats_background_loop() -> None:
+    """Периодический refresh, чтобы pill загорался без ожидания первого клика."""
+
+    def loop() -> None:
+        # сначала быстро найти живой SSH (в фоне), потом stats
+        try:
+            resolve_ssh_host(load_cfg().get("ssh_host") or "lab_comp")
+        except Exception:
+            pass
+        while True:
+            try:
+                h = _ssh_host_cache or _load_saved_ssh_host() or "lab_comp"
+                fetch_server_stats(h)
+            except Exception:
+                pass
+            time.sleep(_STATS_CACHE_TTL)
+
+    threading.Thread(target=loop, name="lab-stats-loop", daemon=True).start()
 
 
 # ── actions ─────────────────────────────────────────────────────────
@@ -988,6 +1627,888 @@ def action_kill_stream(cfg: dict) -> str:
 
     threading.Thread(target=runner, daemon=True).start()
     return jid
+
+
+def action_kill_mode_training(cfg: dict) -> str:
+    """Полный стоп блока Forest Lab Train: train + validate + Presentation stream."""
+    host = resolve_ssh_host(cfg.get("ssh_host") or "lab_comp")
+    jid = new_job("kill_mode_training", "kill_mode_training.bash")
+
+    def runner() -> None:
+        try:
+            r = ssh_run(
+                host,
+                f"cd {REMOTE_DIR} && bash train_scripts/lab_comp/kill_mode_training.bash",
+                timeout=120,
+            )
+            append_log(jid, (r.stdout or "") + (r.stderr or ""))
+            finish_job(jid, r.returncode)
+        except Exception as e:
+            append_log(jid, str(e))
+            finish_job(jid, 1)
+
+    threading.Thread(target=runner, daemon=True).start()
+    return jid
+
+
+def action_kill_mode_streaming(cfg: dict) -> str:
+    """Полный стоп блока Survival followers: SS + LLM bot."""
+    host = resolve_ssh_host(cfg.get("ssh_host") or "lab_comp")
+    jid = new_job("kill_mode_streaming", "kill_mode_streaming.bash")
+
+    def runner() -> None:
+        try:
+            r = ssh_run(
+                host,
+                f"cd {REMOTE_DIR} && bash train_scripts/lab_comp/kill_mode_streaming.bash",
+                timeout=90,
+            )
+            append_log(jid, (r.stdout or "") + (r.stderr or ""))
+            # локальный кэш бота
+            try:
+                if LLM_BOT is not None:
+                    with LLM_BOT._lock:
+                        LLM_BOT.bot_state = "stopped"
+                        LLM_BOT.bot_http_ready = False
+            except Exception:
+                pass
+            try:
+                SS_PREVIEW.stop()
+            except Exception:
+                pass
+            finish_job(jid, r.returncode)
+        except Exception as e:
+            append_log(jid, str(e))
+            finish_job(jid, 1)
+
+    threading.Thread(target=runner, daemon=True).start()
+    return jid
+
+
+def action_start_streaming_survival(cfg: dict) -> str:
+    """Unity Streaming Survival без onnx/train."""
+    host = resolve_ssh_host(cfg.get("ssh_host") or "lab_comp")
+    build = cfg.get("build") or DEFAULT_BUILD
+    remote = (
+        f"cd {REMOTE_DIR} && export BUILD={sh_quote(build)} && "
+        f"bash train_scripts/lab_comp/start_streaming_survival.bash"
+    )
+    return start_remote_tmux("streaming_survival", host, "fui_streaming_survival", remote)
+
+
+def action_stop_streaming_survival(cfg: dict) -> str:
+    host = resolve_ssh_host(cfg.get("ssh_host") or "lab_comp")
+    jid = new_job("stop_streaming_survival", "stop_streaming_survival.bash")
+
+    def runner() -> None:
+        try:
+            r = ssh_run(
+                host,
+                f"cd {REMOTE_DIR} && bash train_scripts/lab_comp/stop_streaming_survival.bash",
+                timeout=60,
+            )
+            append_log(jid, (r.stdout or "") + (r.stderr or ""))
+            finish_job(jid, r.returncode)
+        except Exception as e:
+            append_log(jid, str(e))
+            finish_job(jid, 1)
+
+    threading.Thread(target=runner, daemon=True).start()
+    return jid
+
+
+def _ss_artifacts_latest() -> Path | None:
+    """Prefer newest live-stress/stats run for Diagnostics links.
+
+    Previously preferred oldest full-runtime PASS, which had no stats/ →
+    open table/chart returned 404 and cards stayed empty.
+    """
+    base = ROOT / "artifacts" / "streaming_survival" / "test_runs"
+    if not base.is_dir():
+        return None
+    runs = sorted([d for d in base.iterdir() if d.is_dir()], reverse=True)
+
+    def _read_summary(run: Path) -> dict[str, Any]:
+        sp = run / "summary.json"
+        if not sp.is_file():
+            return {}
+        try:
+            return json.loads(sp.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+    def _has_stats(run: Path) -> bool:
+        return (run / "stats" / "stats_summary.json").is_file() or (
+            run / "stats" / "parser_stats.csv"
+        ).is_file()
+
+    def _has_live(run: Path) -> bool:
+        return (run / "live_stress_report.json").is_file()
+
+    def _from_latest_file() -> Path | None:
+        latest = base / "LATEST"
+        if not latest.is_file():
+            return None
+        p = Path(latest.read_text(encoding="utf-8").strip())
+        if not p.is_absolute():
+            p = (ROOT / p).resolve()
+        return p if p.is_dir() else None
+
+    # 1) LATEST pointer if it has stats or live stress
+    pointed = _from_latest_file()
+    if pointed is not None and (_has_stats(pointed) or _has_live(pointed)):
+        return pointed
+
+    # 2) newest run with stats/
+    for run in runs:
+        if _has_stats(run):
+            return run
+
+    # 3) newest live stress
+    for run in runs:
+        if _has_live(run):
+            return run
+
+    # 4) LATEST even without stats
+    if pointed is not None:
+        return pointed
+
+    # 5) full-runtime PASS (machine checks only)
+    for run in runs:
+        data = _read_summary(run)
+        if data.get("full_runtime_status") == "PASS" and data.get("overall") == "PASS":
+            return run
+
+    return runs[0] if runs else None
+
+
+def _ss_runs_base() -> Path:
+    return ROOT / "artifacts" / "streaming_survival" / "test_runs"
+
+
+def _ss_resolve_run(run_id: str | None = None) -> Path | None:
+    """Resolve a specific test_runs/<id> dir, or fall back to latest."""
+    base = _ss_runs_base()
+    if run_id:
+        name = Path(str(run_id).strip()).name
+        if not name or name in (".", "..", "LATEST"):
+            return None
+        p = (base / name).resolve()
+        try:
+            p.relative_to(base.resolve())
+        except ValueError:
+            return None
+        return p if p.is_dir() else None
+    return _ss_artifacts_latest()
+
+
+def _ss_run_when_label(run: Path) -> str:
+    """Human local date from dirname YYYYMMDD_HHMMSS_* (UTC) or mtime."""
+    m = re.match(r"^(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})", run.name)
+    if m:
+        y, mo, d, h, mi, s = (int(x) for x in m.groups())
+        try:
+            # Live-stress run ids are created with datetime.now(timezone.utc).
+            # Show wall-clock local time so 17:05 UTC → 20:05 MSK, not "17:05".
+            dt = datetime(y, mo, d, h, mi, s, tzinfo=timezone.utc).astimezone()
+            return dt.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return f"{y:04d}-{mo:02d}-{d:02d} {h:02d}:{mi:02d}:{s:02d}"
+    try:
+        return datetime.fromtimestamp(run.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return "—"
+
+
+def _ss_format_duration(sec: float | None) -> str:
+    if sec is None or sec < 0:
+        return "—"
+    sec_i = int(round(sec))
+    h, rem = divmod(sec_i, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}ч {m}м"
+    if m:
+        return f"{m}м"
+    return f"{s}с"
+
+
+def _ss_run_start_ts(run: Path) -> float | None:
+    m = re.match(r"^(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})", run.name)
+    if not m:
+        return None
+    try:
+        y, mo, d, h, mi, s = (int(x) for x in m.groups())
+        return datetime(y, mo, d, h, mi, s, tzinfo=timezone.utc).timestamp()
+    except Exception:
+        return None
+
+
+def _ss_run_duration_sec(run: Path, live: dict[str, Any]) -> float | None:
+    """Best-effort wall time of a live-stress run."""
+    for key in ("duration_sec", "elapsed_sec", "duration_s"):
+        v = live.get(key)
+        if v is not None:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                pass
+    # Prefer span of per-attempt result markers (closest to real wall time).
+    try:
+        results = sorted(run.glob("live_*_result.json"), key=lambda p: p.stat().st_mtime)
+        if len(results) >= 2:
+            return max(0.0, results[-1].stat().st_mtime - results[0].stat().st_mtime)
+        if len(results) == 1:
+            start = _ss_run_start_ts(run)
+            if start is not None:
+                return max(0.0, results[0].stat().st_mtime - start)
+    except Exception:
+        pass
+    lp = run / "live_stress_report.json"
+    start = _ss_run_start_ts(run)
+    if lp.is_file() and start is not None:
+        try:
+            # Cap absurd values if report was rewritten long after the run.
+            dur = lp.stat().st_mtime - start
+            if 0 < dur < 12 * 3600:
+                return dur
+        except Exception:
+            pass
+    return None
+
+
+def _ss_run_meta(run: Path) -> dict[str, Any]:
+    summary: dict[str, Any] = {}
+    sp = run / "summary.json"
+    if sp.is_file():
+        try:
+            summary = json.loads(sp.read_text(encoding="utf-8"))
+        except Exception:
+            summary = {}
+    live: dict[str, Any] = {}
+    lp = run / "live_stress_report.json"
+    if lp.is_file():
+        try:
+            live = json.loads(lp.read_text(encoding="utf-8"))
+        except Exception:
+            live = {}
+    stats: dict[str, Any] = {}
+    ssp = run / "stats" / "stats_summary.json"
+    if ssp.is_file():
+        try:
+            stats = json.loads(ssp.read_text(encoding="utf-8"))
+        except Exception:
+            stats = {}
+    has_stats = ssp.is_file() or (run / "stats" / "parser_stats.csv").is_file()
+    has_live = lp.is_file()
+    running_meta: dict[str, Any] = {}
+    rp = run / "live_stress_running.json"
+    if rp.is_file():
+        try:
+            running_meta = json.loads(rp.read_text(encoding="utf-8"))
+        except Exception:
+            running_meta = {"status": "RUNNING"}
+    # In-progress: report not ready, but traj/screenshots/ping are active.
+    # live_*_result.json appears only AFTER an attempt ends — during a long first
+    # #do we only have trajectories/ — those must count or the run is invisible.
+    live_attempt_files = sorted(run.glob("live_*_result.json"))
+    activity_files: list[Path] = list(live_attempt_files)
+    if rp.is_file():
+        activity_files.append(rp)
+    traj_dir = run / "trajectories"
+    if traj_dir.is_dir():
+        activity_files.extend(traj_dir.glob("*.jsonl"))
+    shot_dir = run / "screenshots"
+    if shot_dir.is_dir():
+        activity_files.extend(p for p in shot_dir.rglob("*") if p.is_file())
+    for name in ("runtime_ping.json", "world_map.json"):
+        p = run / name
+        if p.is_file():
+            activity_files.append(p)
+    newest_live_mtime = 0.0
+    if activity_files:
+        try:
+            newest_live_mtime = max(f.stat().st_mtime for f in activity_files)
+        except Exception:
+            newest_live_mtime = 0.0
+    recently_active = newest_live_mtime > 0 and (time.time() - newest_live_mtime) < 45 * 60
+    has_live_artifacts = (
+        bool(live_attempt_files)
+        or bool(list(traj_dir.glob("*.jsonl")) if traj_dir.is_dir() else [])
+        or rp.is_file()
+    )
+    in_progress = (not has_live) and has_live_artifacts and recently_active
+    done_attempts = len(live_attempt_files)
+    traj_attempts = 0
+    if traj_dir.is_dir():
+        traj_attempts = len({p.name.split("_trajectory")[0] for p in traj_dir.glob("*_trajectory.jsonl")})
+    attempts_list = live.get("attempts") if isinstance(live.get("attempts"), list) else []
+    attempts_n = (
+        int(live.get("attempts_total") or 0)
+        or int(live.get("n_attempts") or 0)
+        or len(attempts_list)
+        or int(summary.get("live_stress_attempts") or 0)
+        or int(running_meta.get("attempts") or 0)
+        or (40 if (has_live or in_progress) else 0)
+    )
+    attempts_passed = live.get("attempts_passed")
+    if attempts_passed is None and attempts_list:
+        attempts_passed = sum(1 for a in attempts_list if (a.get("result") or "").upper() == "PASS")
+    if attempts_passed is None:
+        attempts_passed = 0 if has_live else (None if not in_progress else None)
+    else:
+        attempts_passed = int(attempts_passed)
+    attempts_failed = live.get("attempts_failed")
+    if attempts_failed is None and attempts_n and attempts_passed is not None and has_live:
+        attempts_failed = max(0, int(attempts_n) - int(attempts_passed))
+    elif attempts_failed is not None:
+        attempts_failed = int(attempts_failed)
+    duration_sec = _ss_run_duration_sec(run, live) if has_live else None
+    if in_progress and duration_sec is None:
+        try:
+            # Prefer file mtimes (wall clock). Dirname timestamp may be UTC while
+            # local datetime() parse treats it as local → multi-hour skew.
+            times = [f.stat().st_mtime for f in activity_files]
+            if times:
+                duration_sec = max(0.0, time.time() - min(times))
+            else:
+                duration_sec = max(0.0, time.time() - run.stat().st_mtime)
+        except Exception:
+            duration_sec = None
+    # Stale unfinished stress (no report, idle >45m): still list, but as incomplete.
+    unfinished = (not has_live) and has_live_artifacts and not in_progress
+    if unfinished:
+        live_st_override = "INCOMPLETE"
+        overall_override = "INCOMPLETE"
+    else:
+        live_st_override = None
+        overall_override = None
+    duration_label = _ss_format_duration(duration_sec)
+    mode = (
+        summary.get("mode")
+        or ("live_stress" if (has_live or in_progress or unfinished) else None)
+        or ("parser_only" if (run / "parser_results.json").is_file() and not has_live else None)
+        or "checks"
+    )
+    overall = (
+        overall_override
+        or ("RUNNING" if in_progress else None)
+        or summary.get("overall_qa_status")
+        or summary.get("overall")
+        or live.get("overall")
+        or ("PASS" if has_stats else "—")
+    )
+    live_st = (
+        live_st_override
+        or ("RUNNING" if in_progress else None)
+        or summary.get("live_stress_status")
+        or live.get("overall")
+        or ("—" if not has_live else "?")
+    )
+    when = _ss_run_when_label(run)
+    if has_live or in_progress or unfinished:
+        title = f"Live Stress {attempts_n}" if attempts_n else "Live Stress"
+    elif mode == "parser_only":
+        title = "Parser report"
+    elif mode in ("full_runtime", "checks", "runtime_suite"):
+        title = "Machine Checks"
+    else:
+        title = str(mode)
+    status_show = live_st if (has_live or in_progress or unfinished) else overall
+    parser_fail = stats.get("parser_failures")
+    if parser_fail is None:
+        parser_fail = live.get("parser_failures")
+    # Primary line for humans: pass/fail/duration
+    if in_progress:
+        if traj_attempts > done_attempts:
+            score_line = f"идёт {done_attempts + 1}/{attempts_n or '?'} · {duration_label}"
+        else:
+            score_line = f"сделано {done_attempts}/{attempts_n or '?'} · {duration_label}"
+    elif unfinished:
+        score_line = f"обрыв {done_attempts}/{attempts_n or '?'}"
+    elif has_live and attempts_passed is not None and attempts_failed is not None:
+        score_line = f"PASS {attempts_passed} · FAIL {attempts_failed} · {duration_label}"
+    else:
+        score_line = duration_label if duration_label != "—" else ""
+    subtitle_bits = []
+    if score_line:
+        subtitle_bits.append(score_line)
+    if parser_fail is not None:
+        subtitle_bits.append(f"parser {parser_fail}")
+    if has_stats:
+        subtitle_bits.append("stats")
+    elif has_live:
+        subtitle_bits.append("no stats")
+    elif in_progress:
+        subtitle_bits.append("идёт")
+    elif unfinished:
+        subtitle_bits.append("не завершён")
+    subtitle = " · ".join(subtitle_bits) if subtitle_bits else run.name
+    label = f"{title} · {status_show} · {score_line} · {when}"
+    try:
+        mtime = run.stat().st_mtime
+    except Exception:
+        mtime = 0.0
+    return {
+        "id": run.name,
+        "run_dir": str(run),
+        "when": when,
+        "mtime": mtime,
+        "mode": mode,
+        "title": title,
+        "subtitle": subtitle,
+        "score_line": score_line,
+        "overall": overall,
+        "status": status_show,
+        "live_stress_status": live_st,
+        "attempts": attempts_n,
+        "attempts_passed": attempts_passed if has_live else (done_attempts if (in_progress or unfinished) else attempts_passed),
+        "attempts_failed": attempts_failed,
+        "duration_sec": duration_sec,
+        "duration_label": duration_label,
+        "parser_failures": parser_fail,
+        "stats_dashboard_status": stats.get("stats_dashboard_status")
+        or summary.get("stats_dashboard_status"),
+        "has_stats": has_stats,
+        "has_live": has_live or in_progress or unfinished,
+        "has_summary": sp.is_file(),
+        "has_screenshots": (run / "screenshots").is_dir(),
+        "label": label,
+        "is_report": has_live or in_progress or unfinished,
+        "in_progress": in_progress,
+        "done_attempts": done_attempts if (in_progress or unfinished) else None,
+    }
+
+
+def _ss_list_runs(limit: int = 60, reports_only: bool = True) -> list[dict[str, Any]]:
+    """List test runs. Default: Live Stress reports (40-task) only, newest first."""
+    base = _ss_runs_base()
+    if not base.is_dir():
+        return []
+    runs = [d for d in base.iterdir() if d.is_dir()]
+    runs.sort(key=lambda p: p.name, reverse=True)
+    out: list[dict[str, Any]] = []
+    for run in runs:
+        try:
+            meta = _ss_run_meta(run)
+        except Exception:
+            meta = {
+                "id": run.name,
+                "run_dir": str(run),
+                "when": _ss_run_when_label(run),
+                "title": run.name,
+                "subtitle": "",
+                "status": "—",
+                "label": run.name,
+                "has_stats": False,
+                "has_live": False,
+                "is_report": False,
+            }
+        if reports_only and not meta.get("is_report"):
+            continue
+        out.append(meta)
+        if len(out) >= max(1, min(limit, 120)):
+            break
+    # If no live-stress reports yet, fall back to any runs so UI isn't empty.
+    if not out and reports_only:
+        return _ss_list_runs(limit=limit, reports_only=False)
+    return out
+
+
+def _ss_reports_page_html(limit: int = 120) -> str:
+    """Standalone HTML page: all Live Stress reports with dashboard links."""
+    runs = _ss_list_runs(limit=limit, reports_only=True)
+    rows: list[str] = []
+    for r in runs:
+        rid = html.escape(str(r.get("id") or ""))
+        when = html.escape(str(r.get("when") or "—"))
+        status = html.escape(str(r.get("status") or r.get("live_stress_status") or "—"))
+        title = html.escape(str(r.get("title") or "Live Stress"))
+        passed = r.get("attempts_passed")
+        failed = r.get("attempts_failed")
+        total = r.get("attempts") or 40
+        dur = html.escape(str(r.get("duration_label") or "—"))
+        score = (
+            f"PASS {passed if passed is not None else '—'} / "
+            f"FAIL {failed if failed is not None else '—'} из {total}"
+        )
+        dash = ""
+        if r.get("has_stats"):
+            dash = (
+                f'<a href="/api/ss_diagnostics/stats_dashboard?run={urllib.parse.quote(str(r.get("id") or ""))}" '
+                f'target="_blank" rel="noopener">открыть дашборд</a>'
+            )
+        else:
+            dash = '<span style="opacity:.55">нет stats</span>'
+        rows.append(
+            "<tr>"
+            f"<td><b>{title}</b> · {status}<br/>"
+            f"<code style='font-size:12px;opacity:.8'>{rid}</code></td>"
+            f"<td style='font-variant-numeric:tabular-nums;white-space:nowrap'>{html.escape(score)}<br/>"
+            f"<span style='opacity:.75'>время: {dur}</span></td>"
+            f"<td style='white-space:nowrap;text-align:right'>{when}</td>"
+            f"<td>{dash}</td>"
+            "</tr>"
+        )
+    body_rows = "\n".join(rows) if rows else (
+        '<tr><td colspan="4">Нет Live Stress репортов. Запусти «3. Live Stress 40».</td></tr>'
+    )
+    return f"""<!doctype html>
+<html lang="ru"><head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Streaming Survival — все репорты</title>
+<style>
+  body {{ font-family: ui-sans-serif, system-ui, sans-serif; background:#12141a; color:#e8e8e8;
+         margin:0; padding:24px; line-height:1.4; }}
+  h1 {{ font-size:1.35rem; margin:0 0 8px; }}
+  .hint {{ opacity:.75; margin:0 0 16px; }}
+  table {{ width:100%; border-collapse:collapse; background:rgba(0,0,0,.2);
+           border:1px solid #444; border-radius:8px; overflow:hidden; }}
+  th, td {{ padding:10px 12px; border-bottom:1px solid #333; vertical-align:top; text-align:left; }}
+  th {{ background:rgba(255,255,255,.04); font-size:12px; opacity:.8; font-weight:600; }}
+  tr:hover td {{ background:rgba(106,166,255,.08); }}
+  a {{ color:#7eb6ff; }}
+  code {{ word-break:break-all; }}
+</style>
+</head><body>
+<h1>Live Stress — все репорты</h1>
+<p class="hint">Отдельная страница со всеми прогонами. «открыть дашборд» — таблицы и графики чекеров для этого run.</p>
+<table>
+  <thead><tr>
+    <th>репорт · overall</th>
+    <th>PASS / FAIL · время</th>
+    <th style="text-align:right">дата старта</th>
+    <th>дашборд</th>
+  </tr></thead>
+  <tbody>
+{body_rows}
+  </tbody>
+</table>
+</body></html>
+"""
+
+
+def _ss_load_report(run: Path) -> dict[str, Any]:
+    """Load summary + stats + live for checker cards (no re-run)."""
+    summary: dict[str, Any] = {}
+    summary_path = run / "summary.json"
+    if summary_path.is_file():
+        try:
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        except Exception:
+            summary = {}
+    stats: dict[str, Any] = {}
+    sp = run / "stats" / "stats_summary.json"
+    if sp.is_file():
+        try:
+            stats = json.loads(sp.read_text(encoding="utf-8"))
+            summary.setdefault("stats_dashboard_status", stats.get("stats_dashboard_status"))
+            summary["stats_summary"] = stats
+        except Exception:
+            pass
+    live: dict[str, Any] = {}
+    lp = run / "live_stress_report.json"
+    if lp.is_file():
+        try:
+            live = json.loads(lp.read_text(encoding="utf-8"))
+            summary.setdefault("live_stress", live)
+            summary.setdefault("live_stress_status", live.get("overall"))
+        except Exception:
+            pass
+    log = summary_path.read_text(encoding="utf-8") if summary_path.is_file() else str(run)
+    dash = ""
+    if (run / "stats" / "stats_dashboard.html").is_file():
+        dash = f"/api/ss_diagnostics/stats_dashboard?run={urllib.parse.quote(run.name)}"
+    meta = _ss_run_meta(run)
+    return {
+        "overall": summary.get("overall", "UNKNOWN"),
+        "summary": summary,
+        "stats_summary": stats,
+        "run_dir": str(run),
+        "run_id": run.name,
+        "run_when": meta.get("when"),
+        "run_label": meta.get("label"),
+        "log": log,
+        "visual_status": summary.get("visual_status", "PENDING"),
+        "overall_qa_status": summary.get("overall_qa_status", "UNKNOWN"),
+        "machine_full_runtime_status": summary.get(
+            "machine_full_runtime_status", summary.get("full_runtime_status")
+        ),
+        "live_stress_status": summary.get("live_stress_status"),
+        "stats_dashboard_status": summary.get("stats_dashboard_status")
+        or stats.get("stats_dashboard_status"),
+        "stats_dashboard_url": dash,
+        "has_stats": meta.get("has_stats"),
+        "has_live": meta.get("has_live"),
+    }
+
+
+def _ss_python() -> str:
+    """Prefer base anaconda (has matplotlib for stats charts) over mlagents env."""
+    candidates = [
+        os.environ.get("FOREST_SS_PYTHON") or "",
+        "/home/reedgern/anaconda3/bin/python",
+        str(Path(sys.executable).resolve().parents[2] / "bin" / "python")
+        if "envs" in str(Path(sys.executable))
+        else "",
+        sys.executable,
+    ]
+    for c in candidates:
+        if c and Path(c).is_file():
+            return c
+    return sys.executable
+
+
+def _ss_ensure_stats(run: Path) -> Path | None:
+    """Build stats/stats_dashboard.html for a run if missing. Returns dashboard path or None."""
+    if run is None or not run.is_dir():
+        return None
+    dash = run / "stats" / "stats_dashboard.html"
+    if dash.is_file():
+        return dash
+    if not (run / "live_stress_report.json").is_file():
+        return None
+    py = _ss_python()
+    stats_script = ROOT / "scripts" / "generate_streaming_survival_test_stats.py"
+    try:
+        subprocess.run(
+            [py, str(stats_script), "--run-dir", str(run)],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=180,
+        )
+    except Exception:
+        pass
+    return dash if dash.is_file() else None
+
+
+def run_ss_diagnostics(kind: str, run_id: str | None = None) -> dict[str, Any]:
+    """Streaming Survival diagnostics (followers). Does not touch Training AI tab."""
+    py = _ss_python()
+    checks = ROOT / "scripts" / "run_streaming_survival_checks.py"
+    export = ROOT / "scripts" / "export_streaming_survival_core_zip.py"
+    visual = ROOT / "scripts" / "generate_ss_visual_check_pack.py"
+    analyze = ROOT / "scripts" / "analyze_streaming_survival_failures.py"
+
+    if kind in ("list_runs", "runs"):
+        runs = _ss_list_runs(60, reports_only=True)
+        latest = next((r for r in runs if r.get("has_live")), None)
+        if latest is None:
+            pointed = _ss_artifacts_latest()
+            latest_id = pointed.name if pointed else None
+        else:
+            latest_id = latest.get("id")
+        return {
+            "overall": "PASS",
+            "runs": runs,
+            "latest_id": latest_id,
+            "selected_id": (_ss_resolve_run(run_id).name if run_id and _ss_resolve_run(run_id) else None),
+        }
+
+    if kind == "last_report":
+        run = _ss_resolve_run(run_id)
+        if run is None:
+            return {"overall": "FAIL", "log": "no test runs yet"}
+        return _ss_load_report(run)
+
+    if kind in ("job_status", "diag_job_status"):
+        # polled by UI for long SS diagnostics jobs
+        return {"overall": "PASS", "log": "use /api/jobs/<id>"}
+
+    if kind == "export_zip":
+        proc = subprocess.run(
+            [py, str(export)],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        zip_path = (proc.stdout or "").strip().splitlines()[-1] if proc.stdout else ""
+        name = Path(zip_path).name if zip_path else ""
+        return {
+            "overall": "PASS" if proc.returncode == 0 and zip_path else "FAIL",
+            "zip_path": zip_path,
+            "zip_url": f"/api/ss_diagnostics/download_zip?name={urllib.parse.quote(name)}" if name else "",
+            "log": (proc.stdout or "") + "\n" + (proc.stderr or ""),
+        }
+
+    if kind in ("live_stress", "live_stress_40", "live_stress_1"):
+        attempts = "1" if kind == "live_stress_1" else "40"
+        jid = start_local_job(
+            f"ss_live_stress_{attempts}",
+            [py, "-u", str(checks), "--live-stress", "--attempts", attempts],
+            cwd=ROOT,
+        )
+        eta = "~1–3 мин" if attempts == "1" else "20–45 минут"
+        return {
+            "overall": "RUNNING",
+            "async": True,
+            "job_id": jid,
+            "eta_hint": eta,
+            "log": (
+                f"Live Stress {attempts} запущен в фоне (job " + jid + ").\n"
+                "Жди обновления статуса ниже."
+            ),
+        }
+
+    if kind in ("full_runtime_async",):
+        jid = start_local_job(
+            "ss_full_runtime",
+            [py, "-u", str(checks), "--full-runtime"],
+            cwd=ROOT,
+        )
+        return {
+            "overall": "RUNNING",
+            "async": True,
+            "job_id": jid,
+            "eta_hint": "10–25 минут",
+            "log": (
+                "Full Machine Checks запущен в фоне (job " + jid + ").\n"
+                "Сценарии Unity + continuity/ground. Без 40 live stress."
+            ),
+        }
+
+    if kind in ("stats_dashboard", "open_stats"):
+        run = _ss_resolve_run(run_id)
+        if run is None:
+            return {"overall": "FAIL", "log": "no test runs"}
+        dash = _ss_ensure_stats(run) or (run / "stats" / "stats_dashboard.html")
+        report = _ss_load_report(run)
+        report.update(
+            {
+                "overall": "PASS" if dash.is_file() else "FAIL",
+                "stats_dashboard_path": str(dash) if dash.is_file() else "",
+                "stats_dashboard_url": (
+                    f"/api/ss_diagnostics/stats_dashboard?run={urllib.parse.quote(run.name)}"
+                    if dash.is_file()
+                    else ""
+                ),
+                "log": "stats ok" if dash.is_file() else "stats_dashboard.html missing",
+            }
+        )
+        return report
+
+    if kind in ("visual_pack", "visual_check_pack"):
+        run = _ss_resolve_run(run_id)
+        cmd = [py, str(visual)]
+        if run is not None:
+            cmd.extend(["--run-dir", str(run)])
+        proc = subprocess.run(
+            cmd,
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        run = _ss_resolve_run(run_id) or _ss_artifacts_latest()
+        return {
+            "overall": "PASS" if proc.returncode == 0 else "FAIL",
+            "run_dir": str(run) if run else "",
+            "run_id": run.name if run else "",
+            "visual_folder": str(run / "screenshots") if run else "",
+            "log": (proc.stdout or "") + "\n" + (proc.stderr or ""),
+        }
+
+    if kind in ("problem_finder", "analyze"):
+        run = _ss_resolve_run(run_id)
+        cmd = [py, str(analyze)]
+        if run is not None:
+            cmd.extend(["--run-dir", str(run)])
+        proc = subprocess.run(
+            cmd,
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        run = _ss_resolve_run(run_id) or _ss_artifacts_latest()
+        report = ""
+        if run and (run / "problem_finder_report.md").is_file():
+            report = str(run / "problem_finder_report.md")
+        out = {
+            "overall": "PASS" if proc.returncode == 0 else "FAIL",
+            "report_path": report,
+            "run_dir": str(run) if run else "",
+            "run_id": run.name if run else "",
+            "log": (proc.stdout or "") + "\n" + (proc.stderr or ""),
+        }
+        if run is not None:
+            out.update({k: v for k, v in _ss_load_report(run).items() if k not in out})
+        return out
+
+    if kind == "open_visual":
+        run = _ss_resolve_run(run_id)
+        if run is None:
+            return {"overall": "FAIL", "log": "no test runs"}
+        folder = run / "screenshots"
+        folder.mkdir(parents=True, exist_ok=True)
+        return {
+            "overall": "PASS",
+            "run_dir": str(run),
+            "run_id": run.name,
+            "visual_folder": str(folder),
+            "tasks": str(run / "visual_check_tasks.json"),
+            "verdicts": str(run / "visual_verdicts.json"),
+            "log": f"Visual folder: {folder}",
+        }
+
+    if kind == "parser":
+        cmd = [py, "-u", str(checks), "--parser-only"]
+        proc = subprocess.run(
+            cmd,
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=180,
+        )
+        run = _ss_artifacts_latest()
+        summary = {}
+        if run and (run / "summary.json").is_file():
+            summary = json.loads((run / "summary.json").read_text(encoding="utf-8"))
+        return {
+            "overall": summary.get("overall") or ("PASS" if proc.returncode == 0 else "FAIL"),
+            "summary": summary,
+            "run_dir": str(run) if run else "",
+            "run_id": run.name if run else "",
+            "visual_status": summary.get("visual_status", "PENDING"),
+            "overall_qa_status": summary.get("overall_qa_status", "UNKNOWN"),
+            "machine_full_runtime_status": summary.get(
+                "machine_full_runtime_status", summary.get("full_runtime_status")
+            ),
+            "log": (proc.stdout or "")[-12000:] + "\n" + (proc.stderr or "")[-4000:],
+            "returncode": proc.returncode,
+        }
+
+    if kind in ("full_runtime", "world_registry", "scenarios", "all", "e2e", "runtime_suite"):
+        # Same as Full Machine Checks — async to avoid browser timeout/err.
+        jid = start_local_job(
+            "ss_full_runtime",
+            [py, "-u", str(checks), "--full-runtime"],
+            cwd=ROOT,
+        )
+        return {
+            "overall": "RUNNING",
+            "async": True,
+            "job_id": jid,
+            "eta_hint": "10–25 минут",
+            "log": (
+                "Full Machine Checks / Runtime Suite запущен в фоне (job " + jid + ").\n"
+                "Это НЕ ошибка и не Training AI.\n"
+                "Проверяет: world registry + сценарии Unity (вода/дом/дерево/телепорты/ground).\n"
+                "Не путать с Live Stress 40 (тот шлёт реальные #do 40 раз)."
+            ),
+        }
+
+    return {"overall": "FAIL", "log": f"unknown kind={kind}"}
 
 
 def action_train(cfg: dict, hero: str, stage: str, body: dict) -> str:
@@ -1274,7 +2795,7 @@ HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>Forest Lab Train UI</title>
+<title>Forest Lab</title>
 <style>
 :root {
   --bg: #12141a;
@@ -1454,11 +2975,33 @@ button.george { border-color: #3d6b52; }
 .lab-task button.lab-task-r:hover { border-color: #6a9fff; }
 .lab-tasks-empty { font-size: 12px; color: var(--muted); padding: 4px 2px; }
 .train-btns button.primary { font-weight: 650; min-width: 140px; }
+.llm-status { display:grid; grid-template-columns:1fr 1fr; gap:4px 12px; font-size:12px; margin:8px 0; color:var(--muted); }
+.llm-status b { color:var(--text); font-weight:600; }
+.llm-chat {
+  height: 180px; overflow:auto; background:#0d1118; border:1px solid var(--line);
+  border-radius:8px; padding:8px; font-size:12px; margin:6px 0;
+}
+.llm-chat .row {
+  margin: 0 0 6px;
+  padding: 0;
+  line-height: 1.25;
+  white-space: pre-wrap;
+  font-family: inherit;
+  font-size: inherit;
+}
+.llm-chat .row.user { color:#9ecbff; }
+.llm-chat .row.bot { color:#9fe7b8; }
+.llm-chat .row.system { color:#c9b27a; }
+.llm-chat .row b { font-weight: 650; }
+.llm-setup-log {
+  height: 110px; overflow:auto; background:#0d1118; border:1px solid var(--line);
+  border-radius:8px; padding:8px; font-size:11px; color:#a8b3c7; white-space:pre-wrap;
+}
 </style>
 </head>
 <body>
 <header>
-  <h1>Forest Lab Train</h1>
+  <h1>Forest Lab</h1>
   <span class="meta" id="hdrMeta">старт…</span>
   <span class="meta">UI локальный · train/stats только через ssh lab_comp</span>
   <div style="margin-left:auto" class="btns">
@@ -1467,6 +3010,34 @@ button.george { border-color: #3d6b52; }
   </div>
 </header>
 <main>
+  <div class="subtabs" style="max-width:720px;margin-bottom:4px">
+    <button type="button" class="subtab active" id="tab-mode-training" data-mode="training">Forest Lab Train</button>
+    <button type="button" class="subtab" id="tab-mode-streaming" data-mode="streaming">Survival followers</button>
+  </div>
+
+  <section class="card" id="card-server">
+    <h2>Сервер <code>lab_comp</code> <span id="serverModeLabel">(SSH / local)</span> <span class="pill" id="serverPill">—</span></h2>
+    <p class="hint" id="serverHostHint">RAM / nvidia-smi с lab. Если UI запущен на самом lab — режим local (без SSH к себе). С Windows UI ходит по SSH.</p>
+    <pre class="server-pre" id="serverStats">загрузка RAM / nvidia-smi с lab_comp…</pre>
+    <h2 style="margin-top:10px;font-size:14px">Сейчас на lab <span class="pill" id="labTasksPill">—</span></h2>
+    <div class="lab-tasks" id="labTasks"><div class="lab-tasks-empty">нет активных задач</div></div>
+    <p class="hint">× гасит только этот тип процесса (train / validate / stream / Streaming Survival). OBS не трогает.</p>
+    <h2 style="margin-top:8px">Лог действий <span class="pill" id="jobPill">—</span></h2>
+    <div class="field">
+      <label>Активная задача</label>
+      <select id="jobSelect"></select>
+    </div>
+    <div class="log" id="jobLog">нет задач</div>
+  </section>
+
+  <div id="panel-mode-training" class="mode-panel">
+  <section class="card" style="margin-bottom:10px">
+    <h2>Блок Forest Lab Train</h2>
+    <p class="hint">Одним кликом гасит train + validate + Presentation onnx-стрим. Survival followers и OBS не трогает.</p>
+    <div class="btns">
+      <button type="button" class="danger" id="btnKillModeTraining">⏹ Стоп весь блок Train</button>
+    </div>
+  </section>
   <div class="row top">
     <section class="card">
       <h2>Билд + синк <span class="pill" id="deployPill">idle</span></h2>
@@ -1489,20 +3060,6 @@ button.george { border-color: #3d6b52; }
         1) <code>build_stream_linux.bash</code> → потом sync на lab_comp.<br/>
         2) не билдит Unity: заливает уже готовый <code>build_versions/…</code> + scripts/configs.
       </p>
-    </section>
-    <section class="card">
-      <h2>Сервер <code>lab_comp</code> (только SSH) <span class="pill" id="serverPill">—</span></h2>
-      <p class="hint" id="serverHostHint">RAM / nvidia-smi снимаются по ssh, не с твоего ПК.</p>
-      <pre class="server-pre" id="serverStats">загрузка RAM / nvidia-smi с lab_comp…</pre>
-      <h2 style="margin-top:10px;font-size:14px">Сейчас на lab <span class="pill" id="labTasksPill">—</span></h2>
-      <div class="lab-tasks" id="labTasks"><div class="lab-tasks-empty">нет активных задач</div></div>
-      <p class="hint">× гасит только этот тип процесса (train / validate / stream). OBS не трогает.</p>
-      <h2 style="margin-top:8px">Лог действий <span class="pill" id="jobPill">—</span></h2>
-      <div class="field">
-        <label>Активная задача</label>
-        <select id="jobSelect"></select>
-      </div>
-      <div class="log" id="jobLog">нет задач</div>
     </section>
   </div>
 
@@ -1638,6 +3195,101 @@ button.george { border-color: #3d6b52; }
       </div>
     </div>
   </section>
+  </div><!-- /panel-mode-training -->
+
+  <div id="panel-mode-streaming" class="mode-panel" style="display:none">
+  <section class="card" style="margin-bottom:10px">
+    <h2>Блок Survival followers</h2>
+    <p class="hint">Одним кликом гасит Streaming Survival + LLM Bot. Train / Presentation onnx / OBS не трогает.</p>
+    <div class="btns">
+      <button type="button" class="danger" id="btnKillModeStreaming">⏹ Стоп весь блок Survival</button>
+    </div>
+  </section>
+    <section class="card streaming" id="card-ss">
+      <h2>Streaming Survival <span class="pill" id="ssPill">idle</span></h2>
+      <p class="hint">Отдельная survival-среда со scripted follower-персонажами зрителей. Без обучения. Train / validate / Presentation onnx не трогает.</p>
+      <div class="btns" style="flex-wrap:wrap">
+        <button type="button" class="primary" id="btnSsStart">▶ Start Streaming Survival</button>
+        <button type="button" class="danger" id="btnSsStop">⏹ Stop Streaming Survival</button>
+      </div>
+      <p class="hint">Команды чата: <code>#join</code> · <code>#do добывай воду</code> · <code>#do руби дерево</code> · <code>#do убивай овечек</code> · <code>#do поставь костер</code></p>
+    </section>
+
+    <section class="card" id="card-ss-preview">
+      <h2>Lab screen preview <span class="pill" id="ssPreviewPill">off</span></h2>
+      <p class="hint">Живой скриншот <b>lab_comp DISPLAY=:1</b> (Unity Streaming Survival) через SSH. Не трогает train / OBS.</p>
+      <div class="btns" style="flex-wrap:wrap">
+        <button type="button" class="primary" id="btnSsPreviewStart">▶ Start preview</button>
+        <button type="button" class="danger" id="btnSsPreviewStop">⏹ Stop preview</button>
+        <button type="button" id="btnSsPreviewOnce">1 кадр</button>
+      </div>
+      <p class="hint" id="ssPreviewMeta" style="min-height:1.2em">preview off</p>
+      <div style="margin-top:8px;background:#0b0f16;border:1px solid #2a3344;border-radius:8px;overflow:hidden;min-height:180px;display:flex;align-items:center;justify-content:center">
+        <img id="ssPreviewImg" alt="lab screen preview" style="max-width:100%;width:100%;height:auto;display:none;background:#000" />
+        <span id="ssPreviewPlaceholder" style="color:#7a8499;font-size:13px;padding:24px">Нажми Start preview</span>
+      </div>
+    </section>
+
+    <section class="card" id="card-llm-bot">
+      <h2>LLM Bot <span class="pill" id="llmBotPill">stopped</span></h2>
+      <p class="hint">Бот на <b>lab_comp</b> → UDP :5055 в Streaming Survival. Local debug без follower-check.</p>
+      <div class="llm-status" id="llmStatusGrid">
+        <div>Bot: <b id="llmStBot">—</b></div>
+        <div>Mode: <b id="llmStMode">—</b></div>
+        <div>Python deps: <b id="llmStDeps">—</b></div>
+        <div>Ollama: <b id="llmStOllama">—</b></div>
+        <div>Model: <b id="llmStModel">—</b></div>
+        <div>HTTP :8765: <b id="llmStHttp">—</b></div>
+      </div>
+      <p class="hint" id="llmLastError" style="color:#ff8e8e;min-height:1em"></p>
+      <div class="btns" style="flex-wrap:wrap">
+        <button type="button" class="primary" id="btnLlmStart">Start LLM Bot</button>
+        <button type="button" class="danger" id="btnLlmStop">Stop LLM Bot</button>
+        <button type="button" id="btnLlmListen">Listen Twitch Chat: OFF</button>
+      </div>
+      <label style="font-size:12px;color:var(--muted);margin-top:10px;display:block">Local Debug Chat — #join / #do</label>
+      <div class="llm-chat" id="llmChat"></div>
+      <div class="btns" style="align-items:stretch;flex-wrap:wrap">
+        <input id="llmLocalNick" style="width:140px" placeholder="ник" value="viewer" title="Ник персонажа в игре" />
+        <input id="llmLocalMsg" style="flex:1;min-width:120px" placeholder="#join или #do добывай воду"
+          value="#do добывай воду" />
+        <button type="button" class="primary" id="btnLlmLocalSend">Send</button>
+        <button type="button" id="btnLlmExitDebug" title="Убрать debug_user из мира">#exit debug_user</button>
+        <button type="button" id="btnLlmChatClear">Clear</button>
+      </div>
+      <label style="font-size:12px;color:var(--muted);margin-top:10px;display:block">Debug actions (клик = #do)</label>
+      <div class="btns" id="ssDebugActions" style="flex-wrap:wrap;gap:6px;margin-top:6px"></div>
+      <label style="font-size:12px;color:var(--muted);margin-top:10px;display:block">Setup / bot logs</label>
+      <pre class="llm-setup-log" id="llmBotLog">(пусто)</pre>
+    </section>
+
+    <section class="card" id="card-ss-diagnostics">
+      <h2>Streaming Survival Diagnostics</h2>
+      <div class="btns" style="flex-wrap:wrap;gap:6px">
+        <button type="button" class="primary" id="btnSsDiagLiveStress1" title="~1–3 мин, 1 live #do">Live Stress 1 (быстрый)</button>
+        <button type="button" id="btnSsDiagLiveStress" title="~20–45 мин, 40 live #do">Live Stress 40</button>
+        <button type="button" id="btnSsDiagStats" title="Открыть дашборд выбранного репорта">Дашборд</button>
+        <button type="button" id="btnSsRunRefresh" title="Обновить список">Обновить</button>
+      </div>
+      <div style="margin-top:12px">
+        <div id="ssRunList" role="listbox" aria-label="Live Stress reports"
+          style="max-height:320px;overflow:auto;border:1px solid #555;border-radius:8px;background:rgba(0,0,0,.15)">
+          <div class="hint" style="padding:10px">Загрузка…</div>
+        </div>
+        <p class="hint" id="ssRunMeta" style="margin-top:6px"></p>
+      </div>
+      <!-- hidden status hooks for JS (not shown) -->
+      <span id="ssDiagParserStatus" style="display:none"></span>
+      <span id="ssDiagRuntimeStatus" style="display:none"></span>
+      <span id="ssDiagLiveStatus" style="display:none"></span>
+      <span id="ssDiagVisualStatus" style="display:none"></span>
+      <span id="ssDiagStatsStatus" style="display:none"></span>
+      <span id="ssDiagQaStatus" style="display:none"></span>
+      <span id="ssDiagContinuity" style="display:none"></span>
+      <p class="hint" id="ssDiagStatus" style="min-height:1.2em;margin-top:8px"></p>
+      <pre class="llm-setup-log" id="ssDiagLog" style="max-height:200px;display:none"></pre>
+    </section>
+  </div><!-- /panel-mode-streaming -->
 </main>
 <div class="modal-bg" id="detailModal">
   <div class="modal">
@@ -1657,9 +3309,32 @@ let TB_RUNS = [];
 let LAST_JOB = null;
 
 async function api(path, opts) {
-  const r = await fetch(path, opts);
-  const j = await r.json();
-  if (!r.ok) throw new Error(j.error || r.statusText);
+  let r;
+  const ctrl = new AbortController();
+  // server_stats/llm status не должны висеть вечно в браузере
+  const soft = (path || "").indexOf("/api/server_stats") === 0
+    || (path || "").indexOf("/api/llm_bot/status") === 0
+    || (path || "").indexOf("/api/llm_bot/local_chat") === 0
+    || (path || "").indexOf("/api/ss_preview/") === 0
+    || (path || "").indexOf("/api/tb/") === 0;
+  const ms = (path || "").indexOf("/api/ss_diagnostics/") === 0 ? 600000
+    : (soft ? 12000 : 180000);
+  const timer = setTimeout(() => ctrl.abort(), ms);
+  try {
+    r = await fetch(path, Object.assign({}, opts || {}, { signal: ctrl.signal }));
+  } catch (e) {
+    const name = (e && e.name) || "";
+    if (name === "AbortError") throw new Error("timeout (" + path + ")");
+    throw new Error("Failed to fetch (" + path + ") — UI занят/перезапусти");
+  } finally {
+    clearTimeout(timer);
+  }
+  const txt = await r.text();
+  let j = {};
+  try { j = txt ? JSON.parse(txt) : {}; } catch (_) {
+    throw new Error("bad JSON from " + path);
+  }
+  if (!r.ok) throw new Error(j.error || r.statusText || ("HTTP " + r.status));
   return j;
 }
 
@@ -1865,13 +3540,137 @@ async function startJointStream() {
 }
 
 function switchJointTab(panelId) {
-  for (const btn of document.querySelectorAll(".subtab")) {
+  for (const btn of document.querySelectorAll("#card-joint-wrap .subtab")) {
     const on = btn.dataset.panel === panelId;
     btn.classList.toggle("active", on);
   }
-  for (const panel of document.querySelectorAll(".subpanel")) {
+  for (const panel of document.querySelectorAll("#card-joint-wrap .subpanel")) {
     panel.classList.toggle("active", panel.id === panelId);
   }
+  saveUiView();
+}
+
+function switchModeTab(mode) {
+  const train = mode === "training";
+  document.getElementById("tab-mode-training").classList.toggle("active", train);
+  document.getElementById("tab-mode-streaming").classList.toggle("active", !train);
+  document.getElementById("panel-mode-training").style.display = train ? "" : "none";
+  document.getElementById("panel-mode-streaming").style.display = train ? "none" : "";
+  saveUiView();
+}
+
+const UI_VIEW_KEY = "forest_lab_ui_view_v1";
+let _saveUiViewTimer = null;
+
+function _nearestVisibleCardId() {
+  const targetY = window.scrollY + Math.min(140, window.innerHeight * 0.18);
+  let best = "";
+  let bestDist = Infinity;
+  for (const el of document.querySelectorAll("section.card[id]")) {
+    const panel = el.closest(".mode-panel");
+    if (panel && getComputedStyle(panel).display === "none") continue;
+    const top = el.getBoundingClientRect().top + window.scrollY;
+    const dist = Math.abs(top - targetY);
+    if (dist < bestDist) {
+      bestDist = dist;
+      best = el.id;
+    }
+  }
+  return best;
+}
+
+function saveUiView() {
+  try {
+    const streaming = !!(document.getElementById("tab-mode-streaming")
+      && document.getElementById("tab-mode-streaming").classList.contains("active"));
+    const jointBtn = document.querySelector("#card-joint-wrap .subtab.active");
+    const view = {
+      mode: streaming ? "streaming" : "training",
+      joint: (jointBtn && jointBtn.dataset.panel) || "panel-joint-train",
+      scrollY: Math.max(0, window.scrollY || window.pageYOffset || 0),
+      anchor: _nearestVisibleCardId() || "",
+    };
+    localStorage.setItem(UI_VIEW_KEY, JSON.stringify(view));
+  } catch (_) {}
+}
+
+function restoreUiView() {
+  let view = null;
+  try {
+    view = JSON.parse(localStorage.getItem(UI_VIEW_KEY) || "null");
+  } catch (_) {
+    view = null;
+  }
+  if (!view || typeof view !== "object") return;
+  if (view.mode === "streaming" || view.mode === "training") {
+    // Avoid recursive save noise while restoring.
+    const train = view.mode === "training";
+    document.getElementById("tab-mode-training").classList.toggle("active", train);
+    document.getElementById("tab-mode-streaming").classList.toggle("active", !train);
+    document.getElementById("panel-mode-training").style.display = train ? "" : "none";
+    document.getElementById("panel-mode-streaming").style.display = train ? "none" : "";
+  }
+  if (view.joint) {
+    for (const btn of document.querySelectorAll("#card-joint-wrap .subtab")) {
+      btn.classList.toggle("active", btn.dataset.panel === view.joint);
+    }
+    for (const panel of document.querySelectorAll("#card-joint-wrap .subpanel")) {
+      panel.classList.toggle("active", panel.id === view.joint);
+    }
+  }
+  const applyScroll = () => {
+    if (view.anchor) {
+      const el = document.getElementById(view.anchor);
+      if (el && getComputedStyle(el).display !== "none") {
+        el.scrollIntoView({ block: "start", behavior: "auto" });
+        return;
+      }
+    }
+    if (typeof view.scrollY === "number" && view.scrollY > 0) {
+      window.scrollTo(0, view.scrollY);
+    }
+  };
+  requestAnimationFrame(() => requestAnimationFrame(applyScroll));
+  setTimeout(applyScroll, 250);
+  setTimeout(applyScroll, 800);
+}
+
+function bindUiViewPersistence() {
+  window.addEventListener("scroll", () => {
+    clearTimeout(_saveUiViewTimer);
+    _saveUiViewTimer = setTimeout(saveUiView, 120);
+  }, { passive: true });
+  window.addEventListener("beforeunload", saveUiView);
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") saveUiView();
+  });
+}
+
+async function startStreamingSurvival() {
+  flash("hdrMeta", "start Streaming Survival…");
+  try {
+    const j = await api("/api/action", {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ action:"start_streaming_survival" }),
+    });
+    LAST_JOB = j.job_id;
+    document.getElementById("ssPill").textContent = "starting";
+    pollJobs();
+  } catch (e) { alert(e.message||e); }
+}
+
+async function stopStreamingSurvival() {
+  if (!confirm("Остановить Streaming Survival? Train / Presentation onnx не трогаем.")) return;
+  flash("hdrMeta", "stop Streaming Survival…");
+  try {
+    const j = await api("/api/action", {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ action:"stop_streaming_survival" }),
+    });
+    LAST_JOB = j.job_id;
+    document.getElementById("ssPill").textContent = "stopping";
+    pollJobs();
+  } catch (e) { alert(e.message||e); }
 }
 
 async function killValidateOnly() {
@@ -1908,6 +3707,37 @@ async function killStreamOnly() {
   }
 }
 
+async function killModeTraining() {
+  if (!confirm("Стоп весь блок Forest Lab Train?\\n\\nУбьёт: train + validate + Presentation stream.\\nНе трогает: Survival followers, OBS.")) return;
+  flash("hdrMeta", "стоп блок Train…");
+  try {
+    const j = await api("/api/action", {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ action:"kill_mode_training" }),
+    });
+    LAST_JOB = j.job_id;
+    pollJobs();
+    setTimeout(pollServer, 1500);
+    setTimeout(pollServer, 5000);
+  } catch (e) { alert(e.message||e); }
+}
+
+async function killModeStreaming() {
+  if (!confirm("Стоп весь блок Survival followers?\\n\\nУбьёт: Streaming Survival + LLM Bot.\\nНе трогает: train, Presentation onnx, OBS.")) return;
+  flash("hdrMeta", "стоп блок Survival…");
+  try {
+    const j = await api("/api/action", {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ action:"kill_mode_streaming" }),
+    });
+    LAST_JOB = j.job_id;
+    try { await pollLlmBot(); } catch (_) {}
+    pollJobs();
+    setTimeout(pollServer, 1500);
+    setTimeout(pollServer, 5000);
+  } catch (e) { alert(e.message||e); }
+}
+
 async function killTrainOnly() {
   if (!confirm("Остановить train на lab (mlagents + headless Unity)? Стрим и validate не трогаем.")) return;
   flash("hdrMeta", "стоп train…");
@@ -1923,6 +3753,202 @@ async function killTrainOnly() {
   } catch (e) {
     alert(e.message||e);
   }
+}
+
+const LLM_API = "/api/llm_bot";
+let LLM_LISTEN = false;
+let LLM_POLL_TIMER = null;
+
+function renderSsDebugActions(s) {
+  const host = document.getElementById("ssDebugActions");
+  if (!host) return;
+  const acts = (s && Array.isArray(s.available_actions) && s.available_actions.length)
+    ? s.available_actions
+    : [
+    {action:"collect_water", hint:"вода"},
+    {action:"collect_wood", hint:"дерево"},
+    {action:"collect_food", hint:"еда"},
+    {action:"kill_sheep", hint:"овечки"},
+    {action:"build_campfire", hint:"костёр"},
+    {action:"go_home", hint:"к дому"},
+    {action:"idle", hint:"ждать"},
+  ];
+  // доп. кнопки цепочек
+  const extras = [
+    {label:"#join", msg:"#join"},
+    {label:"#exit", msg:"#exit"},
+    {label:"10 воды→10 дерева", msg:"#do добудь 10 воды затем 10 дерева"},
+    {label:"гуляй", msg:"#do гуляй"},
+  ];
+  host.innerHTML = "";
+  for (const a of acts) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.textContent = a.action;
+    b.title = a.hint || a.action;
+    b.onclick = () => ssDebugSend("#do " + (a.hint ? a.hint.split("/")[0].trim() : a.action));
+    host.append(b);
+  }
+  for (const e of extras) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.textContent = e.label;
+    b.onclick = () => ssDebugSend(e.msg);
+    host.append(b);
+  }
+}
+
+async function ssDebugSend(message) {
+  const input = document.getElementById("llmLocalMsg");
+  if (input) input.value = message;
+  const nickEl = document.getElementById("llmLocalNick");
+  const username = ((nickEl && nickEl.value) || "viewer").trim() || "viewer";
+  try {
+    const j = await api(LLM_API + "/local_chat", {
+      method: "POST", headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({ username, message }),
+    });
+    renderLlmStatus(j.status || j);
+    setTimeout(pollLlmBot, 800);
+    setTimeout(pollLlmBot, 2500);
+  } catch (e) { alert(e.message || e); }
+}
+
+function renderLlmStatus(s) {
+  if (!s) return;
+  renderSsDebugActions(s);
+  const pill = document.getElementById("llmBotPill");
+  const st = s.bot_state || "—";
+  const live = (st === "running" || st === "starting");
+  if (pill) {
+    pill.textContent = st;
+    pill.className = "pill" + (live ? " live" : "");
+  }
+  setCardState("card-llm-bot", live, false);
+  const modeSs = document.getElementById("tab-mode-streaming");
+  if (modeSs) {
+    const ssLive = !!(document.getElementById("card-ss") && document.getElementById("card-ss").classList.contains("running"));
+    modeSs.classList.toggle("has-live", ssLive || live);
+  }
+  const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+  set("llmStBot", st + (s.host ? (" @ " + s.host) : " @ lab_comp"));
+  LLM_LISTEN = !!s.listen_stream;
+  set("llmStMode", LLM_LISTEN ? "Twitch stream" : "Local debug");
+  set("llmStDeps", s.python_deps || "—");
+  set("llmStOllama", s.ollama || "—");
+  set("llmStModel", (s.model || "—") + (s.ollama_model ? " (" + s.ollama_model + ")" : ""));
+  set("llmStHttp", s.bot_http_ready ? "ready" : "down");
+  const err = document.getElementById("llmLastError");
+  if (err) err.textContent = s.last_error ? ("Last error: " + s.last_error) : "";
+  const btnL = document.getElementById("btnLlmListen");
+  if (btnL) btnL.textContent = LLM_LISTEN ? "Listen Twitch Chat: ON" : "Listen Twitch Chat: OFF";
+
+  const logEl = document.getElementById("llmBotLog");
+  if (logEl && Array.isArray(s.logs)) {
+    logEl.textContent = s.logs.length ? s.logs.join("\n") : "(пусто)";
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+  const chat = document.getElementById("llmChat");
+  if (chat && Array.isArray(s.chat)) {
+    // не дёргать вниз, если пользователь читает историю сверху
+    const distBottom = chat.scrollHeight - chat.scrollTop - chat.clientHeight;
+    const stickBottom = distBottom < 56;
+    chat.innerHTML = "";
+    const esc = (t) => String(t)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    for (const m of s.chat) {
+      const body = String(m.text || "").replace(/^[\s\u00a0\u200b\uFEFF\u2028\u2029]+|[\s\u00a0\u200b\uFEFF\u2028\u2029]+$/g, "");
+      if (!body) continue;
+      const r = (m.role === "bot" || m.role === "system") ? m.role : "user";
+      const who = (m.role || "user") + ":";
+      const row = document.createElement("div");
+      row.className = "row " + r;
+      // <b>role:</b> + один <br> + текст — без пустой строки
+      row.innerHTML = "<b>" + esc(who) + "</b><br>" + esc(body);
+      chat.append(row);
+    }
+    if (stickBottom) chat.scrollTop = chat.scrollHeight;
+  }
+}
+
+async function pollLlmBot() {
+  try {
+    const s = await api(LLM_API + "/status");
+    renderLlmStatus(s);
+  } catch (e) {
+    const pill = document.getElementById("llmBotPill");
+    if (pill) pill.textContent = "ui-err";
+  }
+}
+
+function wireLlmBotUi() {
+  if (!document.getElementById("btnLlmStart")) return;
+  document.getElementById("btnLlmStart").onclick = async () => {
+    flash("hdrMeta", "LLM bot starting…");
+    try {
+      const s = await api(LLM_API + "/start", { method: "POST", headers: {"Content-Type":"application/json"}, body: "{}" });
+      renderLlmStatus(s);
+    } catch (e) { alert(e.message || e); }
+  };
+  document.getElementById("btnLlmStop").onclick = async () => {
+    try {
+      const s = await api(LLM_API + "/stop", { method: "POST", headers: {"Content-Type":"application/json"}, body: "{}" });
+      renderLlmStatus(s);
+    } catch (e) { alert(e.message || e); }
+  };
+  document.getElementById("btnLlmListen").onclick = async () => {
+    const next = !LLM_LISTEN;
+    try {
+      const j = await api(LLM_API + "/mode", {
+        method: "POST", headers: {"Content-Type":"application/json"},
+        body: JSON.stringify({ listen_stream: next }),
+      });
+      renderLlmStatus(j.status || j);
+    } catch (e) { alert(e.message || e); }
+  };
+  const send = async () => {
+    const input = document.getElementById("llmLocalMsg");
+    const nickEl = document.getElementById("llmLocalNick");
+    const message = (input.value || "").trim();
+    const username = ((nickEl && nickEl.value) || "viewer").trim() || "viewer";
+    if (!message) return;
+    input.value = "";
+    try {
+      // accepted сразу; ответ бота подтянет pollLlmBot
+      const j = await api(LLM_API + "/local_chat", {
+        method: "POST", headers: {"Content-Type":"application/json"},
+        body: JSON.stringify({ username, message }),
+      });
+      renderLlmStatus(j.status || j);
+      setTimeout(pollLlmBot, 800);
+      setTimeout(pollLlmBot, 2500);
+    } catch (e) { alert(e.message || e); }
+  };
+  document.getElementById("btnLlmLocalSend").onclick = send;
+  const btnExitDbg = document.getElementById("btnLlmExitDebug");
+  if (btnExitDbg) {
+    btnExitDbg.onclick = async () => {
+      try {
+        await api(LLM_API + "/local_chat", {
+          method: "POST", headers: {"Content-Type":"application/json"},
+          body: JSON.stringify({ username: "debug_user", message: "#exit" }),
+        });
+        setTimeout(pollLlmBot, 600);
+      } catch (e) { alert(e.message || e); }
+    };
+  }
+  document.getElementById("llmLocalMsg").addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter" && !ev.shiftKey) { ev.preventDefault(); send(); }
+  });
+  document.getElementById("btnLlmChatClear").onclick = async () => {
+    try {
+      await api(LLM_API + "/clear_chat", { method: "POST", headers: {"Content-Type":"application/json"}, body: "{}" });
+      await pollLlmBot();
+    } catch (e) { alert(e.message || e); }
+  };
+  pollLlmBot();
+  if (LLM_POLL_TIMER) clearInterval(LLM_POLL_TIMER);
+  LLM_POLL_TIMER = setInterval(pollLlmBot, 2000);
 }
 
 async function loadJointChart() {
@@ -2259,19 +4285,38 @@ async function pollServer() {
   try {
     const s = await api("/api/server_stats");
     const host = s.host || "lab_comp";
+    const mode = s.mode || (host === "local" ? "local" : "ssh");
     const tried = (s.tried || []).join(" → ");
+    const modeLabel = document.getElementById("serverModeLabel");
+    if (modeLabel) modeLabel.textContent = mode === "local" ? "(local на lab)" : "(только SSH)";
     document.getElementById("serverHostHint").textContent =
       s.ok
-        ? `host=${host} · данные только по SSH (не локальный ПК)`
-        : `ssh fail · пробовали: ${tried || host}`;
+        ? (mode === "local"
+          ? `host=local · UI уже на lab_comp, команды без SSH (это нормально)`
+          : `host=${host} · данные по SSH с lab (не с твоего ПК)`)
+        : (s.pending
+          ? `host=${host} · опрос…`
+          : (mode === "local"
+            ? `local fail · ${s.text || "?"}`
+            : `ssh fail · пробовали: ${tried || host}`));
     document.getElementById("serverStats").textContent =
-      `[ssh ${host}]\n` + (s.text || "(пусто)");
-    document.getElementById("serverPill").textContent = s.ok ? "ssh ok" : "ssh err";
-    document.getElementById("serverPill").className = "pill" + (s.ok ? " on" : "");
+      `[${mode} ${host}]\n` + (s.text || "(пусто)");
+    const pill = document.getElementById("serverPill");
+    if (s.ok) {
+      pill.textContent = mode === "local" ? "local ok" : "ssh ok";
+      pill.className = "pill on";
+    } else if (s.pending) {
+      pill.textContent = mode === "local" ? "local…" : "ssh…";
+      pill.className = "pill";
+    } else {
+      pill.textContent = mode === "local" ? "local err" : "ssh err";
+      pill.className = "pill";
+    }
     applyLabActivity(s.activity || {});
   } catch (e) {
-    document.getElementById("serverStats").textContent = "server_stats (ssh lab_comp): " + (e.message||e);
+    document.getElementById("serverStats").textContent = "server_stats: " + (e.message||e);
     document.getElementById("serverPill").textContent = "err";
+    document.getElementById("serverPill").className = "pill";
     applyLabActivity({});
   }
 }
@@ -2303,8 +4348,11 @@ function setPillLive(id, live, streamLive, idleText) {
 }
 
 function applyLabActivity(a) {
+  a = a || {};
   const jack = !!a.jack, lily = !!a.lily, george = !!a.george;
   const joint = !!a.joint, validate = !!a.validate, stream = !!a.stream;
+  const ss = !!a.streaming_survival;
+  const bot = !!a.llm_bot;
   setCardState("card-jack", jack, false);
   setCardState("card-lily", lily, false);
   setCardState("card-george", george, false);
@@ -2312,17 +4360,36 @@ function applyLabActivity(a) {
   // Обёртка с вкладками: красный = train, синий = stream.
   setCardState("card-joint-wrap", joint, stream && !joint);
   if (joint && stream) setCardState("card-joint-wrap", true, true);
+  // Survival followers: красный мигающий блок когда процесс жив.
+  setCardState("card-ss", ss, false);
+  setCardState("card-llm-bot", bot, false);
+  // Preview card keeps its own running state from ssPreviewApplyStatus — don't clear it here.
+  const previewLive = !!(document.getElementById("card-ss-preview")
+    && document.getElementById("card-ss-preview").classList.contains("running"));
 
   const tabTrain = document.getElementById("tab-joint-train");
   const tabStream = document.getElementById("tab-joint-stream");
   if (tabTrain) tabTrain.classList.toggle("has-live", joint);
   if (tabStream) tabStream.classList.toggle("has-live", stream);
+  const modeSs = document.getElementById("tab-mode-streaming");
+  if (modeSs) modeSs.classList.toggle("has-live", ss || bot || previewLive);
 
   setPillLive("pill-jack", jack, false, null);
   setPillLive("pill-lily", lily, false, null);
   setPillLive("pill-george", george, false, null);
   setPillLive("pill-joint", joint, false, "finetune");
   setPillLive("pill-stream", stream, false, "idle");
+
+  const ssPill = document.getElementById("ssPill");
+  if (ssPill) {
+    if (ss) {
+      ssPill.textContent = "RUNNING";
+      ssPill.className = "pill live";
+    } else if (ssPill.textContent === "RUNNING" || ssPill.textContent === "starting") {
+      ssPill.textContent = "idle";
+      ssPill.className = "pill";
+    }
+  }
 
   const valPill = document.getElementById("valPill");
   if (valPill) {
@@ -2353,6 +4420,8 @@ function renderLabTasks(a) {
     }
     if (a.validate) tasks.push({id:"validate", kind:"validate", label:"Validate (mp4)", kill:"validate"});
     if (a.stream) tasks.push({id:"stream", kind:"stream", label:"Stream Presentation", kill:"stream"});
+    if (a.streaming_survival) tasks.push({id:"streaming_survival", kind:"streaming_survival", label:"Streaming Survival", kill:"streaming_survival"});
+    if (a.llm_bot) tasks.push({id:"llm_bot", kind:"llm_bot", label:"LLM Bot", kill:"llm_bot"});
   }
   host.innerHTML = "";
   if (pill) {
@@ -2396,10 +4465,22 @@ function renderLabTasks(a) {
 }
 
 async function killLabTask(kind, label) {
+  if (kind === "llm_bot") {
+    if (!confirm("Остановить LLM Bot на lab?" + (label ? "\n\n" + label : ""))) return;
+    flash("hdrMeta", "стоп llm_bot…");
+    try {
+      const s = await api(LLM_API + "/stop", { method: "POST", headers: {"Content-Type":"application/json"}, body: "{}" });
+      renderLlmStatus(s);
+      setTimeout(pollServer, 1200);
+      setTimeout(pollServer, 3500);
+    } catch (e) { alert(e.message || e); }
+    return;
+  }
   const map = {
     train: { action: "kill_train", ask: "Остановить train на lab (mlagents + headless)? Стрим/validate не трогаем." },
     validate: { action: "kill_validate", ask: "Остановить только validate (mp4)?" },
     stream: { action: "kill_stream", ask: "Остановить только бесконечный стрим Presentation? OBS не гасим." },
+    streaming_survival: { action: "stop_streaming_survival", ask: "Остановить Streaming Survival? Train / Presentation onnx не трогаем." },
   };
   const conf = map[kind];
   if (!conf) { alert("Неизвестный тип: " + kind); return; }
@@ -2541,6 +4622,479 @@ function renderHeroes() {
   loadJointChart();
 }
 
+function bindModeTabs() {
+  const t = document.getElementById("tab-mode-training");
+  const s = document.getElementById("tab-mode-streaming");
+  if (t) t.onclick = () => switchModeTab("training");
+  if (s) s.onclick = () => switchModeTab("streaming");
+  const bStart = document.getElementById("btnSsStart");
+  const bStop = document.getElementById("btnSsStop");
+  if (bStart) bStart.onclick = () => startStreamingSurvival();
+  if (bStop) bStop.onclick = () => stopStreamingSurvival();
+  bindSsDiagnostics();
+  bindSsPreview();
+}
+
+let _ssPreviewTimer = null;
+let _ssPreviewRunning = false;
+
+function bindSsPreview() {
+  const startBtn = document.getElementById("btnSsPreviewStart");
+  const stopBtn = document.getElementById("btnSsPreviewStop");
+  const onceBtn = document.getElementById("btnSsPreviewOnce");
+  if (startBtn) startBtn.onclick = () => ssPreviewStart();
+  if (stopBtn) stopBtn.onclick = () => ssPreviewStop();
+  if (onceBtn) onceBtn.onclick = () => ssPreviewOnce();
+  ssPreviewPollStatus();
+}
+
+function ssPreviewApplyStatus(st) {
+  _ssPreviewRunning = !!(st && st.running);
+  setCardState("card-ss-preview", _ssPreviewRunning, false);
+  const pill = document.getElementById("ssPreviewPill");
+  const meta = document.getElementById("ssPreviewMeta");
+  const img = document.getElementById("ssPreviewImg");
+  const ph = document.getElementById("ssPreviewPlaceholder");
+  if (pill) {
+    if (_ssPreviewRunning) {
+      pill.textContent = "LIVE";
+      pill.className = "pill live";
+    } else {
+      pill.textContent = "off";
+      pill.className = "pill";
+    }
+  }
+  const modeSs = document.getElementById("tab-mode-streaming");
+  if (modeSs) {
+    const ssLive = !!(document.getElementById("card-ss") && document.getElementById("card-ss").classList.contains("running"));
+    const botLive = !!(document.getElementById("card-llm-bot") && document.getElementById("card-llm-bot").classList.contains("running"));
+    modeSs.classList.toggle("has-live", ssLive || botLive || _ssPreviewRunning);
+  }
+  if (meta) {
+    const err = (st && st.last_error) ? (" · err: " + st.last_error) : "";
+    const age = st && st.last_ok_at
+      ? (" · last " + Math.max(0, Math.round(Date.now()/1000 - st.last_ok_at)) + "s ago")
+      : "";
+    meta.textContent = (_ssPreviewRunning ? "live " + (st.display || ":1") : "preview off")
+      + " · frames=" + ((st && st.frames) || 0)
+      + age + err;
+  }
+  if (st && st.has_frame && img) {
+    img.style.display = "block";
+    if (ph) ph.style.display = "none";
+    img.src = "/api/ss_preview/frame.jpg?t=" + Date.now();
+  }
+  if (_ssPreviewRunning && !_ssPreviewTimer) {
+    _ssPreviewTimer = setInterval(ssPreviewTick, 1600);
+  }
+  if (!_ssPreviewRunning && _ssPreviewTimer) {
+    clearInterval(_ssPreviewTimer);
+    _ssPreviewTimer = null;
+  }
+}
+
+async function ssPreviewPollStatus() {
+  try {
+    const st = await api("/api/ss_preview/status");
+    ssPreviewApplyStatus(st);
+  } catch (_) {}
+}
+
+async function ssPreviewTick() {
+  try {
+    const st = await api("/api/ss_preview/status");
+    ssPreviewApplyStatus(st);
+  } catch (e) {
+    const meta = document.getElementById("ssPreviewMeta");
+    if (meta) meta.textContent = "preview poll: " + (e.message || e);
+  }
+}
+
+async function ssPreviewStart() {
+  try {
+    const st = await api("/api/ss_preview/start", {
+      method: "POST",
+      headers: {"Content-Type":"application/json"},
+      body: "{}",
+    });
+    ssPreviewApplyStatus(st);
+  } catch (e) { alert(e.message || e); }
+}
+
+async function ssPreviewStop() {
+  try {
+    const st = await api("/api/ss_preview/stop", {
+      method: "POST",
+      headers: {"Content-Type":"application/json"},
+      body: "{}",
+    });
+    ssPreviewApplyStatus(st);
+  } catch (e) { alert(e.message || e); }
+}
+
+async function ssPreviewOnce() {
+  try {
+    const st = await api("/api/ss_preview/once", {
+      method: "POST",
+      headers: {"Content-Type":"application/json"},
+      body: "{}",
+    });
+    ssPreviewApplyStatus(st);
+  } catch (e) { alert(e.message || e); }
+}
+
+function bindSsDiagnostics() {
+  const logEl = document.getElementById("ssDiagLog");
+  const stEl = document.getElementById("ssDiagStatus");
+  const zipEl = document.getElementById("ssDiagZipLink");
+  const statsLink = document.getElementById("ssDiagStatsLink");
+  const parserSt = document.getElementById("ssDiagParserStatus");
+  const runtimeSt = document.getElementById("ssDiagRuntimeStatus");
+  const liveSt = document.getElementById("ssDiagLiveStatus");
+  const visualSt = document.getElementById("ssDiagVisualStatus");
+  const statsSt = document.getElementById("ssDiagStatsStatus");
+  const qaSt = document.getElementById("ssDiagQaStatus");
+  const runList = document.getElementById("ssRunList");
+  const runMeta = document.getElementById("ssRunMeta");
+  let selectedRunId = "";
+  let cachedReports = [];
+  let runningJobRunId = "";
+  let runningJobKind = "";
+  function showLog(text) {
+    if (!logEl) return;
+    if (!text) {
+      logEl.style.display = "none";
+      logEl.textContent = "";
+      return;
+    }
+    logEl.style.display = "block";
+    logEl.textContent = text;
+  }
+  function dashUrl() {
+    return "/api/ss_diagnostics/stats_dashboard"
+      + (selectedRunId ? ("?run=" + encodeURIComponent(selectedRunId)) : "");
+  }
+  function highlightSelectedReport() {
+    if (!runList) return;
+    for (const row of runList.querySelectorAll("[data-run-id]")) {
+      const on = row.getAttribute("data-run-id") === selectedRunId;
+      row.style.background = on ? "rgba(106,166,255,.22)" : "transparent";
+      row.style.outline = on ? "1px solid rgba(106,166,255,.55)" : "none";
+      row.setAttribute("aria-selected", on ? "true" : "false");
+    }
+  }
+  function renderReportList(runs, preferId, latestId) {
+    cachedReports = runs || [];
+    if (!runList) return;
+    runList.innerHTML = "";
+    if (!cachedReports.length && !runningJobRunId) {
+      runList.innerHTML = '<div class="hint" style="padding:10px">Нет репортов. Запусти Live Stress 40.</div>';
+      selectedRunId = "";
+      return;
+    }
+    const ids = new Set(cachedReports.map(r => r.id));
+    // preferId === "__latest__" = after new job: always pick newest report
+    let keep = "";
+    if (preferId === "__latest__") keep = latestId || "";
+    else keep = preferId || selectedRunId || latestId || "";
+    if (keep && ids.has(keep)) selectedRunId = keep;
+    else if (cachedReports.length) selectedRunId = cachedReports[0].id;
+    else selectedRunId = runningJobRunId || "";
+
+    if (runningJobRunId) {
+      const runRow = document.createElement("div");
+      runRow.setAttribute("data-run-id", runningJobRunId);
+      runRow.style.cssText = "display:grid;grid-template-columns:minmax(0,1.4fr) minmax(140px,1fr) auto;gap:10px;align-items:center;padding:9px 12px;border-bottom:1px solid #3a3a3a;background:rgba(230,184,77,.12)";
+      runRow.innerHTML = '<div style="min-width:0"><div style="font-weight:600">Live Stress 40 · RUNNING</div>'
+        + '<div class="hint" style="opacity:.85;margin-top:2px;font-size:12px;word-break:break-all">'
+        + runningJobRunId + "</div></div>"
+        + '<div style="font-variant-numeric:tabular-nums">PASS — · FAIL —<br/><span class="hint">длительность: идёт…</span></div>'
+        + '<div style="text-align:right;white-space:nowrap;opacity:.95">сейчас</div>';
+      runList.appendChild(runRow);
+    }
+    for (const r of cachedReports) {
+      if (runningJobRunId && r.id === runningJobRunId) continue;
+      const row = document.createElement("div");
+      row.setAttribute("role", "option");
+      row.setAttribute("data-run-id", r.id);
+      row.style.cssText = "display:grid;grid-template-columns:minmax(0,1.4fr) minmax(140px,1fr) auto;gap:10px;align-items:center;padding:9px 12px;cursor:pointer;border-bottom:1px solid #3a3a3a";
+      const left = document.createElement("div");
+      left.style.cssText = "min-width:0";
+      const t = document.createElement("div");
+      t.style.cssText = "font-weight:600";
+      t.textContent = (r.title || ("Live Stress " + (r.attempts || 40))) + " · " + (r.status || r.live_stress_status || "—");
+      if (r.in_progress || r.status === "RUNNING") {
+        row.style.background = "rgba(230,184,77,.12)";
+      }
+      const idLine = document.createElement("div");
+      idLine.className = "hint";
+      idLine.style.cssText = "opacity:.7;margin-top:2px;font-size:11px;word-break:break-all";
+      idLine.textContent = r.id || "";
+      left.appendChild(t);
+      left.appendChild(idLine);
+
+      const mid = document.createElement("div");
+      mid.style.cssText = "font-variant-numeric:tabular-nums;line-height:1.35";
+      const total = r.attempts || 40;
+      const score = document.createElement("div");
+      if (r.in_progress || r.status === "RUNNING") {
+        const done = (r.done_attempts != null) ? r.done_attempts : (r.attempts_passed ?? "—");
+        score.innerHTML = '<span style="color:#e6b84d">RUNNING</span>'
+          + ' <span class="hint">' + done + " / " + total + "</span>";
+      } else {
+        const passed = (r.attempts_passed === 0 || r.attempts_passed) ? r.attempts_passed : "—";
+        const failed = (r.attempts_failed === 0 || r.attempts_failed) ? r.attempts_failed : "—";
+        score.innerHTML = '<span style="color:#3ecf8e">PASS ' + passed + "</span>"
+          + " / <span style=\"color:#ef6b6b\">FAIL " + failed + "</span>"
+          + ' <span class="hint">из ' + total + "</span>";
+      }
+      const dur = document.createElement("div");
+      dur.className = "hint";
+      dur.style.marginTop = "2px";
+      dur.textContent = "время: " + (r.duration_label || "—");
+      mid.appendChild(score);
+      mid.appendChild(dur);
+
+      const right = document.createElement("div");
+      right.style.cssText = "text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums;opacity:.95";
+      right.textContent = r.when || "—";
+
+      row.appendChild(left);
+      row.appendChild(mid);
+      row.appendChild(right);
+      row.onclick = () => { loadRunReport(r.id); };
+      runList.appendChild(row);
+    }
+    highlightSelectedReport();
+  }
+  function applyCheckerStats(_summary, _stats) {}
+  function openSelectedDashboard() {
+    window.open(dashUrl(), "_blank", "noopener");
+  }
+  function applySummary(summary, stats, extra) {
+    if (!summary) return;
+    if (parserSt) parserSt.textContent = summary.parser_only_status || summary.parser || "—";
+    if (runtimeSt) {
+      runtimeSt.textContent = summary.machine_full_runtime_status
+        || summary.full_runtime_status
+        || (summary.mode === "parser_only" ? "NOT RUN" : (summary.overall || "—"));
+    }
+    if (liveSt) liveSt.textContent = summary.live_stress_status || "NOT RUN";
+    if (visualSt) visualSt.textContent = summary.visual_status || "PENDING";
+    if (statsSt) statsSt.textContent = summary.stats_dashboard_status
+      || (stats && stats.stats_dashboard_status) || "NOT RUN";
+    if (qaSt) qaSt.textContent = summary.overall_qa_status || "—";
+    const contEl = document.getElementById("ssDiagContinuity");
+    if (contEl) {
+      let maxJump = Number((stats && stats.max_position_jump) || summary.max_position_jump || 0);
+      let maxSpeed = Number((stats && stats.max_speed) || summary.max_speed || 0);
+      let illegal = Number(summary.illegal_teleports || 0);
+      const rows = (summary.scenario_results && summary.scenario_results.scenarios)
+        || summary.scenarios || [];
+      for (const e of rows) {
+        if (!e) continue;
+        const j = Number(e.max_position_jump || 0);
+        const s = Number(e.max_speed || 0);
+        if (j > maxJump) maxJump = j;
+        if (s > maxSpeed) maxSpeed = s;
+        const arr = e.illegal_teleports;
+        if (Array.isArray(arr)) illegal += arr.length;
+        const u = e.unity_result;
+        if (u && Array.isArray(u.illegal_teleports)) illegal += u.illegal_teleports.length;
+      }
+      const live = summary.live_stress || {};
+      if (Number(live.max_position_jump || 0) > maxJump) maxJump = Number(live.max_position_jump);
+      if (Number(live.max_speed || 0) > maxSpeed) maxSpeed = Number(live.max_speed);
+      contEl.textContent =
+        "Continuity: max jump " + maxJump.toFixed(2)
+        + " · max speed " + maxSpeed.toFixed(2)
+        + " · illegal teleports " + illegal
+        + " · min ground " + (stats && stats.min_ground_clearance != null ? stats.min_ground_clearance : (live.min_ground_clearance ?? "—"));
+    }
+    applyCheckerStats(summary, stats);
+    if (runMeta) runMeta.textContent = "";
+    if (statsLink) statsLink.innerHTML = "";
+  }
+  async function loadRunReport(runId) {
+    selectedRunId = runId || "";
+    highlightSelectedReport();
+    if (stEl) stEl.textContent = "";
+    try {
+      const j = await api("/api/ss_diagnostics/last_report", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({run: selectedRunId || null}),
+      });
+      if (j.run_id) selectedRunId = j.run_id;
+      highlightSelectedReport();
+      const summary = j.summary || {};
+      if (j.visual_status) summary.visual_status = j.visual_status;
+      if (j.overall_qa_status) summary.overall_qa_status = j.overall_qa_status;
+      if (j.machine_full_runtime_status) summary.machine_full_runtime_status = j.machine_full_runtime_status;
+      if (j.live_stress_status) summary.live_stress_status = j.live_stress_status;
+      if (j.stats_dashboard_status) summary.stats_dashboard_status = j.stats_dashboard_status;
+      applySummary(summary, j.stats_summary || summary.stats_summary, j);
+      if (runMeta) runMeta.textContent = "";
+      if (stEl) stEl.textContent = "";
+      showLog("");
+    } catch (e) {
+      if (stEl) stEl.textContent = "ошибка: " + (e.message || e);
+    }
+  }
+  async function refreshRuns(preferId) {
+    try {
+      const j = await api("/api/ss_diagnostics/runs");
+      const runs = j.runs || [];
+      const latestReport = (runs.find(r => r.has_live) || runs[0] || {}).id || j.latest_id || "";
+      renderReportList(runs, preferId, latestReport);
+    } catch (e) {
+      if (runList) runList.innerHTML = '<div class="hint" style="padding:10px">Ошибка списка: '
+        + String(e.message || e) + "</div>";
+      if (runMeta) runMeta.textContent = "list error: " + (e.message || e);
+    }
+  }
+  async function pollDiagJob(jobId, kind) {
+    if (stEl) stEl.textContent = "RUNNING…";
+    let n = 0;
+    while (n < 720) { // up to ~60 min @ 5s
+      n++;
+      let detail = null;
+      try { detail = await api("/api/jobs/" + encodeURIComponent(jobId)); } catch (_) {}
+      if (detail) {
+        const st = detail.status || "?";
+        const logTail = detail.log_tail || "";
+        const m = logTail.match(/test_runs\/([0-9]{8}_[0-9]{6}_[0-9]+)/);
+        if (m && m[1] && m[1] !== runningJobRunId) {
+          runningJobRunId = m[1];
+          await refreshRuns(m[1]);
+        } else if (n % 2 === 0) {
+          // Keep history updated while job runs (disk may show RUNNING before result.json).
+          await refreshRuns(runningJobRunId || selectedRunId);
+        }
+        if (stEl) stEl.textContent = st === "running" || st === "?" ? "RUNNING…" : st;
+        showLog(logTail || ("job " + jobId));
+        if (st === "ok" || st === "error") {
+          const finishedRun = runningJobRunId;
+          runningJobRunId = "";
+          runningJobKind = "";
+          try {
+            await refreshRuns((kind.indexOf("live") >= 0 || kind.indexOf("full") >= 0 || kind.indexOf("runtime") >= 0)
+              ? "__latest__" : (finishedRun || "__latest__"));
+            const pick = finishedRun || selectedRunId || "";
+            await loadRunReport(pick);
+            if (stEl) stEl.textContent = st === "ok" ? "готово" : "ошибка job";
+            showLog("");
+          } catch (e2) {
+            if (stEl) stEl.textContent = "ошибка: " + (e2.message || e2);
+          }
+          return;
+        }
+      }
+      await new Promise(r => setTimeout(r, 5000));
+    }
+    if (stEl) stEl.textContent = "timeout job";
+  }
+  async function run(kind) {
+    if (kind === "stats_dashboard") {
+      if (stEl) stEl.textContent = "сборка дашборда…";
+      try {
+        const j = await api("/api/ss_diagnostics/stats_dashboard", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({run: selectedRunId || null}),
+        });
+        const url = j.stats_dashboard_url || dashUrl();
+        if (j.overall === "FAIL" || !url) {
+          if (stEl) stEl.textContent = "дашборд недоступен: " + (j.log || "нет stats");
+          return;
+        }
+        window.open(url, "_blank", "noopener");
+        if (stEl) stEl.textContent = "";
+      } catch (e) {
+        if (stEl) stEl.textContent = "ошибка дашборда: " + (e.message || e);
+      }
+      return;
+    }
+    if (stEl) stEl.textContent = "запуск…";
+    showLog("…");
+    try {
+      const body = {};
+      if (selectedRunId && ["last_report","stats_dashboard","open_stats","open_visual","problem_finder","analyze","visual_pack","visual_check_pack"].indexOf(kind) >= 0) {
+        body.run = selectedRunId;
+      }
+      const j = await api("/api/ss_diagnostics/" + kind, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(body),
+      });
+      if (j.async && j.job_id) {
+        runningJobKind = kind;
+        runningJobRunId = "";
+        if (kind.indexOf("live") >= 0) {
+          if (liveSt) liveSt.textContent = "RUNNING";
+          if (statsSt) statsSt.textContent = "RUNNING";
+          if (qaSt) qaSt.textContent = "RUNNING";
+        } else if (kind.indexOf("full") >= 0 || kind.indexOf("runtime") >= 0) {
+          if (runtimeSt) runtimeSt.textContent = "RUNNING";
+        }
+        renderReportList(cachedReports, selectedRunId, cachedReports[0] && cachedReports[0].id);
+        if (stEl) stEl.textContent = "RUNNING · " + (j.eta_hint || "");
+        showLog(j.log || ("job " + j.job_id));
+        LAST_JOB = j.job_id;
+        pollDiagJob(j.job_id, kind);
+        return;
+      }
+      if (j.run_id) {
+        selectedRunId = j.run_id;
+        await refreshRuns(j.run_id);
+      } else if (["parser","live_stress","full_runtime","runtime_suite"].indexOf(kind) >= 0) {
+        await refreshRuns(null);
+      }
+      const summary = j.summary || {};
+      if (j.visual_status) summary.visual_status = j.visual_status;
+      if (j.overall_qa_status) summary.overall_qa_status = j.overall_qa_status;
+      if (j.machine_full_runtime_status) summary.machine_full_runtime_status = j.machine_full_runtime_status;
+      if (j.live_stress_status) summary.live_stress_status = j.live_stress_status;
+      if (j.stats_dashboard_status) summary.stats_dashboard_status = j.stats_dashboard_status;
+      if (summary.overall || j.stats_summary || summary.live_stress) {
+        applySummary(summary, j.stats_summary || summary.stats_summary, j);
+      }
+      if (stEl) stEl.textContent = (summary.overall || j.overall || "ok")
+        + (j.run_id ? (" · " + j.run_id) : "");
+      showLog(j.log || "");
+      if (zipEl && j.zip_url) zipEl.innerHTML = "";
+      if (statsLink) statsLink.innerHTML = "";
+    } catch (e) {
+      if (stEl) stEl.textContent = "ошибка";
+      showLog(String(e.message || e));
+    }
+  }
+  const map = {
+    btnSsDiagLiveStress1: "live_stress_1",
+    btnSsDiagLiveStress: "live_stress",
+    btnSsDiagStats: "stats_dashboard",
+  };
+  for (const [id, kind] of Object.entries(map)) {
+    const b = document.getElementById(id);
+    if (b) b.onclick = () => run(kind);
+  }
+  const btnRefresh = document.getElementById("btnSsRunRefresh");
+  if (btnRefresh) btnRefresh.onclick = async () => {
+    await refreshRuns(selectedRunId);
+    await loadRunReport(selectedRunId);
+  };
+  // Auto-fill report list; refresh while any Live Stress is in progress
+  (async () => {
+    await refreshRuns(null);
+    await loadRunReport(selectedRunId || "");
+    setInterval(async () => {
+      const hasRunning = (cachedReports || []).some(r => r && (r.in_progress || r.status === "RUNNING"));
+      if (!hasRunning && !runningJobRunId) return;
+      await refreshRuns(selectedRunId);
+    }, 8000);
+  })();
+}
+
 async function startValidate() {
   const run_id = document.getElementById("valRun").value.trim();
   const hero = (document.querySelector('input[name="valHero"]:checked') || {}).value || "jack";
@@ -2675,6 +5229,14 @@ async function boot() {
   document.getElementById("btnKill").onclick = () => killTrainOnly();
   document.getElementById("btnKillValidate").onclick = () => killValidateOnly();
   document.getElementById("btnKillStream").onclick = () => killStreamOnly();
+  const btnKillModeTrain = document.getElementById("btnKillModeTraining");
+  if (btnKillModeTrain) btnKillModeTrain.onclick = () => killModeTraining();
+  const btnKillModeSs = document.getElementById("btnKillModeStreaming");
+  if (btnKillModeSs) btnKillModeSs.onclick = () => killModeStreaming();
+  bindModeTabs();
+  bindUiViewPersistence();
+  restoreUiView();
+  wireLlmBotUi();
   document.getElementById("jobSelect").onchange = (e) => { LAST_JOB = e.target.value; pollJobs(); };
   document.getElementById("detailClose").onclick = () => {
     document.getElementById("detailModal").classList.remove("open");
@@ -2704,6 +5266,8 @@ async function boot() {
   } catch (e) {
     flash("hdrMeta", "TB пока недоступен — кнопки запуска работают");
   }
+  restoreUiView();
+
   setInterval(loadCharts, 30000);
 }
 boot().catch(e => { document.getElementById("hdrMeta").textContent = "UI error: "+e; });
@@ -2732,7 +5296,12 @@ class Handler(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length") or 0)
         if n <= 0:
             return {}
-        return json.loads(self.rfile.read(n).decode("utf-8"))
+        raw = self.rfile.read(n).decode("utf-8", errors="replace")
+        try:
+            obj = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+        return obj if isinstance(obj, dict) else {}
 
     def do_GET(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
@@ -2749,21 +5318,80 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(raw)
             return
 
+        if path == "/api/ss_preview/status":
+            self._json(200, SS_PREVIEW.status())
+            return
+
+        if path == "/api/ss_preview/frame.jpg":
+            try:
+                if not SS_PREVIEW_FRAME.is_file():
+                    self.send_response(404)
+                    self.send_header("Content-Type", "text/plain")
+                    self.end_headers()
+                    self.wfile.write(b"no frame")
+                    return
+                raw = SS_PREVIEW_FRAME.read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "image/jpeg")
+                self.send_header("Cache-Control", "no-store, max-age=0")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+            except Exception as e:
+                self._json(500, {"error": str(e)})
+            return
+
         if path == "/api/config":
             self._json(200, {"config": load_cfg()})
             return
 
+        if path == "/api/llm_bot/status":
+            if LLM_BOT is None:
+                self._json(500, {"bot_state": "error", "last_error": _LLM_BOT_IMPORT_ERROR or "LLM_BOT import failed", "logs": [], "chat": []})
+                return
+            self._json(200, LLM_BOT.status())
+            return
+
         if path == "/api/server_stats":
             cfg = load_cfg()
-            # Всегда remote lab_comp — никогда не читать free/nvidia-smi с машины UI.
-            # ssh_run сам перебирает ZT + 194 при timeout.
+            # Только кэш. Lock с таймаутом — никогда не клинить HTTP.
+            stats = None
+            if _stats_lock.acquire(timeout=0.4):
+                try:
+                    cached = _stats_cache.get("data")
+                    stats = dict(cached) if isinstance(cached, dict) else None
+                finally:
+                    _stats_lock.release()
+            if stats is None:
+                stats = _stats_pending_payload(
+                    _ssh_host_cache or (cfg.get("ssh_host") or "lab_comp")
+                )
             try:
-                host = resolve_ssh_host(cfg.get("ssh_host") or "lab_comp")
+                act = dict(stats.get("activity") or {})
+                if LLM_BOT is not None and LLM_BOT.is_live():
+                    act["llm_bot"] = True
+                    tasks = list(act.get("tasks") or [])
+                    if not any(t.get("kill") == "llm_bot" for t in tasks):
+                        tasks.append({
+                            "id": "llm_bot",
+                            "kind": "llm_bot",
+                            "label": "LLM Bot",
+                            "kill": "llm_bot",
+                        })
+                    act["tasks"] = tasks
+                stats["activity"] = act
             except Exception:
-                host = None
-            stats = fetch_server_stats(host)
-            stats["note"] = "stats via ssh only; not local PC"
-            stats["tried"] = ssh_candidates(cfg.get("ssh_host") or "lab_comp")
+                pass
+            if ui_runs_on_lab() or stats.get("mode") == "local" or stats.get("host") == "local":
+                stats["mode"] = "local"
+                stats["host"] = stats.get("host") or "local"
+                stats["note"] = "UI on lab_comp: local shell (no SSH-to-self)"
+                stats["tried"] = ["local"]
+            else:
+                stats["mode"] = stats.get("mode") or "ssh"
+                stats["note"] = "stats via ssh only; not local PC"
+                stats["tried"] = ssh_candidates(cfg.get("ssh_host") or "lab_comp")
+            stats["ssh_cache"] = _ssh_host_cache or ""
             self._json(200, stats)
             return
 
@@ -2889,6 +5517,116 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(data)
             return
 
+        if path == "/api/ss_diagnostics/download_zip":
+            name = qs.get("name", [""])[0]
+            name = Path(name).name
+            if not name or ".." in name or not name.endswith(".zip"):
+                self._json(400, {"error": "bad name"})
+                return
+            zp = ROOT / "artifacts" / "streaming_survival" / "exports" / name
+            if not zp.is_file():
+                self._json(404, {"error": "zip not found"})
+                return
+            data = zp.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/zip")
+            self.send_header("Content-Disposition", f'attachment; filename="{name}"')
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
+
+        if path == "/api/ss_diagnostics/stats_dashboard":
+            run = _ss_resolve_run((qs.get("run") or [None])[0])
+            if run is None:
+                self._json(404, {"error": "no run"})
+                return
+            dash = _ss_ensure_stats(run) or (run / "stats" / "stats_dashboard.html")
+            if not dash.is_file():
+                self._json(404, {"error": "stats_dashboard.html missing", "run_dir": str(run), "run_id": run.name})
+                return
+            data = dash.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
+            return
+
+        if path == "/api/ss_diagnostics/reports_page":
+            data = _ss_reports_page_html().encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
+            return
+
+        if path == "/api/ss_diagnostics/runs" or path.startswith("/api/ss_diagnostics/runs"):
+            runs = _ss_list_runs(60, reports_only=True)
+            latest = next((r for r in runs if r.get("has_live")), None)
+            self._json(
+                200,
+                {
+                    "runs": runs,
+                    "latest_id": (latest or {}).get("id"),
+                },
+            )
+            return
+
+        if path.startswith("/api/ss_diagnostics/stats_file"):
+            run = _ss_resolve_run((qs.get("run") or [None])[0])
+            if run is None:
+                self._json(404, {"error": "no run"})
+                return
+            rel = qs.get("path", [""])[0].replace("\\", "/").lstrip("/")
+            if not rel or ".." in rel:
+                self._json(400, {"error": "bad path"})
+                return
+            # Allow problem_finder at run root and stats/* / screenshots/*
+            fp = (run / rel).resolve()
+            run_res = run.resolve()
+            try:
+                fp.relative_to(run_res)
+            except ValueError:
+                self._json(404, {"error": "not found", "run_dir": str(run), "path": rel})
+                return
+            if not fp.is_file():
+                # Helpful hint when charts missing (no matplotlib during stats gen)
+                hint = ""
+                if "charts/" in rel and (run / "stats" / "charts" / "README_NO_MATPLOTLIB.txt").is_file():
+                    hint = " charts missing: regenerate stats with matplotlib"
+                self._json(
+                    404,
+                    {
+                        "error": "not found" + hint,
+                        "run_dir": str(run),
+                        "run_id": run.name,
+                        "path": rel,
+                        "exists_stats": (run / "stats").is_dir(),
+                    },
+                )
+                return
+            data = fp.read_bytes()
+            ctype = "application/octet-stream"
+            if fp.suffix == ".png":
+                ctype = "image/png"
+            elif fp.suffix in (".csv", ".md", ".txt"):
+                ctype = "text/plain; charset=utf-8"
+            elif fp.suffix == ".json":
+                ctype = "application/json"
+            elif fp.suffix == ".html":
+                ctype = "text/html; charset=utf-8"
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
+            return
+
         self._json(404, {"error": "not found"})
 
     def do_POST(self) -> None:
@@ -2902,6 +5640,68 @@ class Handler(BaseHTTPRequestHandler):
                 deep_merge(cfg, body)
                 save_cfg(cfg)
             self._json(200, {"config": cfg})
+            return
+
+        if path.startswith("/api/ss_preview/"):
+            try:
+                if path == "/api/ss_preview/start":
+                    self._json(200, SS_PREVIEW.start(float(body.get("interval_sec") or 1.6)))
+                    return
+                if path == "/api/ss_preview/stop":
+                    self._json(200, SS_PREVIEW.stop())
+                    return
+                if path == "/api/ss_preview/once":
+                    SS_PREVIEW.capture_once()
+                    self._json(200, SS_PREVIEW.status())
+                    return
+                if path == "/api/ss_preview/status":
+                    self._json(200, SS_PREVIEW.status())
+                    return
+                self._json(404, {"error": f"unknown ss_preview path {path}"})
+                return
+            except Exception as e:
+                self._json(500, {"ok": False, "error": str(e), **SS_PREVIEW.status()})
+                return
+
+        if path.startswith("/api/llm_bot/"):
+            if LLM_BOT is None:
+                self._json(500, {"ok": False, "error": _LLM_BOT_IMPORT_ERROR or "LLM_BOT import failed"})
+                return
+            try:
+                if path == "/api/llm_bot/start":
+                    self._json(200, LLM_BOT.start())
+                    return
+                if path == "/api/llm_bot/stop":
+                    self._json(200, LLM_BOT.stop())
+                    return
+                if path == "/api/llm_bot/mode":
+                    self._json(200, LLM_BOT.set_mode(bool(body.get("listen_stream"))))
+                    return
+                if path == "/api/llm_bot/local_chat":
+                    self._json(
+                        200,
+                        LLM_BOT.local_chat(
+                            str(body.get("username") or "viewer"),
+                            str(body.get("message") or ""),
+                        ),
+                    )
+                    return
+                if path == "/api/llm_bot/clear_chat":
+                    self._json(200, LLM_BOT.clear_chat())
+                    return
+                self._json(404, {"error": f"unknown llm_bot path {path}"})
+                return
+            except Exception as e:
+                self._json(500, {"ok": False, "error": str(e), "status": LLM_BOT.status()})
+                return
+
+        if path.startswith("/api/ss_diagnostics/"):
+            kind = path.rsplit("/", 1)[-1]
+            try:
+                run_id = body.get("run") or body.get("run_id") or None
+                self._json(200, run_ss_diagnostics(kind, run_id=run_id))
+            except Exception as e:
+                self._json(500, {"overall": "FAIL", "log": str(e)})
             return
 
         if path == "/api/action":
@@ -2918,6 +5718,14 @@ class Handler(BaseHTTPRequestHandler):
                     jid = action_kill_validate(cfg)
                 elif action == "kill_stream":
                     jid = action_kill_stream(cfg)
+                elif action == "kill_mode_training":
+                    jid = action_kill_mode_training(cfg)
+                elif action == "kill_mode_streaming":
+                    jid = action_kill_mode_streaming(cfg)
+                elif action == "start_streaming_survival":
+                    jid = action_start_streaming_survival(cfg)
+                elif action == "stop_streaming_survival":
+                    jid = action_stop_streaming_survival(cfg)
                 elif action == "restart_joint_train":
                     with _cfg_lock:
                         cfg2 = load_cfg()
@@ -2994,11 +5802,12 @@ def main() -> None:
     print(f"[train_lab_ui] root={ROOT}", flush=True)
     print(f"[train_lab_ui] config={CFG_PATH}", flush=True)
     print("[train_lab_ui] remote trains: setsid+nohup — UI close does NOT stop lab jobs", flush=True)
-    # SSH resolve в фоне — иначе старт UI ждёт таймауты.
+    # SSH resolve + stats в фоне — иначе UI ждёт таймауты и pill не зеленеет.
     threading.Thread(
         target=lambda: resolve_ssh_host(load_cfg().get("ssh_host") or "lab_comp"),
         daemon=True,
     ).start()
+    start_stats_background_loop()
     try:
         server.serve_forever()
     except KeyboardInterrupt:

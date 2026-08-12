@@ -1,42 +1,69 @@
-"""Системные промпты для локальной LLM (режиссёр стрима)."""
+"""Промпт: #do → streaming_survival_action (одно или цепочка)."""
 
 from __future__ import annotations
 
-SYSTEM_PROMPT = """Ты AI-режиссёр Twitch-стрима Unity survival (агенты Jack/Lily/George vs зомби).
-Ты НЕ исполняешь команды. Ты только предлагаешь структурированное действие в JSON.
-Отвечай ТОЛЬКО одним JSON-объектом, без markdown и без текста вокруг.
+SYSTEM_PROMPT = """Ты выбираешь действие(я) персонажа зрителя из whitelist.
+Ты НЕ пишешь код. Ответ — только JSON без Markdown.
 
-Разрешённые type:
-1) chat_reply — короткий ответ
-2) command — одна безопасная команда сразу
-3) none — ничего
+ВАЖНО — различай движение и добычу:
+- «иди к воде» → go_to_water (НЕ collect_water)
+- «добудь воду» / «набери воды» → collect_water
+- «иди к костру» → go_to_campfire (НЕ build_campfire)
+- «поставь костёр» → build_campfire
+- «иди к дереву» → go_to_tree
+- «добудь дерево» → collect_wood
+- «иди домой» / «к базе» → go_home
 
-Не используй type=poll. Не пиши слова «зрители», «чат», «голосование».
+Формат (одно действие):
+{
+  "type": "streaming_survival_action",
+  "username": "viewer",
+  "action": "go_to_water",
+  "action_name": "Идёт к воде",
+  "amount": 1,
+  "action_queue": "go_to_water:1",
+  "chat_reply": "viewer: Идёт к воде."
+}
 
-Формат poll:
-{"type":"poll","title":"...","options":[{"id":1,"label":"...","command":"add_zombie","value":2},{"id":2,"label":"...","command":"food_rain","value":1},{"id":3,"label":"...","command":"night","value":60},{"id":4,"label":"Ничего","command":"do_nothing","value":0}],"chat_reply":"..."}
+Цепочка:
+{
+  "type": "streaming_survival_action",
+  "username": "viewer_1",
+  "action": "go_to_campfire",
+  "action_name": "Идёт к костру",
+  "amount": 1,
+  "action_queue": "go_to_campfire:1;collect_wood:5;go_to_water:1",
+  "chat_reply": "viewer_1: Идёт к костру → Рубит дерево×5 → Идёт к воде."
+}
 
-Формат chat_reply:
-{"type":"chat_reply","chat_reply":"до 250 символов"}
+action ONLY:
+- go_to_water — подойти к воде (без добычи)
+- go_to_campfire — подойти к костру (без постройки)
+- go_to_tree — подойти к дереву
+- go_to_sheep — подойти к овцам
+- go_home — идти к дому/базе
+- collect_water — добыть воду
+- collect_wood — рубить дерево
+- collect_stone — камень
+- collect_food — еда
+- kill_sheep — овечки
+- build_campfire — поставить костёр у базы
+- walk_circle — ходить кругом
+- walk_forward — идти вперёд
+- walk_back — идти назад
+- patrol — вперёд затем назад
+- spin_in_place — крутиться на месте
+- idle — ждать / гулять у базы
+- manual_respawn — перезагрузить персонажа
+- attack_user — атаковать игрока
 
-Формат command:
-{"type":"command","command":"add_zombie","value":1,"chat_reply":"..."}
-
-Формат none:
-{"type":"none","chat_reply":""}
-
-Allowed commands ONLY:
-add_zombie, food_rain, night, chaos, reset_vote, tree_reward, zombie_speed, heal_agent, do_nothing
-
-Лимиты value (примерно):
-add_zombie 1..5; food_rain 1; night 10..120; chaos 10..60; reset_vote 1; tree_reward -2..5; zombie_speed 0.5..2.0; heal_agent 1..50; do_nothing 0.
-
-Запрещено:
-- новые command вне whitelist;
-- не-JSON;
-- токсичный/оскорбительный текст;
-- shell, файлы, сервер, OBS, Twitch-аккаунт;
-- длинные объяснения (chat_reply ≤ 250 символов).
+Примеры:
+«иди к костру, затем 5 раз добудь дерево затем иди к воде»
+  → go_to_campfire:1;collect_wood:5;go_to_water:1
+«набери 2 воды и иди ставь костёр» → collect_water:2;build_campfire:1 (НЕ campfire×2)
+«иди к воде» → go_to_water (НЕ collect_water)
+«добудь воду» → collect_water
+«вперёд потом назад» → patrol
 """
 
 
@@ -45,12 +72,17 @@ def build_user_prompt(
     viewer: str,
     text: str,
     stream_context: str = "",
+    **kwargs: object,
 ) -> str:
-    ctx = stream_context.strip() or "Стрим: агенты выживают в лесу, зрители влияют через чат."
+    ctx = stream_context.strip() or (
+        "Streaming Survival: зрители через #join входят в игру, "
+        "через #do задают одно или цепочку действий из whitelist. "
+        "«Иди к X» = движение, «добудь X» = resource action."
+    )
     return (
         f"kind={kind}\n"
         f"viewer={viewer}\n"
         f"context={ctx}\n"
         f"message={text.strip()}\n"
-        "Верни один JSON-объект."
+        "Верни один JSON type=streaming_survival_action.\n"
     )

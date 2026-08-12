@@ -1,0 +1,87 @@
+[
+  {
+    "id": "seq_campfire_wood_water",
+    "command": "#do иди к костру, затем 5 раз добудь дерево затем иди к воде",
+    "expected_plan": [
+      {"action": "go_to_campfire", "count": 1},
+      {"action": "collect_wood", "count": 5},
+      {"action": "go_to_water", "count": 1}
+    ],
+    "expected_chat_contains": ["костр", "дерев", "вод"]
+  },
+  {
+    "id": "go_to_water_only",
+    "command": "#do иди к воде",
+    "expected_plan": [{"action": "go_to_water", "count": 1}]
+  },
+  {
+    "id": "collect_water_only",
+    "command": "#do добудь воду",
+    "expected_plan": [{"action": "collect_water", "count": 1}]
+  },
+  {
+    "id": "go_home_only",
+    "command": "#do иди домой",
+    "expected_plan": [{"action": "go_home", "count": 1}]
+  },
+  {
+    "id": "go_to_campfire_only",
+    "command": "#do иди к костру",
+    "expected_plan": [{"action": "go_to_campfire", "count": 1}]
+  },
+  {
+    "id": "collect_wood_5",
+    "command": "#do 5 раз добудь дерево",
+    "expected_plan": [{"action": "collect_wood", "count": 5}]
+  },
+  {
+    "id": "water_2_then_campfire",
+    "command": "#do набери 2 воды и иди ставь костер",
+    "expected_plan": [
+      {"action": "collect_water", "count": 2},
+      {"action": "build_campfire", "count": 1}
+    ]
+  },
+  {
+    "id": "go_water_then_collect_2_then_home",
+    "command": "#do иди к воде и добудь 2 воды, потом иди домой",
+    "expected_plan": [
+      {"action": "go_to_water", "count": 1},
+      {"action": "collect_water", "count": 2},
+      {"action": "go_home", "count": 1}
+    ]
+  },
+  {
+    "id": "home_then_campfire_then_circle",
+    "command": "#do подойди к дому, потом поставь костер, затем ходи по кругу",
+    "expected_plan": [
+      {"action": "go_home", "count": 1},
+      {"action": "build_campfire", "count": 1},
+      {"action": "walk_circle", "count": 1}
+    ]
+  },
+  {
+    "id": "patrol_forward_back",
+    "command": "#do хочу чтобы ты шел вперед а потом шел назад",
+    "expected_plan": [{"action": "patrol", "count": 1}]
+  },
+  {
+    "id": "build_campfire_only",
+    "command": "#do поставь костер",
+    "expected_plan": [{"action": "build_campfire", "count": 1}]
+  },
+  {
+    "id": "go_to_tree_only",
+    "command": "#do подойди к дереву",
+    "expected_plan": [{"action": "go_to_tree", "count": 1}]
+  },
+  {
+    "id": "wrong_count_must_not_bind_to_campfire",
+    "command": "#do набери 2 штуки воды и иди ставь костер",
+    "expected_plan": [
+      {"action": "collect_water", "count": 2},
+      {"action": "build_campfire", "count": 1}
+    ],
+    "forbid": [{"action": "build_campfire", "count": 2}]
+  }
+]

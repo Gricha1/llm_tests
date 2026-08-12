@@ -96,16 +96,29 @@ if [ "${FOREST_STREAM_SUPERVISE:-1}" = "1" ] && [ "${FOREST_STREAM_INNER:-0}" !=
       exit 0
     fi
 
+    if [ -f "${STOP_FLAG}" ]; then
+      echo "[stream_onnx] ${STOP_FLAG} после child — супервизор выходит (не рестарт)"
+      rm -f "${STOP_FLAG}" "${FLAG}"
+      kill_stream_only
+      exit 0
+    fi
+
     if [ "${restarted}" -eq 0 ]; then
       set +e
       wait "${child}"
       code=$?
       set -e
-      # 130=SIGINT, 143=SIGTERM, 0=нормальный выход — не рестартим
+      if [ -f "${STOP_FLAG}" ]; then
+        echo "[stream_onnx] ${STOP_FLAG} — супервизор выходит (не рестарт)"
+        rm -f "${STOP_FLAG}" "${FLAG}"
+        kill_stream_only
+        exit 0
+      fi
+      # 130=SIGINT, 143=SIGTERM, 137=SIGKILL, 0=нормальный выход — не рестартим
       if [ "${code}" -eq "${RESTART_EXIT}" ]; then
         echo "[stream_onnx] python exit ${RESTART_EXIT} (#restart_stream)"
         restarted=1
-      elif [ "${code}" -eq 130 ] || [ "${code}" -eq 143 ] || [ "${code}" -eq 0 ]; then
+      elif [ "${code}" -eq 130 ] || [ "${code}" -eq 143 ] || [ "${code}" -eq 137 ] || [ "${code}" -eq 9 ] || [ "${code}" -eq 0 ]; then
         echo "[stream_onnx] остановлен code=${code} — супервизор выходит (не рестарт)"
         kill_stream_only
         exit 0

@@ -38,7 +38,7 @@ public static class PresentationWorldReset
         bool zombieOnly = envConfig != null
             && envConfig.ResolveJackMode() == JackTrainingMode.ZombieOnly;
 
-        if (!zombieOnly)
+        if (!zombieOnly || TrainingEnvSpace.IsStreamingSurvivalMode)
         {
             foreach (var zombieSpawner in envRoot.GetComponentsInChildren<ZombieSpawner>(true))
             {
@@ -49,7 +49,7 @@ public static class PresentationWorldReset
 
         VerifyAndRetry(treeSpawner, sheepSpawner);
 
-        if (zombieOnly)
+        if (zombieOnly && !TrainingEnvSpace.IsStreamingSurvivalMode)
             TrainingEnvSpace.ForceStartJackZombieSpawners(envRoot);
 
         PresentationWorldSnapshotLogger.LogEvent(
