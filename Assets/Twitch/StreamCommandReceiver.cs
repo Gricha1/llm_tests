@@ -296,10 +296,14 @@ public class StreamCommandReceiver : MonoBehaviour
         {
             // Live-stress / QA: empty world — no leftover viewers from prior runs.
             ctrl.ClearAllPlayers();
-            ctrl.ResetResourcesForTest();
+            // Long hold so ROUND_LOSE does not interrupt multi-step water→campfire chains.
+            float hold = ExtractFloat(json, "hold_seconds");
+            if (hold < 30f)
+                hold = 900f;
+            ctrl.ResetResourcesForTest(hold);
             if (StreamingSurvivalWorldRegistry.Instance != null)
                 StreamingSurvivalWorldRegistry.Instance.Rebuild();
-            Debug.Log("[SSTest] clear_all_players (empty session)");
+            Debug.Log($"[SSTest] clear_all_players (empty session) hold={hold:F0}s");
             return;
         }
         if (cmd == "reset_player_to_spawn")

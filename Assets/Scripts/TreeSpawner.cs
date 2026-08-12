@@ -305,11 +305,15 @@ public class TreeSpawner : MonoBehaviour
     {
         var root = ResolveSpawnerChildRoot(tree);
         if (root != null)
+        {
             trees.Remove(root);
+            // Same-frame retarget must not see this trunk as alive (Destroy is deferred).
+            root.SetActive(false);
+        }
 
-        nextRespawnTime = Time.unscaledTime + 0.05f;
+        // Delay refill so agent walks to another living tree instead of farming one stand.
+        nextRespawnTime = Time.unscaledTime + Mathf.Max(0.75f, respawnInterval);
         ReconcileTreeList();
-        TryRefillTick();
     }
 
     public int TargetCount => treeCount;
@@ -321,6 +325,34 @@ public class TreeSpawner : MonoBehaviour
             ReconcileTreeList();
             return trees.Count;
         }
+    }
+
+    /// <summary>Ближайшее живое дерево из зоны TreeSpawner (не декорации за забором).</summary>
+    public bool TryGetNearestAliveTree(Vector3 worldFrom, out GameObject tree, out Vector3 worldPos)
+    {
+        ReconcileTreeList();
+        tree = null;
+        worldPos = default;
+        float best = float.MaxValue;
+        for (int i = 0; i < trees.Count; i++)
+        {
+            var t = trees[i];
+            if (!IsAliveTree(t)) continue;
+            Vector3 p = t.transform.position;
+            // z>29 — край у верхнего забора/пруда, агент упирается
+            if (p.z < 8f || p.z > 28.5f)
+                continue;
+            float dx = p.x - worldFrom.x;
+            float dz = p.z - worldFrom.z;
+            float d = dx * dx + dz * dz;
+            if (d < best)
+            {
+                best = d;
+                tree = t;
+                worldPos = p;
+            }
+        }
+        return tree != null;
     }
 
     /// <summary>Полный сброс + чекер: пока мало живых — генерируем снова.</summary>

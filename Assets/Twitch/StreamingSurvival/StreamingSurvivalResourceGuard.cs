@@ -174,6 +174,43 @@ public static class StreamingSurvivalResourceGuard
             }
         }
 
+        // Wood: ghost stand after Destroy must not credit — require a live trunk
+        // near the locked stand (ApproachStand is ~1.35m from trunk; character may
+        // be up to ~Radius from stand, so trunk can be >Radius from character).
+        if (action == "collect_wood")
+        {
+            var spawner = TrainingEnvSpace.FindInPresentation<TreeSpawner>()
+                ?? Object.FindFirstObjectByType<TreeSpawner>();
+            if (spawner == null
+                || !spawner.TryGetNearestAliveTree(characterPos, out _, out Vector3 livePos))
+            {
+                r.Ok = false;
+                r.Reason = "no_live_tree";
+                return r;
+            }
+            Vector3 standRef = targetPos;
+            float tsx = livePos.x - standRef.x;
+            float tsz = livePos.z - standRef.z;
+            float treeToStand = Mathf.Sqrt(tsx * tsx + tsz * tsz);
+            float treeToAnchor = treeToStand;
+            if (objectAnchor.HasValue)
+            {
+                float tax = livePos.x - objectAnchor.Value.x;
+                float taz = livePos.z - objectAnchor.Value.z;
+                treeToAnchor = Mathf.Sqrt(tax * tax + taz * taz);
+            }
+            // Stand offset ~1.35; ghost farm = nearest live tree far from this stand.
+            if (treeToStand > 2.25f && treeToAnchor > 2.25f)
+            {
+                r.Ok = false;
+                r.Reason =
+                    $"live_tree_not_at_stand treeToStand={treeToStand:F1} treeToAnchor={treeToAnchor:F1}";
+                return r;
+            }
+            objectPos = livePos;
+            found = true;
+        }
+
         float standToObjX = targetPos.x - objectPos.x;
         float standToObjZ = targetPos.z - objectPos.z;
         float standToObj = Mathf.Sqrt(standToObjX * standToObjX + standToObjZ * standToObjZ);

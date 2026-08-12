@@ -2176,6 +2176,8 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
             float d = HarvestReachDistance(origin, c);
             if (d > EatReach) continue;
             GameObject root = GetSheepInstanceRoot(c);
+            if (root != null && root.GetComponentInParent<ViewerSimpleAgent>() != null)
+                continue;
             if (d < bestDist)
             {
                 bestDist = d;
@@ -2785,16 +2787,21 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
             return;
         }
 
-        if (!_deathSequenceStarted && !IsWoodFoodSwitchMode && _survivalPhase == 1 && survivalGoalSeconds > 0f
-            && SurvivalElapsedSeconds >= survivalGoalSeconds)
+        // Nightmare/boss/zombie stages — только train. Streaming Survival и presentation — нет.
+        if (!TrainingEnvSpace.IsStreamingSurvivalMode
+            && !TrainingEnvSpace.ShouldRunPresentationOnlyServices())
         {
-            EnterSurvivalPhase2();
-        }
+            if (!_deathSequenceStarted && !IsWoodFoodSwitchMode && _survivalPhase == 1 && survivalGoalSeconds > 0f
+                && SurvivalElapsedSeconds >= survivalGoalSeconds)
+            {
+                EnterSurvivalPhase2();
+            }
 
-        if (!_deathSequenceStarted && !IsWoodFoodSwitchMode && _survivalPhase == 2 && survivalGoalSeconds > 0f
-            && SurvivalElapsedSeconds >= survivalGoalSeconds * 2f)
-        {
-            EnterSurvivalPhase3();
+            if (!_deathSequenceStarted && !IsWoodFoodSwitchMode && _survivalPhase == 2 && survivalGoalSeconds > 0f
+                && SurvivalElapsedSeconds >= survivalGoalSeconds * 2f)
+            {
+                EnterSurvivalPhase3();
+            }
         }
 
         satietyTimer += Time.deltaTime;
@@ -3291,6 +3298,13 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
 
     void StartZombieSpawnerForEpisode(bool includeSecondarySpawner)
     {
+        // Streaming Survival: без зомби-апокалипсиса (этапы только для train).
+        if (TrainingEnvSpace.IsStreamingSurvivalMode)
+        {
+            StopZombieSpawnerForEpisode();
+            return;
+        }
+
         EnsureZombieSpawners();
 
         // Меню K: спавн из обоих домов делает ForceStartJackZombieSpawners.
@@ -3312,6 +3326,8 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
 
     void EnterSurvivalPhase2()
     {
+        if (TrainingEnvSpace.IsStreamingSurvivalMode)
+            return;
         if (_survivalPhase >= 2)
             return;
 
@@ -3338,6 +3354,8 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
 
     void EnterSurvivalPhase3()
     {
+        if (TrainingEnvSpace.IsStreamingSurvivalMode)
+            return;
         if (_survivalPhase >= 3)
             return;
 
@@ -3415,6 +3433,10 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     /// <summary>Play-тест: V — перейти к следующему этапу выживания.</summary>
     public void AdvanceSurvivalPhaseDebug()
     {
+        // Streaming Survival / presentation: zombie stages отключены (только train).
+        if (TrainingEnvSpace.IsStreamingSurvivalMode
+            || TrainingEnvSpace.ShouldRunPresentationOnlyServices())
+            return;
         if (_deathSequenceStarted || IsSimpleTrainingMode || IsWoodFoodSwitchMode || survivalGoalSeconds <= 0f)
             return;
 

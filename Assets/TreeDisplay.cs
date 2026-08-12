@@ -6,6 +6,7 @@ public class TreeDisplay : MonoBehaviour
 {
     [SerializeField] private AgentGoToHouseDiscrete agent;
     [SerializeField] private TMP_SpriteAsset spriteAsset;
+    public TMP_SpriteAsset WoodSpriteAsset => spriteAsset;
     private TMP_Text text;
 
     void Awake()

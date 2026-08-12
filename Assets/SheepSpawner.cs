@@ -6,6 +6,8 @@ public class SheepSpawner : MonoBehaviour
     [Header("Sheep Prefab")]
     [SerializeField] private GameObject sheepPrefab;
 
+    public GameObject PeekSheepPrefab() => ResolveSheepPrefab();
+
     [Header("Spawn Settings")]
     [SerializeField] private int sheepCount = 5;
     [SerializeField] private float y = -5.515023f;

@@ -1283,13 +1283,28 @@ def _run_live_stress_only(args: argparse.Namespace) -> int:
         },
     )
     if not probe_unity_runtime(run_dir, args.unity_host, args.unity_port, run_id):
+        reason = "Unity runtime down"
+        live_fail = {
+            "overall": "ERROR",
+            "reason": reason,
+            "attempts_total": int(args.attempts),
+            "attempts_passed": 0,
+            "attempts_failed": int(args.attempts),
+            "attempts": [],
+            "run_id": run_id,
+        }
+        (run_dir / "live_stress_report.json").write_text(
+            json.dumps(live_fail, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
         summary = {
             "timestamp": run_id,
-            "overall": "FAIL",
+            "overall": "ERROR",
             "mode": "live_stress",
-            "live_stress_status": "FAIL",
+            "live_stress_status": "ERROR",
             "live_stress_attempts": int(args.attempts),
-            "reason": "Unity runtime down",
+            "live_stress": live_fail,
+            "reason": reason,
             "run_dir": str(run_dir),
         }
         try:
@@ -1297,6 +1312,7 @@ def _run_live_stress_only(args: argparse.Namespace) -> int:
         except OSError:
             pass
         _write_summary(run_dir, summary)
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
         return 1
     live = _invoke_live_stress(
         run_dir, args.bot_url, args.unity_host, args.unity_port, args.attempts, run_id
@@ -1329,8 +1345,22 @@ def _run_live_stress_only(args: argparse.Namespace) -> int:
         "stats_dashboard_status": stats_status,
         "visual_status": "PENDING",
         "overall_qa_status": "VISUAL_PENDING",
+        "reason": str(live.get("reason") or "").strip(),
         "run_dir": str(run_dir),
     }
+    if not summary["reason"] and str(summary["overall"]).upper() != "PASS":
+        # Prefer first failed attempt reason for UI list.
+        for a in (live.get("failed_attempts") or live.get("attempts") or []):
+            if not isinstance(a, dict):
+                continue
+            if str(a.get("result") or "").upper() in ("PASS", "OK"):
+                continue
+            r = str(a.get("reason") or a.get("error") or "").strip()
+            if r:
+                summary["reason"] = r
+                break
+        if not summary["reason"]:
+            summary["reason"] = f"live_stress {summary['overall']}"
     try:
         from scripts.analyze_streaming_survival_failures import analyze as _analyze
 

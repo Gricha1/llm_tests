@@ -20,6 +20,8 @@ public class ZombieSpawner : MonoBehaviour
     [Header("Prefab")]
     [SerializeField] private GameObject zombiePrefab;
 
+    public GameObject PeekZombiePrefab() => zombiePrefab;
+
     [Header("Spawn Settings")]
     [SerializeField] private bool zombie_from_hills = false;
     [SerializeField] private bool spawn_idle = false;

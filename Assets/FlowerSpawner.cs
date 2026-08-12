@@ -96,6 +96,33 @@ public class FlowerSpawner : MonoBehaviour
         }
     }
 
+    public Vector3 GetAreaCenterWorld()
+    {
+        return ToWorld(new Vector3(
+            (areaMinX + areaMaxX) * 0.5f,
+            spawnY,
+            (areaMinZ + areaMaxZ) * 0.5f));
+    }
+
+    public Vector3 GetAreaCenterLocal()
+    {
+        return new Vector3(
+            (areaMinX + areaMaxX) * 0.5f,
+            spawnY,
+            (areaMinZ + areaMaxZ) * 0.5f);
+    }
+
+    public static FlowerSpawner FindInPresentation()
+    {
+        var root = TrainingEnvSpace.PresentationRoot;
+        if (root != null)
+        {
+            var fs = root.GetComponentInChildren<FlowerSpawner>(true);
+            if (fs != null) return fs;
+        }
+        return Object.FindFirstObjectByType<FlowerSpawner>(FindObjectsInactive.Include);
+    }
+
     public void NotifyFlowerCollected(GameObject flower)
     {
         if (flower != null)

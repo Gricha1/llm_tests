@@ -61,6 +61,11 @@ public sealed class HudHpBars : MonoBehaviour
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
     private static void Bootstrap()
     {
+        if (TrainingEnvSpace.IsStreamingSurvivalMode)
+        {
+            GlobalEnabled = false;
+            return;
+        }
         if (!GlobalEnabled)
             return;
 

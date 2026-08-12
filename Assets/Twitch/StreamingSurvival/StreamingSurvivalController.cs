@@ -132,6 +132,15 @@ public sealed class StreamingSurvivalController : MonoBehaviour
         if (!_worldReady || Time.unscaledTime < _cleanupUntil)
             TryPrepareWorld(force: false);
 
+        // Drive viewers even when a player GO sits under an inactive Env root
+        // (Player.Update would not run → frozen traj with unchanged target).
+        foreach (var kv in _players)
+        {
+            var p = kv.Value;
+            if (p != null)
+                p.TickGameplay();
+        }
+
         if (_inPause)
         {
             if (Time.time >= _pauseUntil)
@@ -682,9 +691,14 @@ public sealed class StreamingSurvivalController : MonoBehaviour
         Vector3 spawn = NextFollowerSpawnPos(slot);
         go.transform.position = spawn;
 
+        // Parent under an active hierarchy. Inactive PresentationRoot kills Update().
         var root = TrainingEnvSpace.PresentationRoot;
-        if (root != null)
+        if (root != null && root.gameObject.activeInHierarchy)
             go.transform.SetParent(root, true);
+        else
+            go.transform.SetParent(transform, true);
+        if (!go.activeSelf)
+            go.SetActive(true);
 
         var cc = go.GetComponent<CharacterController>();
         if (cc == null)
@@ -699,6 +713,7 @@ public sealed class StreamingSurvivalController : MonoBehaviour
         var player = go.GetComponent<StreamingSurvivalPlayer>();
         if (player == null)
             player = go.AddComponent<StreamingSurvivalPlayer>();
+        player.enabled = true;
         player.Setup(username, "idle", "Ждёт у базы");
         // Setup мог сдвинуть Y raycast'ом — вернём на высоту спавна цветов
         player.TeleportTo(spawn, "join_spawn");

@@ -724,8 +724,17 @@ def run_stress(
 
     passed = sum(1 for r in results if r.get("result") == "PASS")
     failed = [r for r in results if r.get("result") != "PASS"]
+    fail_reason = ""
+    for a in failed:
+        r = str(a.get("reason") or a.get("error") or "").strip()
+        if r:
+            fail_reason = r
+            break
+    if not fail_reason and failed:
+        fail_reason = f"{len(failed)}/{len(results)} attempts failed"
     report = {
         "overall": "PASS" if passed == len(results) and len(results) >= attempts else "FAIL",
+        "reason": fail_reason,
         "attempts_total": len(results),
         "attempts_passed": passed,
         "attempts_failed": len(failed),

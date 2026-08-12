@@ -130,6 +130,9 @@ _stats_cache: dict[str, Any] = {"t": 0.0, "data": None}
 _stats_inflight = False
 _STATS_CACHE_TTL = 6.0
 _STATS_STALE_MAX = 90.0
+_ss_sync_lock = threading.Lock()
+_ss_sync_last_at = 0.0
+_SS_SYNC_INTERVAL = 25.0
 _EMPTY_ACTIVITY = {
     "jack": False,
     "lily": False,
@@ -906,6 +909,13 @@ def finish_job(jid: str, code: int) -> None:
         job["status"] = "ok" if code == 0 else "error"
         job["returncode"] = code
         job["ended"] = time.time()
+        job_name = str(job.get("name") or "")
+    if job_name.startswith("ss_") and not ui_runs_on_lab():
+        threading.Thread(
+            target=lambda: _ss_sync_runs_from_lab(),
+            name=f"ss-sync-{jid}",
+            daemon=True,
+        ).start()
 
 
 def job_snapshot(jid: str, tail: int = 80) -> dict[str, Any] | None:
@@ -1717,6 +1727,179 @@ def action_stop_streaming_survival(cfg: dict) -> str:
     return jid
 
 
+def _ss_remote_runs_dir() -> str:
+    return f"{REMOTE_DIR}/artifacts/streaming_survival/test_runs"
+
+
+def _ss_remote_checks_bash(checks_args: str) -> str:
+    """Run run_streaming_survival_checks.py on lab (Unity lives there, not on Windows UI)."""
+    return f"""
+set -eu
+cd {REMOTE_DIR}
+PY="${{FOREST_SS_REMOTE_PYTHON:-}}"
+if [ -z "$PY" ] || [ ! -x "$PY" ]; then
+  if [ -x "${{HOME}}/anaconda3/envs/mlagents/bin/python" ]; then
+    PY="${{HOME}}/anaconda3/envs/mlagents/bin/python"
+  elif [ -x "${{HOME}}/anaconda3/bin/python" ]; then
+    PY="${{HOME}}/anaconda3/bin/python"
+  else
+    PY=python3
+  fi
+fi
+"$PY" -u scripts/run_streaming_survival_checks.py {checks_args}
+"""
+
+
+def _ss_list_remote_run_ids(host: str, limit: int = 12) -> list[str]:
+    cmd = (
+        f"ls -1d {_ss_remote_runs_dir()}/*/ 2>/dev/null "
+        f"| xargs -n1 basename 2>/dev/null | sort -r | head -{max(1, min(limit, 40))}"
+    )
+    try:
+        r = ssh_run(host, cmd, timeout=45)
+    except Exception:
+        return []
+    out: list[str] = []
+    for ln in (r.stdout or "").splitlines():
+        name = Path(ln.strip()).name
+        if re.match(r"^\d{8}_\d{6}_\d+$", name):
+            out.append(name)
+    return out
+
+
+def _ss_pull_run_dir(host: str, run_id: str) -> bool:
+    """Pull one test_runs/<id> folder from lab → local artifacts (for UI charts)."""
+    name = Path(str(run_id).strip()).name
+    if not re.match(r"^\d{8}_\d{6}_\d+$", name):
+        return False
+    base = _ss_runs_base()
+    base.mkdir(parents=True, exist_ok=True)
+    tar_bin = shutil.which("tar") or "tar"
+    remote_cmd = f"cd {_ss_remote_runs_dir()} && tar czf - {sh_quote(name)}"
+    try:
+        p_ssh = subprocess.Popen(
+            [ssh_bin(), *_ssh_common_opts(), host, remote_cmd],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert p_ssh.stdout is not None
+        p_tar = subprocess.Popen(
+            [tar_bin, "xzf", "-", "-C", str(base)],
+            stdin=p_ssh.stdout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        p_ssh.stdout.close()
+        p_tar.communicate(timeout=300)
+        rc_ssh = p_ssh.wait(timeout=10)
+        rc_tar = p_tar.returncode
+        ok = rc_ssh == 0 and rc_tar == 0 and (base / name).is_dir()
+        if not ok:
+            return False
+        # LATEST pointer (best-effort)
+        try:
+            lr = ssh_run(
+                host,
+                f"cat {_ss_remote_runs_dir()}/LATEST 2>/dev/null || true",
+                timeout=20,
+            )
+            latest = (lr.stdout or "").strip()
+            if latest:
+                (base / "LATEST").write_text(latest + "\n", encoding="utf-8")
+        except Exception:
+            pass
+        return ok
+    except Exception:
+        return False
+
+
+def _ss_sync_runs_from_lab(
+    host: str | None = None,
+    run_ids: list[str] | None = None,
+    limit: int = 10,
+) -> int:
+    """Pull recent SS test runs from lab when UI runs on Windows (Unity on lab only)."""
+    if ui_runs_on_lab():
+        return 0
+    try:
+        host = host or resolve_ssh_host(load_cfg().get("ssh_host") or "lab_comp")
+    except Exception:
+        return 0
+    ids = run_ids if run_ids is not None else _ss_list_remote_run_ids(host, limit=limit)
+    synced = 0
+    for rid in ids:
+        local = _ss_runs_base() / rid
+        if local.is_dir() and (local / "live_stress_report.json").is_file():
+            continue
+        if _ss_pull_run_dir(host, rid):
+            synced += 1
+    return synced
+
+
+def _ss_maybe_sync_runs(force: bool = False) -> None:
+    if ui_runs_on_lab():
+        return
+    global _ss_sync_last_at
+    now = time.time()
+    with _ss_sync_lock:
+        if not force and now - _ss_sync_last_at < _SS_SYNC_INTERVAL:
+            return
+        _ss_sync_last_at = now
+        already = getattr(_ss_maybe_sync_runs, "_inflight", False)
+        if already and not force:
+            return
+        _ss_maybe_sync_runs._inflight = True  # type: ignore[attr-defined]
+
+    def _bg() -> None:
+        try:
+            _ss_sync_runs_from_lab()
+        except Exception:
+            pass
+        finally:
+            _ss_maybe_sync_runs._inflight = False  # type: ignore[attr-defined]
+
+    # Never block UI request threads on SSH/tar pull.
+    threading.Thread(target=_bg, name="ss-sync-runs", daemon=True).start()
+
+
+def _start_ss_checks_async(
+    job_name: str,
+    session: str,
+    checks_args: str,
+    *,
+    eta_hint: str,
+    log_intro: str,
+) -> dict[str, Any]:
+    """Live Stress / Full Runtime: always on lab unless UI itself runs on lab_comp.
+
+    Windows UI must never run Unity checks locally — Unity is only on lab.
+    """
+    # os.name == "nt" → this PC; force SSH even if FOREST_UI_LOCAL was mis-set.
+    on_lab = ui_runs_on_lab() and os.name != "nt"
+    if on_lab:
+        py = _ss_python()
+        checks = ROOT / "scripts" / "run_streaming_survival_checks.py"
+        argv = [py, "-u", str(checks)] + checks_args.split()
+        jid = start_local_job(job_name, argv, cwd=ROOT)
+        where = "lab (local)"
+    else:
+        cfg = load_cfg()
+        host = resolve_ssh_host(cfg.get("ssh_host") or "lab_comp")
+        remote_bash = _ss_remote_checks_bash(checks_args.strip())
+        jid = start_remote_detached(job_name, host, session, remote_bash)
+        where = f"lab_comp via ssh ({host})"
+    return {
+        "overall": "RUNNING",
+        "async": True,
+        "job_id": jid,
+        "eta_hint": eta_hint,
+        "log": (
+            f"{log_intro} → {where} (job {jid}).\n"
+            "Жди обновления статуса ниже. При Error в списке останется попытка с причиной."
+        ),
+    }
+
+
 def _ss_artifacts_latest() -> Path | None:
     """Prefer newest live-stress/stats run for Diagnostics links.
 
@@ -1798,7 +1981,18 @@ def _ss_resolve_run(run_id: str | None = None) -> Path | None:
             p.relative_to(base.resolve())
         except ValueError:
             return None
-        return p if p.is_dir() else None
+        if p.is_dir():
+            return p
+        if not ui_runs_on_lab():
+            # Kick background pull — never block HTTP on SSH/tar.
+            threading.Thread(
+                target=lambda: _ss_sync_runs_from_lab(run_ids=[name], limit=1),
+                name=f"ss-pull-{name}",
+                daemon=True,
+            ).start()
+        return None
+    if not ui_runs_on_lab():
+        _ss_maybe_sync_runs()
     return _ss_artifacts_latest()
 
 
@@ -1875,6 +2069,62 @@ def _ss_run_duration_sec(run: Path, live: dict[str, Any]) -> float | None:
         except Exception:
             pass
     return None
+
+
+def _ss_extract_fail_reason(summary: dict[str, Any], live: dict[str, Any] | None = None) -> str:
+    """Human reason for ERROR row: top-level or first failed attempt."""
+    live = live or {}
+    nested = summary.get("live_stress") if isinstance(summary.get("live_stress"), dict) else {}
+    for src in (summary, live, nested):
+        if not isinstance(src, dict):
+            continue
+        for key in ("reason", "error", "fail_reason"):
+            v = str(src.get(key) or "").strip()
+            if v and v.lower() not in ("ok", "none", "-"):
+                return v
+    for src in (live, nested, summary):
+        if not isinstance(src, dict):
+            continue
+        failed = src.get("failed_attempts")
+        if not isinstance(failed, list):
+            failed = []
+        attempts = src.get("attempts") if isinstance(src.get("attempts"), list) else []
+        for a in list(failed) + list(attempts):
+            if not isinstance(a, dict):
+                continue
+            if str(a.get("result") or "").upper() in ("PASS", "OK", ""):
+                if a not in failed:
+                    continue
+            v = str(a.get("reason") or a.get("error") or a.get("fail_reason") or "").strip()
+            if v:
+                return v
+    # Aggregate counters when attempt reason missing
+    for src in (live, nested):
+        if not isinstance(src, dict):
+            continue
+        bits: list[str] = []
+        for key, label in (
+            ("stuck_failures", "stuck"),
+            ("teleport_failures", "teleport"),
+            ("resource_guard_failures", "resource_guard"),
+            ("parser_failures", "parser"),
+            ("ground_failures", "ground"),
+            ("visual_failures", "visual"),
+        ):
+            try:
+                n = int(src.get(key) or 0)
+            except (TypeError, ValueError):
+                n = 0
+            if n:
+                bits.append(f"{label}={n}")
+        if bits:
+            return " · ".join(bits)
+        if str(src.get("overall") or "").upper() in ("FAIL", "ERROR"):
+            ap = src.get("attempts_passed")
+            at = src.get("attempts_total") or src.get("n_attempts")
+            if at is not None:
+                return f"PASS {ap if ap is not None else 0}/{at}"
+    return ""
 
 
 def _ss_run_meta(run: Path) -> dict[str, Any]:
@@ -1977,16 +2227,48 @@ def _ss_run_meta(run: Path) -> dict[str, Any]:
             duration_sec = None
     # Stale unfinished stress (no report, idle >45m): still list, but as incomplete.
     unfinished = (not has_live) and has_live_artifacts and not in_progress
+    # Early fail / aborted live-stress: only summary.json left — still a real attempt.
+    summary_mode = str(summary.get("mode") or "")
+    summary_live = summary_mode in ("live_stress", "live_stress_only", "full_qa")
+    summary_reason = _ss_extract_fail_reason(summary, live)
+    early_fail = (
+        (not has_live)
+        and (not in_progress)
+        and (not unfinished)
+        and summary_live
+        and str(summary.get("overall") or "").upper()
+        in ("FAIL", "ERROR", "INCOMPLETE", "RUNNING")
+    )
     if unfinished:
         live_st_override = "INCOMPLETE"
         overall_override = "INCOMPLETE"
+    elif early_fail:
+        raw = str(summary.get("live_stress_status") or summary.get("overall") or "ERROR").upper()
+        reason_l0 = summary_reason.lower()
+        launch0 = any(
+            m in reason_l0
+            for m in (
+                "unity runtime",
+                "bot unreachable",
+                "runtime down",
+                "traceback",
+                "exception",
+            )
+        ) or (not summary_reason)
+        if raw in ("FAIL", "ERROR"):
+            tag = "Error" if launch0 else "Failed"
+            live_st_override = tag
+            overall_override = tag
+        else:
+            live_st_override = raw
+            overall_override = raw
     else:
         live_st_override = None
         overall_override = None
     duration_label = _ss_format_duration(duration_sec)
     mode = (
         summary.get("mode")
-        or ("live_stress" if (has_live or in_progress or unfinished) else None)
+        or ("live_stress" if (has_live or in_progress or unfinished or early_fail) else None)
         or ("parser_only" if (run / "parser_results.json").is_file() and not has_live else None)
         or "checks"
     )
@@ -2005,8 +2287,36 @@ def _ss_run_meta(run: Path) -> dict[str, Any]:
         or live.get("overall")
         or ("—" if not has_live else "?")
     )
+    # Normalize FAIL/PASS → Failed/Success for humans.
+    # ERROR only for launch/runtime crashes (Unity down, bot unreachable, …).
+    launch_error_markers = (
+        "unity runtime",
+        "bot unreachable",
+        "missing trajectory",
+        "runtime down",
+        "traceback",
+        "exception",
+        "ssh",
+        "timeout",
+        "no such file",
+        "permission denied",
+    )
+    reason_l = summary_reason.lower()
+    is_launch_error = any(m in reason_l for m in launch_error_markers) or (
+        early_fail and "delta=" not in reason_l and "need>=" not in reason_l
+    )
+    raw_live = str(live_st).upper()
+    raw_overall = str(overall).upper()
+    if raw_live in ("PASS", "OK", "SUCCESS"):
+        live_st = "Success"
+    elif raw_live in ("FAIL", "FAILED", "ERROR"):
+        live_st = "Error" if is_launch_error else "Failed"
+    if raw_overall in ("PASS", "OK", "SUCCESS"):
+        overall = "Success"
+    elif raw_overall in ("FAIL", "FAILED", "ERROR") and (has_live or early_fail or summary_reason):
+        overall = "Error" if is_launch_error else "Failed"
     when = _ss_run_when_label(run)
-    if has_live or in_progress or unfinished:
+    if has_live or in_progress or unfinished or early_fail:
         title = f"Live Stress {attempts_n}" if attempts_n else "Live Stress"
     elif mode == "parser_only":
         title = "Parser report"
@@ -2014,7 +2324,9 @@ def _ss_run_meta(run: Path) -> dict[str, Any]:
         title = "Machine Checks"
     else:
         title = str(mode)
-    status_show = live_st if (has_live or in_progress or unfinished) else overall
+    status_show = live_st if (has_live or in_progress or unfinished or early_fail) else overall
+    if status_show in ("Failed", "Error", "FAIL", "ERROR") and summary_reason:
+        status_show = f"{('Error' if status_show in ('Error', 'ERROR') else 'Failed')} · {summary_reason}"
     parser_fail = stats.get("parser_failures")
     if parser_fail is None:
         parser_fail = live.get("parser_failures")
@@ -2026,8 +2338,13 @@ def _ss_run_meta(run: Path) -> dict[str, Any]:
             score_line = f"сделано {done_attempts}/{attempts_n or '?'} · {duration_label}"
     elif unfinished:
         score_line = f"обрыв {done_attempts}/{attempts_n or '?'}"
+    elif early_fail or (has_live and str(live_st) in ("Failed", "Error")):
+        score_line = summary_reason or str(live_st)
     elif has_live and attempts_passed is not None and attempts_failed is not None:
-        score_line = f"PASS {attempts_passed} · FAIL {attempts_failed} · {duration_label}"
+        if str(live_st) == "Success":
+            score_line = f"Success · {duration_label}"
+        else:
+            score_line = f"PASS {attempts_passed} · FAIL {attempts_failed} · {duration_label}"
     else:
         score_line = duration_label if duration_label != "—" else ""
     subtitle_bits = []
@@ -2043,6 +2360,8 @@ def _ss_run_meta(run: Path) -> dict[str, Any]:
         subtitle_bits.append("идёт")
     elif unfinished:
         subtitle_bits.append("не завершён")
+    elif early_fail and summary_reason:
+        subtitle_bits.append(summary_reason)
     subtitle = " · ".join(subtitle_bits) if subtitle_bits else run.name
     label = f"{title} · {status_show} · {score_line} · {when}"
     try:
@@ -2060,21 +2379,22 @@ def _ss_run_meta(run: Path) -> dict[str, Any]:
         "score_line": score_line,
         "overall": overall,
         "status": status_show,
+        "reason": summary_reason,
         "live_stress_status": live_st,
         "attempts": attempts_n,
         "attempts_passed": attempts_passed if has_live else (done_attempts if (in_progress or unfinished) else attempts_passed),
-        "attempts_failed": attempts_failed,
+        "attempts_failed": attempts_failed if attempts_failed is not None else (int(attempts_n or 0) if early_fail else None),
         "duration_sec": duration_sec,
         "duration_label": duration_label,
         "parser_failures": parser_fail,
         "stats_dashboard_status": stats.get("stats_dashboard_status")
         or summary.get("stats_dashboard_status"),
         "has_stats": has_stats,
-        "has_live": has_live or in_progress or unfinished,
+        "has_live": has_live or in_progress or unfinished or early_fail,
         "has_summary": sp.is_file(),
         "has_screenshots": (run / "screenshots").is_dir(),
         "label": label,
-        "is_report": has_live or in_progress or unfinished,
+        "is_report": has_live or in_progress or unfinished or early_fail,
         "in_progress": in_progress,
         "done_attempts": done_attempts if (in_progress or unfinished) else None,
     }
@@ -2082,6 +2402,8 @@ def _ss_run_meta(run: Path) -> dict[str, Any]:
 
 def _ss_list_runs(limit: int = 60, reports_only: bool = True) -> list[dict[str, Any]]:
     """List test runs. Default: Live Stress reports (40-task) only, newest first."""
+    if not ui_runs_on_lab():
+        _ss_maybe_sync_runs()
     base = _ss_runs_base()
     if not base.is_dir():
         return []
@@ -2236,6 +2558,7 @@ def _ss_load_report(run: Path) -> dict[str, Any]:
             "machine_full_runtime_status", summary.get("full_runtime_status")
         ),
         "live_stress_status": summary.get("live_stress_status"),
+        "reason": meta.get("reason") or summary.get("reason") or "",
         "stats_dashboard_status": summary.get("stats_dashboard_status")
         or stats.get("stats_dashboard_status"),
         "stats_dashboard_url": dash,
@@ -2339,39 +2662,25 @@ def run_ss_diagnostics(kind: str, run_id: str | None = None) -> dict[str, Any]:
 
     if kind in ("live_stress", "live_stress_40", "live_stress_1"):
         attempts = "1" if kind == "live_stress_1" else "40"
-        jid = start_local_job(
-            f"ss_live_stress_{attempts}",
-            [py, "-u", str(checks), "--live-stress", "--attempts", attempts],
-            cwd=ROOT,
-        )
         eta = "~1–3 мин" if attempts == "1" else "20–45 минут"
-        return {
-            "overall": "RUNNING",
-            "async": True,
-            "job_id": jid,
-            "eta_hint": eta,
-            "log": (
-                f"Live Stress {attempts} запущен в фоне (job " + jid + ").\n"
-                "Жди обновления статуса ниже."
-            ),
-        }
+        where = "lab_comp" if not ui_runs_on_lab() else "локально"
+        return _start_ss_checks_async(
+            f"ss_live_stress_{attempts}",
+            f"fui_ss_live_stress_{attempts}",
+            f"--live-stress --attempts {attempts}",
+            eta_hint=eta,
+            log_intro=f"Live Stress {attempts} на {where}",
+        )
 
     if kind in ("full_runtime_async",):
-        jid = start_local_job(
+        where = "lab_comp" if not ui_runs_on_lab() else "локально"
+        return _start_ss_checks_async(
             "ss_full_runtime",
-            [py, "-u", str(checks), "--full-runtime"],
-            cwd=ROOT,
+            "fui_ss_full_runtime",
+            "--full-runtime",
+            eta_hint="10–25 минут",
+            log_intro=f"Full Machine Checks на {where}",
         )
-        return {
-            "overall": "RUNNING",
-            "async": True,
-            "job_id": jid,
-            "eta_hint": "10–25 минут",
-            "log": (
-                "Full Machine Checks запущен в фоне (job " + jid + ").\n"
-                "Сценарии Unity + continuity/ground. Без 40 live stress."
-            ),
-        }
 
     if kind in ("stats_dashboard", "open_stats"):
         run = _ss_resolve_run(run_id)
@@ -2489,24 +2798,21 @@ def run_ss_diagnostics(kind: str, run_id: str | None = None) -> dict[str, Any]:
         }
 
     if kind in ("full_runtime", "world_registry", "scenarios", "all", "e2e", "runtime_suite"):
-        # Same as Full Machine Checks — async to avoid browser timeout/err.
-        jid = start_local_job(
+        where = "lab_comp" if not ui_runs_on_lab() else "локально"
+        out = _start_ss_checks_async(
             "ss_full_runtime",
-            [py, "-u", str(checks), "--full-runtime"],
-            cwd=ROOT,
+            "fui_ss_full_runtime",
+            "--full-runtime",
+            eta_hint="10–25 минут",
+            log_intro=f"Full Machine Checks / Runtime Suite на {where}",
         )
-        return {
-            "overall": "RUNNING",
-            "async": True,
-            "job_id": jid,
-            "eta_hint": "10–25 минут",
-            "log": (
-                "Full Machine Checks / Runtime Suite запущен в фоне (job " + jid + ").\n"
-                "Это НЕ ошибка и не Training AI.\n"
-                "Проверяет: world registry + сценарии Unity (вода/дом/дерево/телепорты/ground).\n"
-                "Не путать с Live Stress 40 (тот шлёт реальные #do 40 раз)."
-            ),
-        }
+        out["log"] = (
+            out.get("log", "")
+            + "\nЭто НЕ ошибка и не Training AI.\n"
+            "Проверяет: world registry + сценарии Unity (вода/дом/дерево/телепорты/ground).\n"
+            "Не путать с Live Stress 40 (тот шлёт реальные #do 40 раз)."
+        )
+        return out
 
     return {"overall": "FAIL", "log": f"unknown kind={kind}"}
 
@@ -4805,10 +5111,11 @@ function bindSsDiagnostics() {
       const runRow = document.createElement("div");
       runRow.setAttribute("data-run-id", runningJobRunId);
       runRow.style.cssText = "display:grid;grid-template-columns:minmax(0,1.4fr) minmax(140px,1fr) auto;gap:10px;align-items:center;padding:9px 12px;border-bottom:1px solid #3a3a3a;background:rgba(230,184,77,.12)";
-      runRow.innerHTML = '<div style="min-width:0"><div style="font-weight:600">Live Stress 40 · RUNNING</div>'
+      const pending = String(runningJobRunId).indexOf("pending_") === 0;
+      runRow.innerHTML = '<div style="min-width:0"><div style="font-weight:600">Live Stress · RUNNING</div>'
         + '<div class="hint" style="opacity:.85;margin-top:2px;font-size:12px;word-break:break-all">'
-        + runningJobRunId + "</div></div>"
-        + '<div style="font-variant-numeric:tabular-nums">PASS — · FAIL —<br/><span class="hint">длительность: идёт…</span></div>'
+        + (pending ? ("старт… " + runningJobRunId) : runningJobRunId) + "</div></div>"
+        + '<div style="font-variant-numeric:tabular-nums"><span style="color:#e6b84d">RUNNING</span><br/><span class="hint">длительность: идёт…</span></div>'
         + '<div style="text-align:right;white-space:nowrap;opacity:.95">сейчас</div>';
       runList.appendChild(runRow);
     }
@@ -4825,6 +5132,10 @@ function bindSsDiagnostics() {
       t.textContent = (r.title || ("Live Stress " + (r.attempts || 40))) + " · " + (r.status || r.live_stress_status || "—");
       if (r.in_progress || r.status === "RUNNING") {
         row.style.background = "rgba(230,184,77,.12)";
+      } else if (String(r.status || "").indexOf("Error") === 0 || String(r.status || "").indexOf("ERROR") === 0) {
+        row.style.background = "rgba(239,107,107,.10)";
+      } else if (String(r.status || "").indexOf("Failed") === 0 || String(r.status || "").indexOf("FAIL") === 0) {
+        row.style.background = "rgba(239,107,107,.08)";
       }
       const idLine = document.createElement("div");
       idLine.className = "hint";
@@ -4841,6 +5152,15 @@ function bindSsDiagnostics() {
         const done = (r.done_attempts != null) ? r.done_attempts : (r.attempts_passed ?? "—");
         score.innerHTML = '<span style="color:#e6b84d">RUNNING</span>'
           + ' <span class="hint">' + done + " / " + total + "</span>";
+      } else if (String(r.status || "").indexOf("Error") === 0 || String(r.status || "").indexOf("ERROR") === 0) {
+        score.innerHTML = '<span style="color:#ef6b6b">Error</span>'
+          + (r.reason ? (' <span class="hint">' + String(r.reason) + "</span>") : "");
+      } else if (String(r.status || "").indexOf("Failed") === 0 || String(r.status || "").indexOf("FAIL") === 0 || r.reason) {
+        score.innerHTML = '<span style="color:#ef6b6b">Failed</span>'
+          + (r.reason ? (' <span class="hint">' + String(r.reason) + "</span>") : "");
+      } else if (String(r.status || "").indexOf("Success") === 0 || String(r.status || "") === "PASS") {
+        score.innerHTML = '<span style="color:#3ecf8e">Success</span>'
+          + ' <span class="hint">из ' + total + "</span>";
       } else {
         const passed = (r.attempts_passed === 0 || r.attempts_passed) ? r.attempts_passed : "—";
         const failed = (r.attempts_failed === 0 || r.attempts_failed) ? r.attempts_failed : "—";
@@ -4879,7 +5199,15 @@ function bindSsDiagnostics() {
         || summary.full_runtime_status
         || (summary.mode === "parser_only" ? "NOT RUN" : (summary.overall || "—"));
     }
-    if (liveSt) liveSt.textContent = summary.live_stress_status || "NOT RUN";
+    if (liveSt) {
+      const rs = summary.reason || (extra && extra.reason) || "";
+      const st = summary.live_stress_status || "NOT RUN";
+      const up = String(st).toUpperCase();
+      if ((up === "ERROR" || String(st) === "Error") && rs) liveSt.textContent = "Error · " + rs;
+      else if ((up === "FAIL" || up === "FAILED" || String(st) === "Failed") && rs) liveSt.textContent = "Failed · " + rs;
+      else if (up === "PASS" || String(st) === "Success") liveSt.textContent = "Success";
+      else liveSt.textContent = st;
+    }
     if (visualSt) visualSt.textContent = summary.visual_status || "PENDING";
     if (statsSt) statsSt.textContent = summary.stats_dashboard_status
       || (stats && stats.stats_dashboard_status) || "NOT RUN";
@@ -4977,15 +5305,25 @@ function bindSsDiagnostics() {
           const finishedRun = runningJobRunId;
           runningJobRunId = "";
           runningJobKind = "";
+          const reasonMatch = logTail.match(/"reason"\s*:\s*"([^"]+)"/);
+          const errReason = reasonMatch ? reasonMatch[1] : "";
           try {
             await refreshRuns((kind.indexOf("live") >= 0 || kind.indexOf("full") >= 0 || kind.indexOf("runtime") >= 0)
               ? "__latest__" : (finishedRun || "__latest__"));
             const pick = finishedRun || selectedRunId || "";
             await loadRunReport(pick);
-            if (stEl) stEl.textContent = st === "ok" ? "готово" : "ошибка job";
-            showLog("");
+            if (st === "ok") {
+              if (stEl) stEl.textContent = "готово";
+              showLog("");
+            } else {
+              if (stEl) stEl.textContent = errReason
+                ? ("ERROR · " + errReason)
+                : "ERROR · job failed";
+              showLog(logTail || ("ERROR job " + jobId));
+            }
           } catch (e2) {
-            if (stEl) stEl.textContent = "ошибка: " + (e2.message || e2);
+            if (stEl) stEl.textContent = "ERROR · " + (e2.message || e2);
+            showLog(logTail || String(e2.message || e2));
           }
           return;
         }
@@ -5029,7 +5367,8 @@ function bindSsDiagnostics() {
       });
       if (j.async && j.job_id) {
         runningJobKind = kind;
-        runningJobRunId = "";
+        // Placeholder until log reveals real test_runs/<id> — so RUNNING never "vanishes".
+        runningJobRunId = "pending_" + j.job_id;
         if (kind.indexOf("live") >= 0) {
           if (liveSt) liveSt.textContent = "RUNNING";
           if (statsSt) statsSt.textContent = "RUNNING";

@@ -43,6 +43,8 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
     int _needAmount = 1;
     int _doneAmount;
     readonly Queue<QueuedStep> _queue = new Queue<QueuedStep>();
+    /// <summary>True when #do came as a multi-step / counted queue — do not infinite-farm after last step.</summary>
+    bool _startedWithQueue;
     WaterGoalPath _waterPath;
 
     public const float MaxAllowedCharacterSpeed = 8.0f;
@@ -174,7 +176,17 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
         Vector3 origin = transform.position;
         // Water: prefer east/north escapes. Never accept south/west into the fence trap.
         Vector3[] candidates = waterEscape
-            ? (origin.z < 18.0f
+            ? (NearWaterFenceGap(origin)
+                ? new[]
+                {
+                    // At sheep→pond gap: push EAST to GoalWater1 — never north into the plank wall.
+                    Vector3.right * maxDist,
+                    new Vector3(1f, 0f, 0.35f).normalized * maxDist,
+                    new Vector3(1f, 0f, 0.15f).normalized * maxDist,
+                    new Vector3(0.85f, 0f, 0.55f).normalized * maxDist,
+                    preferDir.x >= 0f ? preferDir * maxDist : Vector3.right * maxDist,
+                }
+                : origin.z < 18.0f
                 ? new[]
                 {
                     // Far mid corridor: north only — avoid the x≈12.6 dead pocket.
@@ -222,9 +234,16 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
             dest.y = origin.y;
             if (waterEscape)
             {
+                if (NearWaterFenceGap(origin))
+                {
+                    // Must move east through the gap toward GW1 (~16.5,16.4).
+                    if (dest.x < origin.x + 0.2f) continue;
+                    if (dest.z < 14.2f || dest.z > 17.2f) continue;
+                    if (dest.x > 18.5f) continue;
+                }
                 // West of fence / sheep yard: MUST be allowed to push EAST into the gap.
                 // Old rules rejected dest.x > origin.x+0.35 and froze agents at ~(13,14).
-                if (origin.x < 15.5f && origin.z < 20.0f)
+                else if (origin.x < 15.5f && origin.z < 20.0f)
                 {
                     if (dest.x < 9.5f) continue;
                     if (dest.z < 13.0f || dest.z > 17.5f) continue;
@@ -437,6 +456,7 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
     public void SetAction(string action, string actionName, int amount = 1, string queueCsv = null)
     {
         _queue.Clear();
+        _startedWithQueue = false;
         if (!string.IsNullOrEmpty(queueCsv))
         {
             foreach (var part in queueCsv.Split(';'))
@@ -459,6 +479,8 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
 
         if (_queue.Count > 0)
         {
+            // Multi-step #do (or counted chain): stop after the last step — no infinite water farm.
+            _startedWithQueue = true;
             var first = _queue.Dequeue();
             ApplyStep(first.Action, first.ActionName, first.Amount);
             return;
@@ -554,6 +576,9 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
         ApplyStep("idle", "Ждёт у базы", 1);
     }
 
+    /// <summary>Once agent reached gap mouth, keep corridor east (no 15.15 border flap).</summary>
+    bool _waterGapCommitted;
+
     float _phaseEnteredAt;
 
     Vector3 _lockedWorkTarget;
@@ -566,6 +591,8 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
     float _waterStuckSince = -1f;
     Vector3 _waterStuckPos;
     int _waterStuckTries;
+    /// <summary>Spawn hub already visited for current water trip (avoid spawn↔mouth oscillation).</summary>
+    bool _waterSpawnHubDone;
     float _homeStuckSince = -1f;
     Vector3 _homeStuckPos;
     int _homeStuckTries;
@@ -643,6 +670,8 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
             _waterWpIndex = 0;
             _waterStuckTries = 0;
             _waterStuckSince = -1f;
+            _waterSpawnHubDone = false;
+            _waterGapCommitted = false;
             _phase = Phase.GoWaterWp;
             Vector3 wp = _waterRoute.Count > 0 ? _waterRoute[0] : transform.position;
             Vector3 lake = _waterRoute.Count > 0
@@ -721,10 +750,39 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
         _label.text = string.IsNullOrEmpty(Username) ? "viewer" : Username;
     }
 
+    int _gameplayTickFrame = -1;
+
     void Update()
     {
+        // Prefer controller-driven tick (works even if this GO is inactive in hierarchy).
+        TickGameplay();
+    }
+
+    /// <summary>
+    /// One gameplay step per frame. Safe to call from Controller when Player.Update
+    /// does not run (inactive parent / disabled behaviour).
+    /// </summary>
+    public void TickGameplay()
+    {
+        if (_gameplayTickFrame == Time.frameCount)
+            return;
+        _gameplayTickFrame = Time.frameCount;
+
         var ctrl = StreamingSurvivalController.Instance;
         if (ctrl == null) return;
+        if (!isActiveAndEnabled || !gameObject.activeInHierarchy)
+        {
+            // Recover from inactive hierarchy / disabled script so QA agents keep walking.
+            var host = StreamingSurvivalController.Instance;
+            if (host != null && !gameObject.activeInHierarchy)
+                transform.SetParent(host.transform, true);
+            if (!gameObject.activeSelf)
+                gameObject.SetActive(true);
+            if (!enabled)
+                enabled = true;
+            if (!isActiveAndEnabled)
+                return;
+        }
         if (_anim == null) PrepareAnimator();
         TrackMotionSample();
 
@@ -793,6 +851,18 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
                 }
                 if (TryBeginWorkAtResource(ctrl))
                     break;
+                // East of fence → yard goal (tree/sheep/food): reverse corridor via spawn first.
+                {
+                    Vector3 dest = _lockedWorkTarget;
+                    Vector3 pNow = transform.position;
+                    if (NeedsFenceGapReturn(pNow, dest))
+                    {
+                        Vector3 via = FenceGapReturnWaypoint(pNow);
+                        _target = via;
+                        MoveToward(via);
+                        break;
+                    }
+                }
                 // Near stand but blocked — repath / nudge, never snap-teleport to target.
                 float dStand = DistanceToCurrentTarget();
                 if (StreamingSurvivalResourceGuard.IsResourceAction(Action)
@@ -865,7 +935,6 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
             {
                 bool toFire = Action == "build_campfire" || Action == "go_to_campfire";
                 Vector3 house = toFire ? CampfirePos(ctrl) : HousePos(ctrl);
-                _target = house;
                 SetTargetMeta(
                     toFire ? "campfire_slot" : "home_interaction_point",
                     toFire ? "campfire_slot_0" : "home_0",
@@ -883,52 +952,65 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
                     _homeStuckPos = pNow;
                 }
 
-                // From water/north: exit pond south/east first, then approach house.
-                // Never teleport — only walk + small nudge, then idle if still stuck.
-                if (Action == "go_home" && pNow.z > house.z + 3.5f)
+                // Pond/east-of-fence → house/campfire: reverse of water corridor.
+                // Never cut the west face of the mid-yard fence (stuck ~15.9,21.8).
+                if (NeedsFenceGapReturn(pNow, house))
                 {
-                    Vector3 exitPond = new Vector3(
-                        Mathf.Clamp(Mathf.Max(pNow.x, 9.5f), 9.5f, 14f),
-                        pNow.y,
-                        Mathf.Min(pNow.z - 1.5f, 22.5f));
-                    Vector3 eastBypass = new Vector3(14.0f, pNow.y, Mathf.Clamp(pNow.z, house.z + 3f, 23f));
-                    Vector3 southGate = new Vector3(
-                        Mathf.Clamp(Mathf.Max(pNow.x, 9.0f), 9.0f, 13f),
-                        pNow.y,
-                        house.z + 2.2f);
-
-                    Vector3 via = pNow.z > 23.0f ? exitPond
-                        : (pNow.x < 12.5f && pNow.z > house.z + 5f ? eastBypass : southGate);
+                    Vector3 via = FenceGapReturnWaypoint(pNow);
                     _target = via;
-                    if (!Arrived(via, 1.8f))
+                    if (!Arrived(via, 1.55f))
                     {
-                        if (Time.time - _homeStuckSince > 3.5f)
+                        if (Time.time - _homeStuckSince > 2.5f)
                         {
                             StreamingSurvivalTrajectoryRecorder.Instance?.EmitEvent(
                                 Username, "stuck_detected", this);
-                            if (_homeStuckTries < 3 && TrySafeNudge(via - pNow, MaxStuckNudge))
+                            Vector3 nudgeDir = via - pNow;
+                            nudgeDir.y = 0f;
+                            // Prefer south then west through the gap — never into the fence wall.
+                            if (pNow.z > 16.2f && pNow.x > 14.5f)
+                                nudgeDir = new Vector3(via.x - pNow.x, 0f, 14.8f - pNow.z);
+                            if (_homeStuckTries < 6 && TrySafeNudge(nudgeDir, MaxStuckNudge))
                             {
                                 _homeStuckTries++;
                                 _homeStuckSince = Time.time;
                                 _homeStuckPos = transform.position;
                                 break;
                             }
-                            if (_homeStuckTries >= 3 || Time.time - _homeStuckSince > 10f)
+                            // Still in corridor: keep walking, do not abandon chain yet.
+                            if (NeedsFenceGapReturn(pNow, house)
+                                && Time.time - _phaseEnteredAt < 90f)
                             {
-                                MarkStuckAndIdle("go_home_corridor");
+                                MoveToward(via);
                                 break;
                             }
-                            // Recompute: shift further east then retry.
-                            _target = eastBypass;
+                            if (_homeStuckTries >= 6 || Time.time - _homeStuckSince > 14f)
+                            {
+                                MarkStuckAndIdle(toFire ? "campfire_gap_corridor" : "go_home_gap_corridor");
+                                break;
+                            }
                         }
-                        MoveToward(_target);
+                        MoveToward(via);
+                        break;
+                    }
+
+                    // Reached current WP — immediately take the next corridor point
+                    // (mouth → west yard) so we never aim campfire while still on the gap.
+                    Vector3 next = FenceGapReturnWaypoint(transform.position);
+                    if (NeedsFenceGapReturn(transform.position, house)
+                        && Horiz(transform.position, next) > 1.1f)
+                    {
+                        _target = next;
+                        _homeStuckSince = Time.time;
+                        _homeStuckPos = transform.position;
+                        MoveToward(next);
                         break;
                     }
                 }
 
-                bool noProgress = Action == "go_home"
-                    && Time.time - _homeStuckSince > 5f
-                    && distHome > 3.5f;
+                _target = house;
+                bool noProgress = Time.time - _homeStuckSince > 5f
+                    && distHome > 3.5f
+                    && !NeedsFenceGapReturn(pNow, house);
                 if (noProgress)
                 {
                     StreamingSurvivalTrajectoryRecorder.Instance?.EmitEvent(
@@ -942,10 +1024,10 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
                         _target = house;
                         break;
                     }
-                    MarkStuckAndIdle("go_home_no_progress");
+                    MarkStuckAndIdle(toFire ? "campfire_no_progress" : "go_home_no_progress");
                     break;
                 }
-                if (Arrived(house, 2.8f))
+                if (Arrived(house, toFire ? 1.55f : 2.8f))
                 {
                     Debug.Log(
                         $"[SSPos] action_done user={Username} action={Action} ok=1 " +
@@ -962,11 +1044,11 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
                     else
                         ApplyStep("idle", "У дома", 1);
                 }
-                else if (Time.time - _phaseEnteredAt > 50f)
+                else if (Time.time - _phaseEnteredAt > (NeedsFenceGapReturn(pNow, house) ? 90f : 50f))
                 {
                     StreamingSurvivalTrajectoryRecorder.Instance?.EmitEvent(
                         Username, "stuck_detected", this);
-                    MarkStuckAndIdle("go_home_timeout");
+                    MarkStuckAndIdle(toFire ? "campfire_timeout" : "go_home_timeout");
                 }
                 else
                     MoveToward(house);
@@ -1044,9 +1126,19 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
             {
                 _phase = Action == "collect_water" ? Phase.GoWaterWp : Phase.GoTarget;
                 _hasLockedWorkTarget = false;
+                _hasResourceAnchor = false;
                 CollectState = StreamingSurvivalResourceGuard.CollectState.MovingToResource;
                 ReachedResourceFlag = false;
                 WorkStartedNearTarget = false;
+                // Re-resolve immediately so we walk to a new trunk instead of
+                // re-entering Work on the same ghost stand.
+                if (Action == "collect_wood")
+                {
+                    _lockedWorkTarget = ResolveWorkTarget();
+                    _hasLockedWorkTarget = true;
+                    _target = _lockedWorkTarget;
+                    _phaseEnteredAt = Time.time;
+                }
                 return;
             }
         }
@@ -1060,12 +1152,13 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
 
         if (_doneAmount >= _needAmount)
         {
-            if (_queue.Count > 0)
+            if (_queue.Count > 0 || _startedWithQueue)
             {
+                // End of #do chain (or next queued step). Never infinite-farm after a plan.
                 AdvanceQueueOrIdle();
                 return;
             }
-            // Добыча/охота/костёр — крутим пока зритель не сменит #do
+            // Single chat action without queue — keep farming until viewer sends a new #do.
             if (Action == "collect_water" || Action == "collect_wood"
                 || Action == "collect_food" || Action == "kill_sheep"
                 || Action == "build_campfire")
@@ -1108,6 +1201,8 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
             _phaseEnteredAt = Time.time;
             _waterStuckSince = -1f;
             _waterStuckTries = 0;
+            // Already at pond for remaining collect_water counts — spawn hub not needed.
+            _waterSpawnHubDone = true;
             if (TryBeginWorkAtResource(ctrl))
                 return;
             return;
@@ -1218,7 +1313,19 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
             Username, "resource_guard_pass", this, guard);
 
         if (Action == "collect_wood")
-            ChopTreeVictim();
+        {
+            if (!ChopTreeVictim())
+            {
+                CollectState = StreamingSurvivalResourceGuard.CollectState.Denied;
+                Debug.LogWarning(
+                    $"[ResourceGuard] DENIED user={Username} action=collect_wood reason=no_live_tree_to_chop " +
+                    $"pos=({transform.position.x:F2},{transform.position.z:F2})");
+                StreamingSurvivalTrajectoryRecorder.Instance?.EmitEvent(
+                    Username, "invalid_resource_completion", this);
+                RefreshLabel();
+                return;
+            }
+        }
         if (Action == "kill_sheep" || Action == "collect_food")
         {
             if (_sheepVictim != null)
@@ -1233,7 +1340,8 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
         RefreshLabel();
     }
 
-    void ChopTreeVictim()
+    /// <returns>true only if a live tree was taken down this tick.</returns>
+    bool ChopTreeVictim()
     {
         if (_treeVictim == null)
         {
@@ -1243,18 +1351,57 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
                 && spawner0.TryGetNearestAliveTree(transform.position, out GameObject near, out _))
             {
                 float d = Horiz(transform.position, near.transform.position);
-                if (d <= StreamingSurvivalResourceGuard.WoodInteractionRadius + 0.5f)
+                // Stand is ~1.35m from trunk; arrive slack can put character ~3m out.
+                if (d <= StreamingSurvivalResourceGuard.WoodInteractionRadius + 1.75f)
                     _treeVictim = near;
             }
         }
-        if (_treeVictim == null) return;
+        if (_treeVictim == null) return false;
         var spawner = TrainingEnvSpace.FindInPresentation<TreeSpawner>()
             ?? Object.FindFirstObjectByType<TreeSpawner>();
+        Vector3 chopPos = _treeVictim.transform.position;
         spawner?.NotifyTreeChopped(_treeVictim);
         Debug.Log(
-            $"[SSPos] chop user={Username} tree=({_treeVictim.transform.position.x:F2},{_treeVictim.transform.position.z:F2})");
+            $"[SSPos] chop user={Username} tree=({chopPos.x:F2},{chopPos.z:F2})");
         Destroy(_treeVictim);
         _treeVictim = null;
+        _hasResourceAnchor = false;
+        return true;
+    }
+
+    /// <summary>
+    /// Clear a tree that blocks movement (e.g. after wood step, forest refill).
+    /// Does not credit inventory — pathing only.
+    /// </summary>
+    bool TryChopBlockingTree(Vector3 preferDir)
+    {
+        var spawner = TrainingEnvSpace.FindInPresentation<TreeSpawner>()
+            ?? Object.FindFirstObjectByType<TreeSpawner>();
+        if (spawner == null)
+            return false;
+        if (!spawner.TryGetNearestAliveTree(transform.position, out GameObject tree, out Vector3 treePos))
+            return false;
+        float d = Horiz(transform.position, treePos);
+        if (d > 3.0f)
+            return false;
+        Vector3 toTree = treePos - transform.position;
+        toTree.y = 0f;
+        preferDir.y = 0f;
+        if (preferDir.sqrMagnitude > 0.01f && d > 1.75f)
+        {
+            float dot = Vector3.Dot(preferDir.normalized, toTree.normalized);
+            if (dot < 0.05f)
+                return false;
+        }
+        spawner.NotifyTreeChopped(tree);
+        Debug.Log(
+            $"[SSPos] path_clear_chop user={Username} tree=({treePos.x:F2},{treePos.z:F2}) d={d:F2} " +
+            $"pos=({transform.position.x:F2},{transform.position.z:F2})");
+        StreamingSurvivalTrajectoryRecorder.Instance?.EmitEvent(Username, "path_clear_chop", this);
+        if (_treeVictim == tree)
+            _treeVictim = null;
+        Destroy(tree);
+        return true;
     }
 
     void Deliver(StreamingSurvivalController ctrl)
@@ -1488,9 +1635,11 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
 
         if (westOfFence && !pastGap)
         {
-            // Sparse corridor: one mouth point then GW1 — close pairs + Arrived(2m) froze agents.
+            // Hub rule: always touch spawn first, then gap → GW1 → pond.
+            if (Horiz(from, spawn) > 1.5f)
+                _waterRoute.Add(spawn);
             Vector3 mouth = new Vector3(15.2f, y, 15.3f);
-            if (Horiz(from, mouth) > 1.2f)
+            if (Horiz(from, mouth) > 1.2f && Horiz(spawn, mouth) > 0.8f)
                 _waterRoute.Add(mouth);
             _waterRoute.Add(gw1);
         }
@@ -1537,8 +1686,77 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
         return p.x < 15.15f && p.z < 28.0f;
     }
 
+    /// <summary>Sheep→pond opening band — stuck recovery must push east, not north into planks.</summary>
+    static bool NearWaterFenceGap(Vector3 p)
+    {
+        return p.x >= 13.5f && p.x <= 16.2f && p.z >= 14.0f && p.z <= 16.8f;
+    }
+
     static Vector3 WaterGapSouth(float y) => new Vector3(14.2f, y, 14.6f);
     static Vector3 WaterGapMouth(float y) => new Vector3(15.2f, y, 15.3f);
+    static Vector3 WaterGw1(float y) => new Vector3(16.5f, y, 16.4f);
+
+    /// <summary>
+    /// East of mid-yard fence / still north of the sheep→pond gap — must not
+    /// walk the west face toward house/campfire/trees.
+    /// </summary>
+    static bool StillEastOfFenceGap(Vector3 p)
+    {
+        if (p.x >= 15.15f) return true;
+        // West of planks but still in the sealed corridor north of the gap.
+        return p.x > 14.0f && p.z > 16.5f && p.z < 32.0f;
+    }
+
+    /// <summary>
+    /// Destination is inside the yard (west of fence). Agent must return via
+    /// reverse water corridor → spawn hub before aiming at the goal.
+    /// </summary>
+    bool NeedsFenceGapReturn(Vector3 p, Vector3 destinationWest)
+    {
+        if (destinationWest.x >= 14.5f) return false;
+        Vector3 spawn = SpawnPos(StreamingSurvivalController.Instance);
+        spawn.y = p.y;
+        // Hub reached: west of gap and near spawn → free to walk to tree/fire/home.
+        if (p.x < 15.15f && Horiz(p, spawn) <= 2.2f)
+            return false;
+        return StillEastOfFenceGap(p) || (p.x > 12.0f && p.z > 16.5f);
+    }
+
+    Vector3 ResolveGoalWaterPoint(string[] names, Vector3 fallback)
+    {
+        Vector3? g = FindGoalWaterByNames(names);
+        if (!g.HasValue) return fallback;
+        return new Vector3(g.Value.x, fallback.y, g.Value.z);
+    }
+
+    /// <summary>
+    /// Reverse corridor: pond → GW2 → GW1 → gap mouth → spawn.
+    /// Spawn is the west hub; only then may caller aim campfire/tree/home.
+    /// </summary>
+    Vector3 FenceGapReturnWaypoint(Vector3 p)
+    {
+        float y = p.y;
+        Vector3 spawn = SpawnPos(StreamingSurvivalController.Instance);
+        spawn = new Vector3(spawn.x, y, spawn.z);
+        Vector3 gw2 = ResolveGoalWaterPoint(new[] { "GoalWater2" }, new Vector3(17.0f, y, 25.7f));
+        Vector3 gw1 = ResolveGoalWaterPoint(new[] { "GoalWater1" }, new Vector3(16.5f, y, 16.4f));
+        Vector3 mouth = WaterGapMouth(y);
+
+        // Pond / north of GW2 → GW2 first (never cut west face of fence).
+        if (p.x >= 15.0f && p.z >= 24.5f)
+            return Horiz(p, gw2) <= 1.55f ? gw1 : gw2;
+        // GW2 band → GW1
+        if (p.x >= 15.0f && p.z >= 17.0f)
+            return Horiz(p, gw1) <= 1.55f ? mouth : gw1;
+        // East at gap latitude → mouth, then spawn hub
+        if (p.x >= 15.15f)
+            return Horiz(p, mouth) <= 1.4f ? spawn : mouth;
+        // Sealed west-face pocket north of gap → back to mouth
+        if (p.z > 16.5f)
+            return mouth;
+        // Through gap → spawn hub
+        return spawn;
+    }
 
     static Vector3 ApproachableWaterStand(StreamingSurvivalWorldRegistry.WorldObject water)
     {
@@ -1553,6 +1771,52 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
         if (stand.x >= 16.5f && stand.x <= 22.0f && stand.z >= 28.0f && stand.z <= 31.5f)
             return stand;
         return forced;
+    }
+
+    void EnsureWaterRouteHasGw1(Vector3 gw1)
+    {
+        if (_waterRoute.Count == 0)
+        {
+            BuildWaterRoute();
+            return;
+        }
+        // Drop waypoints behind us (spawn/mouth); keep from GW1 onward.
+        int keep = IndexOfNearestWaterWp(gw1);
+        if (keep < 0)
+        {
+            _waterRoute.Insert(0, gw1);
+            return;
+        }
+        if (keep > 0)
+            _waterRoute.RemoveRange(0, keep);
+        if (_waterRoute.Count == 0 || Horiz(_waterRoute[0], gw1) > 1.5f)
+            _waterRoute.Insert(0, gw1);
+    }
+
+    int IndexOfNearestWaterWp(Vector3 want)
+    {
+        int best = -1;
+        float bestD = float.MaxValue;
+        for (int i = 0; i < _waterRoute.Count; i++)
+        {
+            float d = Horiz(_waterRoute[i], want);
+            if (d < bestD)
+            {
+                bestD = d;
+                best = i;
+            }
+        }
+        return bestD <= 2.5f ? best : -1;
+    }
+
+    static string WaterWaypointId(Vector3 wp, Vector3 stand)
+    {
+        if (Horiz(wp, stand) <= 1.8f) return "water_stand";
+        if (Mathf.Abs(wp.z - 32.8f) < 2.5f && wp.x > 18f) return "gap_gw3";
+        if (Mathf.Abs(wp.z - 25.7f) < 2.5f && wp.x > 15f) return "gap_gw2";
+        if (Mathf.Abs(wp.z - 16.4f) < 2.0f && wp.x > 15f) return "gap_gw1";
+        if (Mathf.Abs(wp.z - 15.3f) < 1.5f) return "gap_mouth";
+        return "water_wp";
     }
 
     Vector3? FindWaterSourceStandPos()
@@ -1688,13 +1952,78 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
             return;
         }
 
-        // While west of the mid-yard fence: ONLY steer to the gap mouth.
-        // Never rewrite GW2/lake into "mouth" and Arrived() — that auto-skipped the whole route.
-        // Do NOT rebuild route on "crossed" here: WestOfWaterFence ends at x<15.15 so
-        // the next frame simply follows GW1+ (old crossed@15.35 + west@15.5 = infinite loop).
-        if (WestOfWaterFence(p))
+        // While west of the mid-yard fence: spawn hub first (once), then gap mouth,
+        // then commit through the gap to GW1 — never sit on the 15.15 border forever.
+        if (WestOfWaterFence(p) && !_waterGapCommitted)
         {
+            Vector3 spawnHub = SpawnPos(ctrl);
+            spawnHub = new Vector3(spawnHub.x, p.y, spawnHub.z);
+            if (!_waterSpawnHubDone)
+            {
+                if (Horiz(p, spawnHub) > 1.35f)
+                {
+                    _target = spawnHub;
+                    SetTargetMeta("water_source", "spawn_hub", spawnHub, stand);
+                    // Deep forest after wood: spawn_hub MoveToward used to return with
+                    // no stuck logic → agent wedged forever between respawned trees.
+                    if (_waterStuckSince < 0f)
+                    {
+                        _waterStuckSince = Time.time;
+                        _waterStuckPos = p;
+                    }
+                    else if (Horiz(p, _waterStuckPos) > 0.4f)
+                    {
+                        _waterStuckSince = Time.time;
+                        _waterStuckPos = p;
+                    }
+                    if (Time.time - _waterStuckSince > 1.35f)
+                    {
+                        _waterStuckTries++;
+                        StreamingSurvivalTrajectoryRecorder.Instance?.EmitEvent(
+                            Username, "stuck_detected", this);
+                        Vector3 toHub = spawnHub - p;
+                        if (TryChopBlockingTree(toHub))
+                        {
+                            _waterStuckSince = Time.time;
+                            return;
+                        }
+                        if (_waterStuckTries <= 5 && TrySafeNudge(toHub, 1.6f, waterEscape: false))
+                        {
+                            _waterStuckSince = Time.time - 0.35f;
+                            return;
+                        }
+                        // Still blocked — keep clearing trees toward the exit.
+                        TryChopBlockingTree(toHub);
+                        _waterStuckSince = Time.time;
+                    }
+                    MoveToward(spawnHub);
+                    return;
+                }
+                _waterSpawnHubDone = true;
+                _waterStuckTries = 0;
+                _waterStuckSince = -1f;
+            }
+
             Vector3 mouth = WaterGapMouth(p.y);
+            Vector3 gw1 = ResolveGoalWaterPoint(new[] { "GoalWater1" }, WaterGw1(p.y));
+
+            // Reached mouth (or pressed into the gap): commit east corridor → GW1.
+            if (Arrived(mouth, 1.35f) || (p.x >= 14.9f && p.z >= 14.8f && p.z <= 16.2f))
+            {
+                _waterGapCommitted = true;
+                EnsureWaterRouteHasGw1(gw1);
+                _waterWpIndex = IndexOfNearestWaterWp(gw1);
+                if (_waterWpIndex < 0) _waterWpIndex = 0;
+                _waterStuckTries = 0;
+                _waterStuckSince = -1f;
+                _target = gw1;
+                SetTargetMeta("water_source", "gap_gw1", gw1, stand);
+                Debug.Log(
+                    $"[SSPos] water_gap_commit user={Username} pos=({p.x:F2},{p.z:F2}) → gw1");
+                MoveToward(gw1);
+                return;
+            }
+
             _target = mouth;
             SetTargetMeta("water_source", "gap_gw1", mouth, stand);
 
@@ -1714,16 +2043,18 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
                 _waterStuckTries++;
                 StreamingSurvivalTrajectoryRecorder.Instance?.EmitEvent(
                     Username, "stuck_detected", this);
-                // Walk around blockers (sheep) — never disable collisions / clip through.
-                Vector3 push = mouth - p;
-                push.y = 0f;
-                if (p.z > 15.6f)
-                    push = new Vector3(mouth.x - p.x, 0f, 14.6f - p.z); // south then east
-                else if (push.sqrMagnitude < 0.01f)
+                // Through the gap toward GW1 — never north into the plank wall.
+                Vector3 push = new Vector3(gw1.x - p.x, 0f, gw1.z - p.z);
+                if (push.sqrMagnitude < 0.01f)
                     push = Vector3.right;
                 Debug.Log(
                     $"[SSPos] water_gap_recover user={Username} " +
-                    $"pos=({p.x:F2},{p.z:F2}) → mouth around");
+                    $"pos=({p.x:F2},{p.z:F2}) → east through gap");
+                if (TryChopBlockingTree(push))
+                {
+                    _waterStuckSince = Time.time;
+                    return;
+                }
                 TrySafeNudge(push.normalized * 2.0f, 2.0f, waterEscape: true);
                 _waterStuckSince = Time.time;
             }
@@ -1732,13 +2063,20 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
             return;
         }
 
+        // Committed / east of mouth: follow corridor waypoints (GW1→GW2→pond).
+        if (_waterGapCommitted && WestOfWaterFence(p) && p.x < 14.6f)
+        {
+            // Fell back west of gap — re-aim mouth then recommit.
+            _waterGapCommitted = false;
+        }
+
         const float waterArrive = 1.15f;
         Vector3 wp = _waterRoute[_waterWpIndex];
+        // CRITICAL: SetTargetMeta overwrites _target — pass the waypoint, not pond stand.
+        // Old bug: meta(stand) made agent aim (19,29) through the fence and stick at gap.
+        string wpId = WaterWaypointId(wp, stand);
+        SetTargetMeta("water_source", wpId, wp, stand);
         _target = wp;
-        if (regW != null)
-            SetTargetMeta("water_source", regW.Id, stand, regW.Position);
-        else
-            SetTargetMeta("water_source", "gap_gw1", wp, stand);
 
         if (_waterStuckSince < 0f)
         {
@@ -1756,8 +2094,14 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
             StreamingSurvivalTrajectoryRecorder.Instance?.EmitEvent(
                 Username, "stuck_detected", this);
             _waterStuckTries++;
+            Vector3 toWp = wp - p;
+            if (TryChopBlockingTree(toWp))
+            {
+                _waterStuckSince = Time.time;
+                return;
+            }
             if (_waterStuckTries <= 3
-                && TrySafeNudge(wp - p, 2.0f, waterEscape: true))
+                && TrySafeNudge(toWp, 2.0f, waterEscape: true))
             {
                 _waterStuckSince = Time.time - 0.4f;
                 return;

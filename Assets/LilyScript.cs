@@ -2273,6 +2273,8 @@ public class LilyScript : Agent, IHasHp
             float d = HarvestReachDistance(origin, c);
             if (d > eatDistance) continue;
             GameObject root = GetSheepInstanceRoot(c);
+            if (root != null && root.GetComponentInParent<ViewerSimpleAgent>() != null)
+                continue;
             if (d < bestDist)
             {
                 bestDist = d;

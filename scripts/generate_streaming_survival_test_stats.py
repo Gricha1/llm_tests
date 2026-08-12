@@ -659,6 +659,7 @@ def build_stats(run_dir: Path) -> Dict[str, Any]:
                 "username": a.get("username"),
                 "command": cmd,
                 "plan": parsed_actions,
+                "parsed_plan": plan if isinstance(plan, list) else [],
                 "total_samples": tm["total_samples"],
                 "duration_seconds": tm["duration_seconds"],
                 "max_position_jump": round(max(jumps) if jumps else float(a.get("max_position_jump") or 0), 3),
@@ -1814,7 +1815,14 @@ def _merged_fence_rects(
     return _fence_rects(fences)
 
 
-def _plot_landmarks(ax, landmarks: Dict[str, Any], *, annotate: bool = True) -> List[Any]:
+def _plot_landmarks(
+    ax,
+    landmarks: Dict[str, Any],
+    *,
+    annotate: bool = True,
+    path_points: Optional[Sequence[Tuple[float, float]]] = None,
+    fit_axes: bool = True,
+) -> List[Any]:
     """Draw world objects/fences; return legend handles."""
     handles = []
     seen_types = set()
@@ -1918,28 +1926,92 @@ def _plot_landmarks(ax, landmarks: Dict[str, Any], *, annotate: bool = True) -> 
         from matplotlib.patches import Patch
 
         handles.append(Patch(facecolor="#c4a484", edgecolor="#8B4513", label="забор"))
-    _fit_axes_to_world(ax, landmarks)
+    if fit_axes:
+        _fit_axes_to_world(ax, landmarks, path_points=path_points)
     return handles
 
 
-def _fit_axes_to_world(ax, landmarks: Dict[str, Any]) -> None:
-    """Patches often don't expand dataLim — force full yard+pond fence into view."""
+def _fit_axes_to_world(
+    ax,
+    landmarks: Dict[str, Any],
+    path_points: Optional[Sequence[Tuple[float, float]]] = None,
+) -> None:
+    """Frame yard + agent paths. Ignore far sheep/zombies that pull the camera away."""
     xs: List[float] = []
     zs: List[float] = []
+    if path_points:
+        for pt in path_points:
+            try:
+                xs.append(float(pt[0]))
+                zs.append(float(pt[1]))
+            except (TypeError, ValueError, IndexError):
+                continue
+
+    key_types = {
+        "home",
+        "home_interaction_point",
+        "campfire",
+        "campfire_slot",
+        "tree",
+        "water_source",
+        "spawn",
+        "stone",
+    }
+    skip_types = {"sheep", "zombie", "flower"}
+    obj_pts: List[Tuple[float, float, str]] = []
     for o in landmarks.get("objects") or []:
         if not isinstance(o, dict):
             continue
         try:
-            xs.append(float(o.get("x") or 0))
-            zs.append(float(o.get("z") or 0))
+            x = float(o.get("x") or 0)
+            z = float(o.get("z") or 0)
         except (TypeError, ValueError):
             continue
+        t = str(o.get("type") or o.get("kind") or "").lower()
+        if t in skip_types:
+            continue
+        obj_pts.append((x, z, t))
+
     for x0, z0, w, h in _fence_rects(landmarks.get("fences") or []):
         xs.extend([x0, x0 + w])
         zs.extend([z0, z0 + h])
+
+    core_xs = list(xs)
+    core_zs = list(zs)
+    for x, z, t in obj_pts:
+        if t in key_types:
+            core_xs.append(x)
+            core_zs.append(z)
+            xs.append(x)
+            zs.append(z)
+
+    if core_xs and core_zs:
+        cx = sorted(core_xs)[len(core_xs) // 2]
+        cz = sorted(core_zs)[len(core_zs) // 2]
+        # Keep extra landmarks only near the play area / path.
+        radius = 40.0
+        if path_points and len(path_points) >= 2:
+            try:
+                px = [float(p[0]) for p in path_points]
+                pz = [float(p[1]) for p in path_points]
+                span = max(max(px) - min(px), max(pz) - min(pz))
+                radius = max(40.0, span * 0.75 + 12.0)
+            except Exception:
+                pass
+        for x, z, t in obj_pts:
+            if t in key_types:
+                continue
+            if (x - cx) * (x - cx) + (z - cz) * (z - cz) <= radius * radius:
+                xs.append(x)
+                zs.append(z)
+    else:
+        for x, z, _t in obj_pts:
+            xs.append(x)
+            zs.append(z)
+
     if not xs or not zs:
         return
-    pad = 2.0
+    pad = 2.5
     ax.set_xlim(min(xs) - pad, max(xs) + pad)
     ax.set_ylim(min(zs) - pad, max(zs) + pad)
 
@@ -1976,7 +2048,10 @@ def _render_xz_charts(
     # --- Overview: color = agent/user (decluttered for 40-attempt runs) ---
     fig, ax = plt.subplots(figsize=(12, 10))
     # Many paths: no per-tree coordinate spam — only icons + fences.
-    lm_handles = _plot_landmarks(ax, landmarks, annotate=not busy)
+    all_xz: List[Tuple[float, float]] = [pt for _a, path_xz, _s in all_paths for pt in path_xz]
+    lm_handles = _plot_landmarks(
+        ax, landmarks, annotate=not busy, path_points=all_xz, fit_axes=False
+    )
     user_handles = {}
     # Last finish per user → one small nick label (not every attempt).
     last_finish: Dict[str, Tuple[float, float]] = {}
@@ -2057,6 +2132,7 @@ def _render_xz_charts(
             bbox=dict(boxstyle="round,pad=0.15", fc=color, alpha=0.75, ec="black", lw=0.6),
         )
 
+    _fit_axes_to_world(ax, landmarks, path_points=all_xz)
     ax.set_xlabel("X (м)")
     ax.set_ylabel("Z (м)")
     ax.set_title(
@@ -2064,7 +2140,7 @@ def _render_xz_charts(
         "цвет линии = агент · S=старт · F=финиш"
     )
     ax.grid(alpha=0.3)
-    ax.set_aspect("equal", adjustable="datalim")
+    ax.set_aspect("equal", adjustable="box")
     leg1 = ax.legend(
         handles=list(user_handles.values()),
         labels=[f"{u}" for u in user_handles],
@@ -2087,12 +2163,13 @@ def _render_xz_charts(
         fig, axes = plt.subplots(rows, cols, figsize=(4.8 * cols, 4.2 * rows), squeeze=False)
         for i, user in enumerate(users):
             ax = axes[i // cols][i % cols]
-            _plot_landmarks(ax, landmarks, annotate=False)
             paths_u = [
                 (aid, path_xz, samples)
                 for aid, path_xz, samples in all_paths
                 if _path_username(aid, samples, traj_rows) == user and len(path_xz) >= 1
             ]
+            pts_u = [pt for _a, path_xz, _s in paths_u for pt in path_xz]
+            _plot_landmarks(ax, landmarks, annotate=False, path_points=pts_u, fit_axes=False)
             col = user_color.get(user, _USER_COLORS[0])
             for j, (aid, path_xz, samples) in enumerate(paths_u):
                 xs = [p[0] for p in path_xz]
@@ -2123,8 +2200,9 @@ def _render_xz_charts(
                     zorder=6,
                     bbox=dict(boxstyle="circle,pad=0.12", fc="white", ec=col, lw=0.8, alpha=0.9),
                 )
+            _fit_axes_to_world(ax, landmarks, path_points=pts_u)
             ax.set_title(f"{user} · {len(paths_u)} путей", fontsize=10, fontweight="bold", color=col)
-            ax.set_aspect("equal", adjustable="datalim")
+            ax.set_aspect("equal", adjustable="box")
             ax.grid(alpha=0.25)
         for k in range(len(users), rows * cols):
             axes[k // cols][k % cols].axis("off")
@@ -2136,27 +2214,86 @@ def _render_xz_charts(
 
     # --- One panel per attempt, labeled with the task/command ---
     if all_paths:
+        from matplotlib.lines import Line2D
+
+        action_colors = {
+            "go_to_water": "#1f77b4",
+            "collect_water": "#17becf",
+            "go_to_campfire": "#ff7f0e",
+            "build_campfire": "#ff7f0e",
+            "go_home": "#e377c2",
+            "collect_wood": "#2ca02c",
+            "collect_food": "#98df8a",
+            "collect_stone": "#7f7f7f",
+            "idle": "#c7c7c7",
+        }
         cmd_by_aid: Dict[str, str] = {}
+        plan_by_aid: Dict[str, List[Any]] = {}
         for r in traj_rows:
-            aid = str(r.get("attempt_id") or "")
-            if aid and aid not in cmd_by_aid:
-                cmd_by_aid[aid] = str(r.get("command") or r.get("raw_command") or "")
+            aid0 = str(r.get("attempt_id") or "")
+            if not aid0:
+                continue
+            if aid0 not in cmd_by_aid:
+                cmd_by_aid[aid0] = str(r.get("command") or r.get("raw_command") or "")
+            if aid0 not in plan_by_aid:
+                pl = r.get("parsed_plan")
+                if isinstance(pl, list) and pl:
+                    plan_by_aid[aid0] = pl
+                else:
+                    try:
+                        plan_by_aid[aid0] = json.loads(str(r.get("parsed_plan_json") or "[]"))
+                    except Exception:
+                        plan_by_aid[aid0] = []
         n = len(all_paths)
         cols = 2 if n > 1 else 1
         rows = math.ceil(n / cols)
-        fig_w = 5.6 * cols
-        fig_h = min(5.2 * rows, 56.0)
+        fig_w = 6.4 * cols
+        fig_h = min(6.0 * rows, 60.0)
         fig, axes = plt.subplots(rows, cols, figsize=(fig_w, fig_h), squeeze=False)
         for i, (aid, path_xz, samples) in enumerate(all_paths):
             ax = axes[i // cols][i % cols]
-            _plot_landmarks(ax, landmarks, annotate=False)
+            _plot_landmarks(ax, landmarks, annotate=False, path_points=path_xz, fit_axes=False)
             user = _path_username(aid, samples, traj_rows)
             col = user_color.get(user, _USER_COLORS[i % len(_USER_COLORS)])
             xs = [p[0] for p in path_xz]
             zs = [p[1] for p in path_xz]
             span = max(max(xs) - min(xs), max(zs) - min(zs)) if xs else 0.0
-            if len(path_xz) >= 2 and span >= 0.35:
+            segs: List[Tuple[str, List[float], List[float]]] = []
+            cur_a = ""
+            cur_xs: List[float] = []
+            cur_zs: List[float] = []
+            for s in samples:
+                p = _pos(s)
+                if not p:
+                    continue
+                a = str(s.get("action") or s.get("current_action") or "idle").lower()
+                if a != cur_a and cur_xs:
+                    segs.append((cur_a, cur_xs, cur_zs))
+                    cur_xs = [cur_xs[-1]]
+                    cur_zs = [cur_zs[-1]]
+                cur_a = a
+                cur_xs.append(p[0])
+                cur_zs.append(p[2])
+            if cur_xs:
+                segs.append((cur_a, cur_xs, cur_zs))
+            seen_act: set[str] = set()
+            if segs:
+                for a, sx, sz in segs:
+                    if len(sx) < 2:
+                        continue
+                    ax.plot(
+                        sx,
+                        sz,
+                        color=action_colors.get(a, col),
+                        alpha=0.92,
+                        linewidth=2.6,
+                        zorder=5,
+                        solid_capstyle="round",
+                    )
+                    seen_act.add(a)
+            elif len(path_xz) >= 2 and span >= 0.35:
                 ax.plot(xs, zs, color=col, alpha=0.9, linewidth=2.4, zorder=5)
+
             ax.annotate(
                 "S", (xs[0], zs[0]), ha="center", va="center", fontsize=8, fontweight="bold",
                 color="#0a7a0a", zorder=6,
@@ -2167,23 +2304,66 @@ def _render_xz_charts(
                 color="#a00000", zorder=6,
                 bbox=dict(boxstyle="circle,pad=0.12", fc="white", ec=col, lw=0.8, alpha=0.9),
             )
+            _fit_axes_to_world(ax, landmarks, path_points=path_xz)
+
             cmd = cmd_by_aid.get(aid) or ""
             if not cmd:
                 for s in samples:
                     if s.get("command"):
                         cmd = str(s.get("command"))
                         break
-            # Full task text — never truncate; wrap so the whole #do is readable.
-            title_cmd = cmd.replace("#do ", "").strip() or aid
-            wrapped = textwrap.fill(title_cmd, width=52)
-            ax.set_title(f"{aid}\n{wrapped}", fontsize=7.5, fontweight="bold", loc="left", pad=8)
-            ax.set_aspect("equal", adjustable="datalim")
+            plan = plan_by_aid.get(aid) or []
+            # Legend = plan steps in order (color ↔ задача). Fallback to seen actions.
+            legend_items: List[Tuple[str, str]] = []
+            if isinstance(plan, list) and plan:
+                for si, step in enumerate(plan, start=1):
+                    if not isinstance(step, dict):
+                        continue
+                    act = str(step.get("action") or "").lower()
+                    if not act:
+                        continue
+                    cnt = int(step.get("count") or step.get("amount") or 1)
+                    name = _ACTION_NAMES_RU.get(act, act)
+                    label = f"{si}. {name}" + (f" ×{cnt}" if cnt > 1 else "")
+                    legend_items.append((act, label))
+            if not legend_items:
+                for a in segs:
+                    act = a[0]
+                    if act and all(act != x[0] for x in legend_items):
+                        legend_items.append((act, _ACTION_NAMES_RU.get(act, act)))
+
+            handles = [
+                Line2D([0], [0], color=action_colors.get(act, col), lw=3.0, label=lab)
+                for act, lab in legend_items
+            ]
+            if handles:
+                ax.legend(
+                    handles=handles,
+                    loc="lower left",
+                    fontsize=7.5,
+                    title="цвет линии = шаг #do",
+                    framealpha=0.95,
+                    borderpad=0.4,
+                )
+
+            prompt = (cmd or "").strip() or "(нет #do)"
+            steps_txt = " → ".join(lab for _a, lab in legend_items) if legend_items else "—"
+            title = (
+                f"{aid}\n"
+                f"Промпт: {textwrap.fill(prompt, width=58)}\n"
+                f"Задачи: {textwrap.fill(steps_txt, width=58)}"
+            )
+            ax.set_title(title, fontsize=7.2, fontweight="bold", loc="left", pad=10)
+            ax.set_aspect("equal", adjustable="box")
             ax.grid(alpha=0.25)
         for k in range(n, rows * cols):
             axes[k // cols][k % cols].axis("off")
-        fig.suptitle("Траектории по задачам (каждая попытка · S/F)", fontsize=12)
-        # Leave room for multi-line full task titles.
-        fig.tight_layout(rect=(0, 0, 1, 0.97), h_pad=1.6)
+        fig.suptitle(
+            "Траектории по задачам (1 панель = 1 попытка · S=старт · F=финиш)\n"
+            "Разный цвет = разный шаг исходного #do (см. легенду и список задач)",
+            fontsize=11,
+        )
+        fig.tight_layout(rect=(0, 0, 1, 0.94), h_pad=2.0)
         fig.savefig(charts_dir / "trajectory_xz_by_attempt.png", dpi=130)
         plt.close(fig)
         out.append("trajectory_xz_by_attempt.png")

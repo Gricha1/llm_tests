@@ -9,6 +9,8 @@ public sealed class PresentationManualHud : MonoBehaviour
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
     static void Bootstrap()
     {
+        if (TrainingEnvSpace.IsStreamingSurvivalMode)
+            return;
         if (Object.FindFirstObjectByType<PresentationManualHud>() != null)
             return;
         var go = new GameObject(nameof(PresentationManualHud));
@@ -18,12 +20,16 @@ public sealed class PresentationManualHud : MonoBehaviour
 
     void Update()
     {
+        if (TrainingEnvSpace.IsStreamingSurvivalMode)
+            return;
         if (Input.GetKeyDown(KeyCode.M))
             ManualPlayControl.TogglePresentationManual();
     }
 
     void OnGUI()
     {
+        if (TrainingEnvSpace.IsStreamingSurvivalMode)
+            return;
         const float w = 220f;
         const float h = 36f;
         float x = Screen.width - w - 16f;
