@@ -27,7 +27,7 @@ public sealed class StreamingSurvivalTrajectoryRecorder : MonoBehaviour
 
     bool _liveTick;
     string _liveUser;
-    float _nextLiveTick;
+    float _nextLiveTickUnscaled;
 
     void Awake()
     {
@@ -99,7 +99,7 @@ public sealed class StreamingSurvivalTrajectoryRecorder : MonoBehaviour
         BeginScenario(attemptId, username);
         _liveTick = true;
         _liveUser = username ?? "";
-        _nextLiveTick = 0f;
+        _nextLiveTickUnscaled = 0f;
         var ctrl = StreamingSurvivalController.Instance;
         var p = ctrl != null ? ctrl.GetPlayer(username) : null;
         if (p != null)
@@ -130,9 +130,11 @@ public sealed class StreamingSurvivalTrajectoryRecorder : MonoBehaviour
     {
         if (!_liveTick || _writer == null || string.IsNullOrEmpty(_liveUser))
             return;
-        if (Time.time < _nextLiveTick)
+        // Wall-clock cadence: under Time.timeScale>1, game-time ticks would skip
+        // and look like teleports to the continuity checker.
+        if (Time.unscaledTime < _nextLiveTickUnscaled)
             return;
-        _nextLiveTick = Time.time + 0.25f;
+        _nextLiveTickUnscaled = Time.unscaledTime + 0.25f;
         var ctrl = StreamingSurvivalController.Instance;
         var p = ctrl != null ? ctrl.GetPlayer(_liveUser) : null;
         if (p != null)

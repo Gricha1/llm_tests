@@ -243,7 +243,10 @@ def check_trajectory(
     if not no_credit:
         _check_initial_direction(r, samples)
     jump_limit = float(scenario.get("max_allowed_position_jump") or MAX_ALLOWED_POSITION_JUMP)
-    _check_continuity(r, samples, sid, max_jump_limit=jump_limit)
+    speed_limit = float(scenario.get("max_allowed_speed") or MAX_ALLOWED_SPEED)
+    _check_continuity(
+        r, samples, sid, max_jump_limit=jump_limit, max_speed_limit=speed_limit
+    )
     _check_ground(r, samples)
     if not no_credit and (
         expect_type == "water_source"
@@ -401,11 +404,13 @@ def _check_continuity(
     sid: str,
     *,
     max_jump_limit: float = MAX_ALLOWED_POSITION_JUMP,
+    max_speed_limit: float = MAX_ALLOWED_SPEED,
 ) -> None:
     max_jump = 0.0
     max_speed = 0.0
     min_dt = 0.08
     jump_lim = float(max_jump_limit) if max_jump_limit and max_jump_limit > 0 else MAX_ALLOWED_POSITION_JUMP
+    speed_lim = float(max_speed_limit) if max_speed_limit and max_speed_limit > 0 else MAX_ALLOWED_SPEED
     strict = _is_strict(sid)
     prev = None
     for s in samples:
@@ -464,7 +469,7 @@ def _check_continuity(
                 "max_jump exceeded"
                 + (" (stuck_recovery not allowed)" if forbidden_nearby else ""),
             )
-        elif jump > (MAX_STUCK_NUDGE_JUMP + 0.05) and speed > MAX_ALLOWED_SPEED and not setup_nearby:
+        elif jump > (MAX_STUCK_NUDGE_JUMP + 0.05) and speed > speed_lim and not setup_nearby:
             r.fail(
                 "continuity",
                 "Illegal teleport detected: "

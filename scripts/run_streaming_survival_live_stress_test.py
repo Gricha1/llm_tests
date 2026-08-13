@@ -25,7 +25,11 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from stream_bot.ss_trajectory_checker import MAX_ALLOWED_POSITION_JUMP, check_trajectory
+from stream_bot.ss_trajectory_checker import (
+    MAX_ALLOWED_POSITION_JUMP,
+    MAX_ALLOWED_SPEED,
+    check_trajectory,
+)
 from stream_bot.validator import plan_from_payload
 
 ARTIFACTS = ROOT / "artifacts" / "streaming_survival" / "test_runs"
@@ -665,9 +669,10 @@ def run_stress(
                 continue
 
         sc = _scenario_for_family(fam, cmd, plan)
-        # ×N Live Stress: larger per-sample steps are expected (timeScale), not teleports.
+        # ×N Live Stress: allow larger per-sample step/speed until denser sampling is enough.
         if scale > 1.01:
             sc["max_allowed_position_jump"] = MAX_ALLOWED_POSITION_JUMP * scale
+            sc["max_allowed_speed"] = MAX_ALLOWED_SPEED * scale
         # Join must stay idle — no collect actions
         if cmd.strip() == "#join":
             sc = {
