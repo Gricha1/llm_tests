@@ -596,6 +596,8 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
     float _homeStuckSince = -1f;
     Vector3 _homeStuckPos;
     int _homeStuckTries;
+    float _woodStuckSince = -1f;
+    Vector3 _woodStuckPos;
 
     // move demos
     string _demoKind;
@@ -612,6 +614,7 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
         _phaseEnteredAt = Time.time;
         _hasLockedWorkTarget = false;
         _waterStuckSince = -1f;
+        _woodStuckSince = -1f;
         _homeStuckSince = -1f;
         _homeStuckTries = 0;
 
@@ -886,6 +889,39 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
                     _hasLockedWorkTarget = false;
                     _phaseEnteredAt = Time.time;
                     break;
+                }
+                if (Action == "collect_wood")
+                {
+                    Vector3 pWood = transform.position;
+                    if (_woodStuckSince < 0f)
+                    {
+                        _woodStuckSince = Time.time;
+                        _woodStuckPos = pWood;
+                    }
+                    else if (Horiz(pWood, _woodStuckPos) > 0.4f)
+                    {
+                        _woodStuckSince = Time.time;
+                        _woodStuckPos = pWood;
+                    }
+                    if (Time.time - _woodStuckSince > 1.35f)
+                    {
+                        Vector3 toTree = _target - pWood;
+                        StreamingSurvivalTrajectoryRecorder.Instance?.EmitEvent(
+                            Username, "stuck_detected", this);
+                        // Не удаляем ствол «мимо счёта» — переключаемся на ближайшее
+                        // дерево и рубим обычным collect_wood (work + wood в инвентарь).
+                        if (TryRetargetWoodToNearestTree(toTree))
+                        {
+                            _woodStuckSince = Time.time;
+                            if (TryBeginWorkAtResource(ctrl))
+                                break;
+                            break;
+                        }
+                        TrySafeNudge(toTree, 1.5f);
+                        _hasLockedWorkTarget = false;
+                        _woodStuckSince = Time.time;
+                        break;
+                    }
                 }
                 MoveToward(_target);
                 break;
@@ -1213,6 +1249,7 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
         _hasLockedWorkTarget = true;
         _target = _lockedWorkTarget;
         _phaseEnteredAt = Time.time;
+        _woodStuckSince = -1f;
     }
 
     void LateUpdate()
@@ -1370,8 +1407,47 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
     }
 
     /// <summary>
-    /// Clear a tree that blocks movement (e.g. after wood step, forest refill).
-    /// Does not credit inventory — pathing only.
+    /// Stuck on collect_wood: take nearest live tree as the next chop target
+    /// (normal Work → ChopTreeVictim → wood credit). No silent Destroy.
+    /// </summary>
+    bool TryRetargetWoodToNearestTree(Vector3 preferDir)
+    {
+        var spawner = TrainingEnvSpace.FindInPresentation<TreeSpawner>()
+            ?? Object.FindFirstObjectByType<TreeSpawner>();
+        if (spawner == null)
+            return false;
+        if (!spawner.TryGetNearestAliveTree(transform.position, out GameObject tree, out Vector3 treePos))
+            return false;
+        float d = Horiz(transform.position, treePos);
+        if (d > 3.5f)
+            return false;
+        Vector3 toTree = treePos - transform.position;
+        toTree.y = 0f;
+        preferDir.y = 0f;
+        if (preferDir.sqrMagnitude > 0.01f && d > 1.75f)
+        {
+            float dot = Vector3.Dot(preferDir.normalized, toTree.normalized);
+            if (dot < -0.15f)
+                return false;
+        }
+        Vector3 stand = ApproachStand(transform.position, treePos, 1.35f);
+        _treeVictim = tree;
+        SetTargetMeta("tree", "tree_live", stand, treePos);
+        _lockedWorkTarget = stand;
+        _hasLockedWorkTarget = true;
+        _target = stand;
+        _phaseEnteredAt = Time.time;
+        ReachedResourceFlag = false;
+        WorkStartedNearTarget = false;
+        CollectState = StreamingSurvivalResourceGuard.CollectState.MovingToResource;
+        Debug.Log(
+            $"[SSPos] wood_stuck_retarget user={Username} tree=({treePos.x:F2},{treePos.z:F2}) d={d:F2} " +
+            $"pos=({transform.position.x:F2},{transform.position.z:F2})");
+        return true;
+    }
+
+    /// <summary>
+    /// Clear a tree that blocks movement on water/home routes (not collect_wood credit).
     /// </summary>
     bool TryChopBlockingTree(Vector3 preferDir)
     {

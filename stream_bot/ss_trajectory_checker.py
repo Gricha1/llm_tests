@@ -242,7 +242,8 @@ def check_trajectory(
 
     if not no_credit:
         _check_initial_direction(r, samples)
-    _check_continuity(r, samples, sid)
+    jump_limit = float(scenario.get("max_allowed_position_jump") or MAX_ALLOWED_POSITION_JUMP)
+    _check_continuity(r, samples, sid, max_jump_limit=jump_limit)
     _check_ground(r, samples)
     if not no_credit and (
         expect_type == "water_source"
@@ -394,10 +395,17 @@ def _check_forbidden_teleports(r: CheckResult, samples: List[Dict[str, Any]], si
         )
 
 
-def _check_continuity(r: CheckResult, samples: List[Dict[str, Any]], sid: str) -> None:
+def _check_continuity(
+    r: CheckResult,
+    samples: List[Dict[str, Any]],
+    sid: str,
+    *,
+    max_jump_limit: float = MAX_ALLOWED_POSITION_JUMP,
+) -> None:
     max_jump = 0.0
     max_speed = 0.0
     min_dt = 0.08
+    jump_lim = float(max_jump_limit) if max_jump_limit and max_jump_limit > 0 else MAX_ALLOWED_POSITION_JUMP
     strict = _is_strict(sid)
     prev = None
     for s in samples:
@@ -420,7 +428,7 @@ def _check_continuity(r: CheckResult, samples: List[Dict[str, Any]], sid: str) -
         forbidden_nearby = _nearby_event(samples, t0, t1, _FORBIDDEN_NORMAL_EVENTS)
 
         if raw_dt < min_dt:
-            if jump > MAX_ALLOWED_POSITION_JUMP and not setup_nearby:
+            if jump > jump_lim and not setup_nearby:
                 r.fail(
                     "continuity",
                     "Illegal teleport detected: "
@@ -446,8 +454,8 @@ def _check_continuity(r: CheckResult, samples: List[Dict[str, Any]], sid: str) -
         speed = jump / raw_dt
         max_speed = max(max_speed, speed)
 
-        # Hard rule: jump > MAX is FAIL even if stuck_recovery event is nearby.
-        if jump > MAX_ALLOWED_POSITION_JUMP and not setup_nearby:
+        # Hard rule: jump > limit is FAIL even if stuck_recovery event is nearby.
+        if jump > jump_lim and not setup_nearby:
             r.fail(
                 "continuity",
                 "Illegal teleport detected: "
@@ -472,10 +480,10 @@ def _check_continuity(r: CheckResult, samples: List[Dict[str, Any]], sid: str) -
     if strict:
         _check_forbidden_teleports(r, samples, sid)
 
-    if strict and max_jump > MAX_ALLOWED_POSITION_JUMP:
+    if strict and max_jump > jump_lim:
         msg = (
             f"max_position_jump={max_jump:.3f} exceeds "
-            f"MAX_ALLOWED_POSITION_JUMP={MAX_ALLOWED_POSITION_JUMP:.1f}"
+            f"MAX_ALLOWED_POSITION_JUMP={jump_lim:.1f}"
         )
         if msg not in r.illegal_teleports:
             r.fail("continuity", msg)

@@ -782,6 +782,12 @@ def main() -> int:
         default=40,
         help="Live stress attempt count (default 40)",
     )
+    ap.add_argument(
+        "--time-scale",
+        type=float,
+        default=1.0,
+        help="Unity Time.timeScale for live-stress only (1=normal, 3=faster). Restored after run.",
+    )
     # legacy aliases
     ap.add_argument("--require-runtime", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--send-runtime", action="store_true", help=argparse.SUPPRESS)
@@ -1051,6 +1057,7 @@ def main() -> int:
             args.unity_port,
             args.attempts,
             run_id,
+            getattr(args, "time_scale", 1.0) or 1.0,
         )
         summary["live_stress_status"] = live.get("overall", "FAIL")
         summary["live_stress"] = live
@@ -1209,6 +1216,7 @@ def _invoke_live_stress(
     unity_port: int,
     attempts: int,
     run_id: str,
+    time_scale: float = 1.0,
 ) -> Dict[str, Any]:
     script = ROOT / "scripts" / "run_streaming_survival_live_stress_test.py"
     if not script.is_file():
@@ -1225,6 +1233,8 @@ def _invoke_live_stress(
             str(unity_port),
             "--attempts",
             str(attempts),
+            "--time-scale",
+            str(time_scale),
             "--run-dir",
             str(run_dir),
             "--run-id",
@@ -1257,13 +1267,17 @@ def _run_live_stress_only(args: argparse.Namespace) -> int:
     (run_dir / "logs").mkdir(parents=True, exist_ok=True)
     (run_dir / "trajectories").mkdir(parents=True, exist_ok=True)
     os.environ["STREAMING_SURVIVAL_TEST_ARTIFACTS_DIR"] = str(run_dir.resolve())
-    print(f"[checks] live-stress-only run_dir={run_dir} attempts={args.attempts}")
+    print(
+        f"[checks] live-stress-only run_dir={run_dir} attempts={args.attempts} "
+        f"time_scale={getattr(args, 'time_scale', 1.0)}"
+    )
     # Mark RUNNING immediately so UI history shows the run before first result.json.
     (run_dir / "live_stress_running.json").write_text(
         json.dumps(
             {
                 "status": "RUNNING",
                 "attempts": int(args.attempts),
+                "time_scale": float(getattr(args, "time_scale", 1.0) or 1.0),
                 "started_at": time.time(),
                 "run_id": run_id,
             },
@@ -1315,7 +1329,13 @@ def _run_live_stress_only(args: argparse.Namespace) -> int:
         print(json.dumps(summary, ensure_ascii=False, indent=2))
         return 1
     live = _invoke_live_stress(
-        run_dir, args.bot_url, args.unity_host, args.unity_port, args.attempts, run_id
+        run_dir,
+        args.bot_url,
+        args.unity_host,
+        args.unity_port,
+        args.attempts,
+        run_id,
+        getattr(args, "time_scale", 1.0) or 1.0,
     )
     stats_status = live.get("stats_dashboard_status") or "NOT_RUN"
     if (run_dir / "stats" / "stats_summary.json").is_file():

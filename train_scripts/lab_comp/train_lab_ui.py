@@ -2071,6 +2071,36 @@ def _ss_run_duration_sec(run: Path, live: dict[str, Any]) -> float | None:
     return None
 
 
+def _ss_short_fail_reason(reason: str, max_len: int = 64) -> str:
+    """Compact fail text for the run list (no teleport spam / huge wrap)."""
+    r = str(reason or "").strip()
+    if not r:
+        return ""
+    parts = [p.strip() for p in r.split("|") if p.strip()]
+    kept: list[str] = []
+    n_tele = 0
+    for p in parts:
+        pl = p.lower()
+        if "illegal teleport" in pl or "max_jump exceeded" in pl:
+            n_tele += 1
+            continue
+        # Hide noisy resource checker wording from the list row.
+        if "delta=" in pl or "gained=" in pl or "need>=" in pl:
+            # Keep a short token once.
+            if "wood" in pl and "wood" not in " ".join(kept).lower():
+                kept.append("wood")
+            elif "water" in pl and "water" not in " ".join(kept).lower():
+                kept.append("water")
+            continue
+        kept.append(p)
+    if n_tele:
+        kept.append(f"teleport×{n_tele}" if n_tele > 1 else "teleport")
+    s = " · ".join(kept) if kept else r
+    if len(s) > max_len:
+        return s[: max_len - 1] + "…"
+    return s
+
+
 def _ss_extract_fail_reason(summary: dict[str, Any], live: dict[str, Any] | None = None) -> str:
     """Human reason for ERROR row: top-level or first failed attempt."""
     live = live or {}
@@ -2325,8 +2355,8 @@ def _ss_run_meta(run: Path) -> dict[str, Any]:
     else:
         title = str(mode)
     status_show = live_st if (has_live or in_progress or unfinished or early_fail) else overall
-    if status_show in ("Failed", "Error", "FAIL", "ERROR") and summary_reason:
-        status_show = f"{('Error' if status_show in ('Error', 'ERROR') else 'Failed')} · {summary_reason}"
+    # List row: keep status short. Full reason stays in "reason" for details/tooltip.
+    short_reason = _ss_short_fail_reason(summary_reason)
     parser_fail = stats.get("parser_failures")
     if parser_fail is None:
         parser_fail = live.get("parser_failures")
@@ -2339,12 +2369,15 @@ def _ss_run_meta(run: Path) -> dict[str, Any]:
     elif unfinished:
         score_line = f"обрыв {done_attempts}/{attempts_n or '?'}"
     elif early_fail or (has_live and str(live_st) in ("Failed", "Error")):
-        score_line = summary_reason or str(live_st)
+        if attempts_n:
+            score_line = f"{int(attempts_passed or 0)}/{attempts_n}"
+        else:
+            score_line = short_reason or str(live_st)
     elif has_live and attempts_passed is not None and attempts_failed is not None:
         if str(live_st) == "Success":
             score_line = f"Success · {duration_label}"
         else:
-            score_line = f"PASS {attempts_passed} · FAIL {attempts_failed} · {duration_label}"
+            score_line = f"{attempts_passed}/{attempts_n or (attempts_passed + attempts_failed)} · {duration_label}"
     else:
         score_line = duration_label if duration_label != "—" else ""
     subtitle_bits = []
@@ -2360,8 +2393,8 @@ def _ss_run_meta(run: Path) -> dict[str, Any]:
         subtitle_bits.append("идёт")
     elif unfinished:
         subtitle_bits.append("не завершён")
-    elif early_fail and summary_reason:
-        subtitle_bits.append(summary_reason)
+    elif early_fail and short_reason:
+        subtitle_bits.append(short_reason)
     subtitle = " · ".join(subtitle_bits) if subtitle_bits else run.name
     label = f"{title} · {status_show} · {score_line} · {when}"
     try:
@@ -2660,16 +2693,29 @@ def run_ss_diagnostics(kind: str, run_id: str | None = None) -> dict[str, Any]:
             "log": (proc.stdout or "") + "\n" + (proc.stderr or ""),
         }
 
-    if kind in ("live_stress", "live_stress_40", "live_stress_1"):
-        attempts = "1" if kind == "live_stress_1" else "40"
-        eta = "~1–3 мин" if attempts == "1" else "20–45 минут"
+    if kind in (
+        "live_stress",
+        "live_stress_40",
+        "live_stress_1",
+        "live_stress_1_fast",
+        "live_stress_40_fast",
+    ):
+        attempts = "1" if "1" in kind else "40"
+        fast = kind.endswith("_fast")
+        scale = "3" if fast else "1"
+        eta = (
+            ("~20–40 сек" if attempts == "1" else "~7–15 мин")
+            if fast
+            else ("~1–3 мин" if attempts == "1" else "20–45 минут")
+        )
+        tag = f"{attempts}_x{scale}" if fast else attempts
         where = "lab_comp" if not ui_runs_on_lab() else "локально"
         return _start_ss_checks_async(
-            f"ss_live_stress_{attempts}",
-            f"fui_ss_live_stress_{attempts}",
-            f"--live-stress --attempts {attempts}",
+            f"ss_live_stress_{tag}",
+            f"fui_ss_live_stress_{tag}",
+            f"--live-stress --attempts {attempts} --time-scale {scale}",
             eta_hint=eta,
-            log_intro=f"Live Stress {attempts} на {where}",
+            log_intro=f"Live Stress {attempts} (×{scale}) на {where}",
         )
 
     if kind in ("full_runtime_async",):
@@ -3572,8 +3618,10 @@ button.george { border-color: #3d6b52; }
     <section class="card" id="card-ss-diagnostics">
       <h2>Streaming Survival Diagnostics</h2>
       <div class="btns" style="flex-wrap:wrap;gap:6px">
-        <button type="button" class="primary" id="btnSsDiagLiveStress1" title="~1–3 мин, 1 live #do">Live Stress 1 (быстрый)</button>
-        <button type="button" id="btnSsDiagLiveStress" title="~20–45 мин, 40 live #do">Live Stress 40</button>
+        <button type="button" class="primary" id="btnSsDiagLiveStress1" title="~1–3 мин, 1 live #do, обычная скорость">Live Stress 1</button>
+        <button type="button" id="btnSsDiagLiveStress1Fast" title="~20–40 сек, 1 live #do, Time.timeScale=3">Live Stress 1 ×3</button>
+        <button type="button" id="btnSsDiagLiveStress" title="~20–45 мин, 40 live #do, обычная скорость">Live Stress 40</button>
+        <button type="button" id="btnSsDiagLiveStressFast" title="~7–15 мин, 40 live #do, Time.timeScale=3">Live Stress 40 ×3</button>
         <button type="button" id="btnSsDiagStats" title="Открыть дашборд выбранного репорта">Дашборд</button>
         <button type="button" id="btnSsRunRefresh" title="Обновить список">Обновить</button>
       </div>
@@ -5128,8 +5176,17 @@ function bindSsDiagnostics() {
       const left = document.createElement("div");
       left.style.cssText = "min-width:0";
       const t = document.createElement("div");
-      t.style.cssText = "font-weight:600";
-      t.textContent = (r.title || ("Live Stress " + (r.attempts || 40))) + " · " + (r.status || r.live_stress_status || "—");
+      t.style.cssText = "font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap";
+      const stRaw = String(r.status || r.live_stress_status || "—");
+      const stHead = stRaw.split(" · ")[0] || stRaw;
+      const tot = r.attempts || 40;
+      const passN = (r.attempts_passed === 0 || r.attempts_passed) ? r.attempts_passed : null;
+      let head = (r.title || ("Live Stress " + tot)) + " · " + stHead;
+      if (passN != null && (stHead === "Failed" || stHead === "Success" || stHead === "RUNNING")) {
+        head = (r.title || ("Live Stress " + tot)) + " · " + stHead + " · " + passN + "/" + tot;
+      }
+      t.textContent = head;
+      if (r.reason) t.title = String(r.reason);
       if (r.in_progress || r.status === "RUNNING") {
         row.style.background = "rgba(230,184,77,.12)";
       } else if (String(r.status || "").indexOf("Error") === 0 || String(r.status || "").indexOf("ERROR") === 0) {
@@ -5153,11 +5210,14 @@ function bindSsDiagnostics() {
         score.innerHTML = '<span style="color:#e6b84d">RUNNING</span>'
           + ' <span class="hint">' + done + " / " + total + "</span>";
       } else if (String(r.status || "").indexOf("Error") === 0 || String(r.status || "").indexOf("ERROR") === 0) {
-        score.innerHTML = '<span style="color:#ef6b6b">Error</span>'
-          + (r.reason ? (' <span class="hint">' + String(r.reason) + "</span>") : "");
+        score.innerHTML = '<span style="color:#ef6b6b">Error</span>';
+        if (r.reason) score.title = String(r.reason);
       } else if (String(r.status || "").indexOf("Failed") === 0 || String(r.status || "").indexOf("FAIL") === 0 || r.reason) {
+        const tot2 = r.attempts || 40;
+        const p2 = (r.attempts_passed === 0 || r.attempts_passed) ? r.attempts_passed : 0;
         score.innerHTML = '<span style="color:#ef6b6b">Failed</span>'
-          + (r.reason ? (' <span class="hint">' + String(r.reason) + "</span>") : "");
+          + ' <span class="hint">' + p2 + "/" + tot2 + "</span>";
+        if (r.reason) score.title = String(r.reason);
       } else if (String(r.status || "").indexOf("Success") === 0 || String(r.status || "") === "PASS") {
         score.innerHTML = '<span style="color:#3ecf8e">Success</span>'
           + ' <span class="hint">из ' + total + "</span>";
@@ -5410,7 +5470,9 @@ function bindSsDiagnostics() {
   }
   const map = {
     btnSsDiagLiveStress1: "live_stress_1",
+    btnSsDiagLiveStress1Fast: "live_stress_1_fast",
     btnSsDiagLiveStress: "live_stress",
+    btnSsDiagLiveStressFast: "live_stress_40_fast",
     btnSsDiagStats: "stats_dashboard",
   };
   for (const [id, kind] of Object.entries(map)) {

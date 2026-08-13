@@ -362,7 +362,25 @@ public class StreamCommandReceiver : MonoBehaviour
         }
         if (cmd == "reset_resources")
         {
-            ctrl.ResetResourcesForTest();
+            float hold = ExtractFloat(json, "hold_seconds");
+            if (hold < 30f)
+                hold = 900f;
+            ctrl.ResetResourcesForTest(hold);
+            return;
+        }
+        if (cmd == "set_time_scale")
+        {
+            // Live Stress only: speed up sim (1 = normal). Clamped so physics stays sane.
+            float scale = ExtractFloat(json, "value");
+            if (scale < 0.25f)
+                scale = 0.25f;
+            if (scale > 4f)
+                scale = 4f;
+            Time.timeScale = scale;
+            // Cap per-frame game dt so ×3 Live Stress does not look like teleports
+            // (one hitch otherwise ≈ speed*1s ≈ 3.2m jump between traj samples).
+            Time.maximumDeltaTime = scale > 1.01f ? 0.05f : (1f / 3f);
+            Debug.Log($"[SSTest] set_time_scale={scale:F2} maxDt={Time.maximumDeltaTime:F3}");
             return;
         }
         Debug.LogWarning($"[SSTest] unknown cmd={cmd}");

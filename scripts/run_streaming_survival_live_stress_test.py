@@ -25,7 +25,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from stream_bot.ss_trajectory_checker import check_trajectory
+from stream_bot.ss_trajectory_checker import MAX_ALLOWED_POSITION_JUMP, check_trajectory
 from stream_bot.validator import plan_from_payload
 
 ARTIFACTS = ROOT / "artifacts" / "streaming_survival" / "test_runs"
@@ -352,11 +352,17 @@ def run_stress(
     unity_port: int,
     attempts: int,
     run_id: str,
+    time_scale: float = 1.0,
 ) -> Dict[str, Any]:
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "trajectories").mkdir(parents=True, exist_ok=True)
     (run_dir / "screenshots").mkdir(parents=True, exist_ok=True)
     os.environ["STREAMING_SURVIVAL_TEST_ARTIFACTS_DIR"] = str(run_dir.resolve())
+    try:
+        scale = float(time_scale)
+    except (TypeError, ValueError):
+        scale = 1.0
+    scale = max(0.25, min(4.0, scale))
 
     try:
         _get(bot_url.rstrip("/") + "/status")
@@ -389,6 +395,20 @@ def run_stress(
         unity_port,
     )
     time.sleep(0.6)
+    # Test-only speed-up: movement/work use Time.deltaTime → finish sooner in wall clock.
+    _udp_send(
+        {
+            "type": "streaming_survival_test",
+            "cmd": "set_time_scale",
+            "value": scale,
+            "run_id": run_id,
+            "output_dir": str(run_dir.resolve()),
+        },
+        unity_host,
+        unity_port,
+    )
+    print(f"[live_stress] time_scale={scale}", flush=True)
+    time.sleep(0.15)
 
     # Ensure Unity writes into this run_dir + world_map.json (landmarks/fences)
     _udp_send(
@@ -431,7 +451,7 @@ def run_stress(
         attempt_id = f"live_{i:02d}_{user}"
         fam = _command_family(cmd)
         # Provisional wait; refined after parse for sequential chains.
-        wait_s = _wait_seconds(cmd)
+        wait_s = _wait_seconds(cmd) / scale
         shot_dir = run_dir / "screenshots" / attempt_id
         shot_dir.mkdir(parents=True, exist_ok=True)
         traj_path = run_dir / "trajectories" / f"{attempt_id}_trajectory.jsonl"
@@ -468,6 +488,19 @@ def run_stress(
                     "type": "streaming_survival_test",
                     "cmd": "reset_player_to_spawn",
                     "username": user,
+                    "run_id": run_id,
+                    "output_dir": str(run_dir.resolve()),
+                },
+                unity_host,
+                unity_port,
+            )
+            time.sleep(0.2)
+            # #join resets round to 240s; hold so ROUND_LOSE does not wipe a long #do.
+            _udp_send(
+                {
+                    "type": "streaming_survival_test",
+                    "cmd": "reset_resources",
+                    "hold_seconds": 900,
                     "run_id": run_id,
                     "output_dir": str(run_dir.resolve()),
                 },
@@ -515,7 +548,7 @@ def run_stress(
                 continue
 
         plan = _extract_plan(resp)
-        wait_s = _wait_seconds(cmd, plan)
+        wait_s = _wait_seconds(cmd, plan) / scale
         entry["parsed_plan"] = plan
         entry["chat_reply"] = resp.get("chat_reply")
         entry["validator_result"] = resp.get("validator_result")
@@ -632,6 +665,9 @@ def run_stress(
                 continue
 
         sc = _scenario_for_family(fam, cmd, plan)
+        # ×N Live Stress: larger per-sample steps are expected (timeScale), not teleports.
+        if scale > 1.01:
+            sc["max_allowed_position_jump"] = MAX_ALLOWED_POSITION_JUMP * scale
         # Join must stay idle — no collect actions
         if cmd.strip() == "#join":
             sc = {
@@ -739,6 +775,7 @@ def run_stress(
         "attempts_passed": passed,
         "attempts_failed": len(failed),
         "duration_sec": round(time.time() - t0, 1),
+        "time_scale": scale,
         "ground_failures": ground_failures,
         "teleport_failures": teleport_failures,
         "stuck_failures": stuck_failures,
@@ -800,6 +837,18 @@ def run_stress(
         {
             "type": "streaming_survival_test",
             "cmd": "clear_all_players",
+            "run_id": run_id,
+            "output_dir": str(run_dir.resolve()),
+        },
+        unity_host,
+        unity_port,
+    )
+    # Always restore normal speed after tests.
+    _udp_send(
+        {
+            "type": "streaming_survival_test",
+            "cmd": "set_time_scale",
+            "value": 1.0,
             "run_id": run_id,
             "output_dir": str(run_dir.resolve()),
         },
@@ -876,6 +925,12 @@ def main() -> int:
         default=int(os.environ.get("FOREST_STREAM_BOT_PORT", "5055")),
     )
     ap.add_argument("--attempts", type=int, default=40)
+    ap.add_argument(
+        "--time-scale",
+        type=float,
+        default=float(os.environ.get("FOREST_SS_TIME_SCALE", "1") or "1"),
+        help="Unity Time.timeScale for this run only (1=normal, 3≈3x faster). Restored to 1 after.",
+    )
     ap.add_argument("--run-dir", default="")
     ap.add_argument("--run-id", default="")
     args = ap.parse_args()
@@ -888,6 +943,7 @@ def main() -> int:
         unity_port=args.unity_port,
         attempts=args.attempts,
         run_id=run_id,
+        time_scale=args.time_scale,
     )
     return 0 if report.get("overall") == "PASS" else 1
 
