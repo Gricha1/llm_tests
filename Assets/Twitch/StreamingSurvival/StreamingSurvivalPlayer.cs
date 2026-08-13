@@ -905,19 +905,30 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
                     }
                     if (Time.time - _woodStuckSince > 1.35f)
                     {
-                        Vector3 toTree = _target - pWood;
+                        // Prefer nearest trunk (not locked stand) — stand-dir often
+                        // points away after circling and blocks retarget forever.
+                        Vector3 prefer = _treeVictim != null
+                            ? (_treeVictim.transform.position - pWood)
+                            : (_target - pWood);
                         StreamingSurvivalTrajectoryRecorder.Instance?.EmitEvent(
                             Username, "stuck_detected", this);
                         // Не удаляем ствол «мимо счёта» — переключаемся на ближайшее
                         // дерево и рубим обычным collect_wood (work + wood в инвентарь).
-                        if (TryRetargetWoodToNearestTree(toTree))
+                        if (TryRetargetWoodToNearestTree(prefer))
                         {
                             _woodStuckSince = Time.time;
                             if (TryBeginWorkAtResource(ctrl))
                                 break;
+                            if (TryForceWoodWorkNearTrunk(ctrl))
+                                break;
                             break;
                         }
-                        TrySafeNudge(toTree, 1.5f);
+                        if (TryForceWoodWorkNearTrunk(ctrl))
+                        {
+                            _woodStuckSince = Time.time;
+                            break;
+                        }
+                        TrySafeNudge(prefer, 1.5f);
                         _hasLockedWorkTarget = false;
                         _woodStuckSince = Time.time;
                         break;
@@ -1419,15 +1430,16 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
         if (!spawner.TryGetNearestAliveTree(transform.position, out GameObject tree, out Vector3 treePos))
             return false;
         float d = Horiz(transform.position, treePos);
-        if (d > 3.5f)
+        if (d > 4.0f)
             return false;
         Vector3 toTree = treePos - transform.position;
         toTree.y = 0f;
         preferDir.y = 0f;
-        if (preferDir.sqrMagnitude > 0.01f && d > 1.75f)
+        // Soft filter only when far: near trunks always allowed so we can finish farm.
+        if (preferDir.sqrMagnitude > 0.01f && d > 2.75f)
         {
             float dot = Vector3.Dot(preferDir.normalized, toTree.normalized);
-            if (dot < -0.15f)
+            if (dot < -0.35f)
                 return false;
         }
         Vector3 stand = ApproachStand(transform.position, treePos, 1.35f);
@@ -1444,6 +1456,47 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
             $"[SSPos] wood_stuck_retarget user={Username} tree=({treePos.x:F2},{treePos.z:F2}) d={d:F2} " +
             $"pos=({transform.position.x:F2},{transform.position.z:F2})");
         return true;
+    }
+
+    /// <summary>
+    /// Already in chop range but stand arrive failed — lock a stand the guard
+    /// accepts and start Work so wood is credited (no silent Destroy).
+    /// </summary>
+    bool TryForceWoodWorkNearTrunk(StreamingSurvivalController ctrl)
+    {
+        if (Action != "collect_wood" || ctrl == null)
+            return false;
+        var spawner = TrainingEnvSpace.FindInPresentation<TreeSpawner>()
+            ?? Object.FindFirstObjectByType<TreeSpawner>();
+        if (spawner == null)
+            return false;
+        if (!spawner.TryGetNearestAliveTree(transform.position, out GameObject tree, out Vector3 treePos))
+            return false;
+        float d = Horiz(transform.position, treePos);
+        if (d > StreamingSurvivalResourceGuard.WoodInteractionRadius + 1.75f)
+            return false;
+
+        Vector3 stand = ApproachStand(transform.position, treePos, Mathf.Min(1.35f, Mathf.Max(0.2f, d * 0.45f)));
+        if (Horiz(transform.position, stand) > ArriveDistForAction())
+        {
+            if (d > 2.25f)
+                return false;
+            stand = transform.position;
+        }
+
+        _treeVictim = tree;
+        SetTargetMeta("tree", "tree_live", stand, treePos);
+        _lockedWorkTarget = stand;
+        _hasLockedWorkTarget = true;
+        _target = stand;
+        _phaseEnteredAt = Time.time;
+        ReachedResourceFlag = false;
+        WorkStartedNearTarget = false;
+        CollectState = StreamingSurvivalResourceGuard.CollectState.MovingToResource;
+        Debug.Log(
+            $"[SSPos] wood_force_work user={Username} tree=({treePos.x:F2},{treePos.z:F2}) d={d:F2} " +
+            $"pos=({transform.position.x:F2},{transform.position.z:F2})");
+        return TryBeginWorkAtResource(ctrl);
     }
 
     /// <summary>
