@@ -41,6 +41,10 @@ class LabBotManager:
         self.model = "unknown"
         self.bot_http_ready = False
         self.last_error: Optional[str] = None
+        self.roster: List[Dict[str, Any]] = []
+        self.roster_count = 0
+        self.players: List[Dict[str, Any]] = []
+        self.players_count = 0
         self._logs: Deque[str] = deque(maxlen=500)
         self._chat: List[Dict[str, str]] = []
         self._host: Optional[str] = None
@@ -126,6 +130,10 @@ class LabBotManager:
                 "ollama_model": OLLAMA_MODEL_DEFAULT,
                 "host": self._host or "lab_comp",
                 "available_actions": acts,
+                "roster": list(self.roster),
+                "roster_count": int(self.roster_count),
+                "players": list(self.players),
+                "players_count": int(self.players_count),
                 "logs": list(self._logs)[-120:],
                 "chat": list(self._chat)[-80:],
             }
@@ -176,10 +184,12 @@ class LabBotManager:
                 prev = self.bot_state
                 self.bot_http_ready = ready
                 if ready:
-                    self.bot_state = "running"
+                    # не перебивать явную остановку probe'ом
+                    if prev != "stopping":
+                        self.bot_state = "running"
                     if self.last_error and str(self.last_error).startswith("ssh status:"):
                         self.last_error = None
-            if ready and prev != "running":
+            if ready and prev != "running" and prev != "stopping":
                 try:
                     st = self._curl_json("GET", "/status", None, timeout=5)
                     if isinstance(st, dict) and "listen_stream" in st:
@@ -195,6 +205,24 @@ class LabBotManager:
                         self.ollama = "running"
                     if self.model in ("unknown", "pulling"):
                         self.model = "ready"
+                try:
+                    st = self._curl_json("GET", "/status", None, timeout=5)
+                    if isinstance(st, dict):
+                        with self._lock:
+                            if "listen_stream" in st:
+                                self.listen_stream = bool(st.get("listen_stream"))
+                            self.roster = list(st.get("roster") or st.get("active_users") or [])
+                            self.roster_count = int(
+                                st.get("roster_count") if st.get("roster_count") is not None
+                                else len(self.roster)
+                            )
+                            self.players = list(st.get("players") or self.roster)
+                            self.players_count = int(
+                                st.get("players_count") if st.get("players_count") is not None
+                                else len(self.players)
+                            )
+                except Exception:
+                    pass
                 # Log tail is optional; never block health on it.
                 try:
                     self._pull_remote_log_tail()
@@ -225,6 +253,21 @@ class LabBotManager:
         with self._lock:
             self._chat.clear()
         return {"ok": True, "chat": []}
+
+    def resync_roster(self) -> Dict[str, Any]:
+        try:
+            data = self._curl_json("POST", "/roster/resync", {}, timeout=30)
+            if isinstance(data, dict):
+                with self._lock:
+                    self.roster = list(data.get("roster") or [])
+                    self.roster_count = int(data.get("roster_count") or len(self.roster))
+            self._log(f"roster resync → Unity ({self.roster_count} players)")
+            self._chat_add("system", f"roster resync → Unity ({self.roster_count})")
+            return {"ok": True, "status": self._snapshot(), "bot": data}
+        except Exception as e:
+            self.last_error = str(e)
+            self._log(f"roster resync error: {e}")
+            return {"ok": False, "error": str(e), "status": self._snapshot()}
 
     def start(self) -> Dict[str, Any]:
         with self._lock:
@@ -264,11 +307,18 @@ class LabBotManager:
             with self._lock:
                 self.bot_state = "running"
                 self.bot_http_ready = True
-                self.listen_stream = False
                 if self.python_deps != "ready":
                     self.python_deps = "ready"
-            self._chat_add("system", f"bot running on {host} · Local debug")
-            self._log("Start Bot OK (lab_comp)")
+            try:
+                st = self._curl_json("GET", "/status", None, timeout=10)
+                if isinstance(st, dict) and "listen_stream" in st:
+                    with self._lock:
+                        self.listen_stream = bool(st.get("listen_stream"))
+            except Exception:
+                pass
+            mode = "Twitch stream" if self.listen_stream else "Local debug"
+            self._chat_add("system", f"bot running on {host} · {mode}")
+            self._log(f"Start Bot OK (lab_comp) · {mode}")
             self._probe_once()
         except Exception as e:
             with self._lock:
@@ -280,10 +330,12 @@ class LabBotManager:
 
     def stop(self) -> Dict[str, Any]:
         with self._lock:
-            self.bot_state = "stopped"
+            if self.bot_state == "stopping":
+                return self._snapshot()
+            self.bot_state = "stopping"
             self.bot_http_ready = False
         self._log("Stop Bot on lab_comp…")
-        self._chat_add("system", "bot stopped on lab")
+        self._chat_add("system", "stopping on lab…")
 
         def worker() -> None:
             try:
@@ -296,10 +348,19 @@ class LabBotManager:
                 for line in out.splitlines():
                     if line.strip():
                         self._log(line)
+                with self._lock:
+                    self.bot_state = "stopped"
+                    self.bot_http_ready = False
+                self._chat_add("system", "bot stopped on lab")
+                self._log("Stop Bot OK (lab_comp)")
             except Exception as e:
                 with self._lock:
                     self.last_error = str(e)
+                    # даже при ошибке SSH считаем остановку завершённой локально
+                    self.bot_state = "stopped"
+                    self.bot_http_ready = False
                 self._log(f"stop error: {e}")
+                self._chat_add("system", f"stop error: {e}")
 
         threading.Thread(target=worker, name="lab-llm-bot-stop", daemon=True).start()
         return self._snapshot()

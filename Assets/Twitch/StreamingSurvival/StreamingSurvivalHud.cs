@@ -32,10 +32,10 @@ public sealed class StreamingSurvivalHud : MonoBehaviour
         ResolveSpritesOnce();
         var c = StreamingSurvivalController.Instance;
         if (c == null) return;
-        SetStat(_water, _waterSprite, c.Water, c.GoalAmount);
-        SetStat(_wood, _woodSprite, c.Wood, c.GoalAmount);
-        SetStat(_food, _foodSprite, c.Food, c.GoalAmount);
-        SetStat(_heat, _heatSprite, c.Heat, c.GoalAmount);
+        SetStat(_water, _waterSprite, c.Water);
+        SetStat(_wood, _woodSprite, c.Wood);
+        SetStat(_food, _foodSprite, c.Food);
+        SetStat(_heat, _heatSprite, c.Heat);
         if (_timeFill != null)
             _timeFill.fillAmount = Mathf.Clamp01(c.RoundProgress01);
         if (_task != null)
@@ -110,15 +110,15 @@ public sealed class StreamingSurvivalHud : MonoBehaviour
             _spritesResolved = true;
     }
 
-    static void SetStat(TMP_Text t, TMP_SpriteAsset sprite, int v, int goal)
+    static void SetStat(TMP_Text t, TMP_SpriteAsset sprite, int v)
     {
         if (t == null) return;
         if (sprite != null && t.spriteAsset != sprite)
             t.spriteAsset = sprite;
         if (sprite != null)
-            t.text = $"<sprite=0>  {v} / {goal}";
+            t.text = $"<sprite=0>  {v}";
         else
-            t.text = $"{v} / {goal}";
+            t.text = $"{v}";
     }
 
     void Build()
@@ -235,7 +235,8 @@ public sealed class StreamingSurvivalHud : MonoBehaviour
         helpText.color = new Color(0.95f, 0.97f, 1f);
         helpText.text =
             "<b>FOLLOWER CHARACTERS</b>\n" +
-            "пиши в чат:  <color=#9ecbff>#join</color>  ·  <color=#9fe7b8>#do действие</color>  ·  <color=#ffb4b4>#exit</color>";
+            "пиши в чат:  <color=#9ecbff>#join</color>  ·  <color=#9fe7b8>#do действие</color>  ·  <color=#ffb4b4>#exit</color>\n" +
+            "<color=#ffd699>#stats</color> — твоя статистика";
         helpText.richText = true;
         ApplyFont(helpText);
     }

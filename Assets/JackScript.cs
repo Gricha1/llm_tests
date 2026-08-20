@@ -2787,9 +2787,9 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
             return;
         }
 
-        // Nightmare/boss/zombie stages — только train. Streaming Survival и presentation — нет.
-        if (!TrainingEnvSpace.IsStreamingSurvivalMode
-            && !TrainingEnvSpace.ShouldRunPresentationOnlyServices())
+        // Фазы зомби/кошмар: train + OBS presentation. Streaming Survival — без зомби.
+        // Раньше presentation тоже блокировали → полоска «Этап 2» ползла по времени, а зомби не спавнились.
+        if (!TrainingEnvSpace.IsStreamingSurvivalMode)
         {
             if (!_deathSequenceStarted && !IsWoodFoodSwitchMode && _survivalPhase == 1 && survivalGoalSeconds > 0f
                 && SurvivalElapsedSeconds >= survivalGoalSeconds)

@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Reflection;
 using UnityEngine;
 using UnityEngine.SceneManagement;
 
@@ -435,12 +436,10 @@ public class ZombieSpawner : MonoBehaviour
         if (_cachedZombieAnimator != null)
             return _cachedZombieAnimator;
 
-#if UNITY_EDITOR
-        _cachedZombieAnimator = UnityEditor.AssetDatabase.LoadAssetAtPath<RuntimeAnimatorController>(
+        _cachedZombieAnimator = EditorLoadAsset<RuntimeAnimatorController>(
             "Assets/ResilientLogicGames/ChubyCharacterFree/Animations/Animator Zombie.controller");
         if (_cachedZombieAnimator != null)
             return _cachedZombieAnimator;
-#endif
 
         var prefab = ResolveZombiePrefab();
         if (prefab != null)
@@ -545,15 +544,13 @@ public class ZombieSpawner : MonoBehaviour
         if (_resolvedZombiePrefab != null)
             return _resolvedZombiePrefab;
 
-#if UNITY_EDITOR
-        var gameFat = UnityEditor.AssetDatabase.LoadAssetAtPath<GameObject>("Assets/Prefabs/FatZombie.prefab");
+        var gameFat = EditorLoadAsset<GameObject>("Assets/Prefabs/FatZombie.prefab");
         if (gameFat != null)
         {
             _resolvedZombiePrefab = gameFat;
             _prefabRootScale = gameFat.transform.localScale;
             return _resolvedZombiePrefab;
         }
-#endif
 
         if (zombiePrefab != null && !zombiePrefab.scene.IsValid())
         {
@@ -562,10 +559,9 @@ public class ZombieSpawner : MonoBehaviour
             return _resolvedZombiePrefab;
         }
 
-#if UNITY_EDITOR
         if (zombiePrefab != null)
         {
-            var source = UnityEditor.PrefabUtility.GetCorrespondingObjectFromOriginalSource(zombiePrefab);
+            var source = EditorPrefabOriginal(zombiePrefab);
             if (source != null
                 && source.GetComponentInChildren<ZombieChase>(true) != null
                 && HasAnimatorController(source))
@@ -575,7 +571,6 @@ public class ZombieSpawner : MonoBehaviour
                 return _resolvedZombiePrefab;
             }
         }
-#endif
 
         _resolvedZombiePrefab = zombiePrefab;
         if (_resolvedZombiePrefab != null)
@@ -589,6 +584,52 @@ public class ZombieSpawner : MonoBehaviour
             return false;
         var anim = go.GetComponentInChildren<Animator>(true);
         return anim != null && anim.runtimeAnimatorController != null;
+    }
+
+    // No hard UnityEditor reference: ScriptAssemblies (editor) DLL is copied into
+    // the Linux player, and AssetDatabase would MissingMethod/FileNotFound every frame.
+    static T EditorLoadAsset<T>(string path) where T : UnityEngine.Object
+    {
+        if (!Application.isEditor || string.IsNullOrEmpty(path))
+            return null;
+        try
+        {
+            var db = System.Type.GetType("UnityEditor.AssetDatabase, UnityEditor");
+            if (db == null)
+                return null;
+            var method = db.GetMethod("LoadAssetAtPath", new[] { typeof(string), typeof(System.Type) });
+            if (method == null)
+                return null;
+            return method.Invoke(null, new object[] { path, typeof(T) }) as T;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    static GameObject EditorPrefabOriginal(GameObject instance)
+    {
+        if (!Application.isEditor || instance == null)
+            return null;
+        try
+        {
+            var util = System.Type.GetType("UnityEditor.PrefabUtility, UnityEditor");
+            if (util == null)
+                return null;
+            var method = util.GetMethod("GetCorrespondingObjectFromOriginalSource",
+                BindingFlags.Public | BindingFlags.Static,
+                null,
+                new[] { typeof(GameObject) },
+                null);
+            if (method == null)
+                return null;
+            return method.Invoke(null, new object[] { instance }) as GameObject;
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     public Vector3 GetSpawnCenterWorld() => transform.position;

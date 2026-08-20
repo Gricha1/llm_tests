@@ -5,12 +5,16 @@ using Unity.MLAgents.Policies;
 
 /// <summary>
 /// Streaming Survival: раунды Water/Wood/Food/Heat со scripted follower-персонажами.
-/// Включается только при -forestStreamingSurvival / FOREST_STREAMING_SURVIVAL.
-/// (Training AI / ML-Agents герои в этом режиме отключаются.)
+/// Полный режим: -forestStreamingSurvival (герои ML скрыты).
+/// Followers-only: -forestStreamOnly / train presentation — те же #join/#do персонажи, Jack/Lily/George учатся.
 /// </summary>
 public sealed class StreamingSurvivalController : MonoBehaviour
 {
     public static StreamingSurvivalController Instance { get; private set; }
+
+    /// <summary>Stream/train presentation: только фолловеры, без раунда SS и без скрытия героев.</summary>
+    public bool FollowersOnlyMode => _followersOnlyMode;
+    bool _followersOnlyMode;
 
     const int Goal = 10;
     const float InterRoundPause = 5f;
@@ -50,8 +54,20 @@ public sealed class StreamingSurvivalController : MonoBehaviour
     public int PlayerCount => _players.Count;
     public float StageSeconds => stageSeconds;
     public float RoundSecondsLeft => Mathf.Max(0f, _roundEndsAt - Time.time);
-    public float RoundProgress01 =>
-        stageSeconds <= 0.01f ? 0f : 1f - (RoundSecondsLeft / stageSeconds);
+    public float RoundProgress01 => ResourceProgress01;
+    public float ResourceProgress01
+    {
+        get
+        {
+            float need = Goal * 4f;
+            if (need < 0.01f) return 0f;
+            int w = Mathf.Clamp(_water, 0, Goal);
+            int d = Mathf.Clamp(_wood, 0, Goal);
+            int f = Mathf.Clamp(_food, 0, Goal);
+            int h = Mathf.Clamp(_heat, 0, Goal);
+            return Mathf.Clamp01((w + d + f + h) / need);
+        }
+    }
     public string Banner => Time.time < _bannerUntil ? _banner : "";
     public string RoundTaskText =>
         _inPause
@@ -84,14 +100,26 @@ public sealed class StreamingSurvivalController : MonoBehaviour
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
     static void Bootstrap()
     {
-        if (!TrainingEnvSpace.IsStreamingSurvivalMode)
+        if (!TrainingEnvSpace.UseUnifiedFollowers)
             return;
+        EnsureInstance();
+    }
+
+    /// <summary>Lazy init для StreamCommandReceiver (stream/train presentation).</summary>
+    public static StreamingSurvivalController EnsureInstance()
+    {
         if (Instance != null)
-            return;
-        HudHpBars.SetGlobalEnabled(false);
+            return Instance;
+        if (!TrainingEnvSpace.UseUnifiedFollowers)
+            return null;
+        if (!TrainingEnvSpace.IsStreamingSurvivalMode)
+            HudHpBars.SetGlobalEnabled(true);
+        else
+            HudHpBars.SetGlobalEnabled(false);
         var go = new GameObject(nameof(StreamingSurvivalController));
         DontDestroyOnLoad(go);
         go.AddComponent<StreamingSurvivalController>();
+        return Instance;
     }
 
     void Awake()
@@ -104,32 +132,46 @@ public sealed class StreamingSurvivalController : MonoBehaviour
         Instance = this;
         DontDestroyOnLoad(gameObject);
 
+        _followersOnlyMode = !TrainingEnvSpace.IsStreamingSurvivalMode;
+
         string envSec = System.Environment.GetEnvironmentVariable("STREAMING_SURVIVAL_STAGE_SECONDS");
         if (!string.IsNullOrEmpty(envSec) && float.TryParse(envSec, out float s) && s > 5f)
             stageSeconds = s;
 
-        HudHpBars.SetGlobalEnabled(false);
-        _hud = gameObject.AddComponent<StreamingSurvivalHud>();
-        _table = gameObject.AddComponent<StreamingSurvivalPlayersTable>();
+        if (!_followersOnlyMode)
+            HudHpBars.SetGlobalEnabled(false);
+
         if (GetComponent<StreamingSurvivalWorldRegistry>() == null)
             gameObject.AddComponent<StreamingSurvivalWorldRegistry>();
-        if (GetComponent<StreamingSurvivalTrajectoryRecorder>() == null)
-            gameObject.AddComponent<StreamingSurvivalTrajectoryRecorder>();
-        if (GetComponent<StreamingSurvivalScenarioRunner>() == null)
-            gameObject.AddComponent<StreamingSurvivalScenarioRunner>();
-        _cleanupUntil = Time.unscaledTime + 8f;
-        StartNewRound("Раунд начался");
+
+        if (_followersOnlyMode)
+        {
+            _table = gameObject.AddComponent<StreamingSurvivalPlayersTable>();
+            Debug.Log("[StreamingSurvival] followers-only (stream/train presentation, ML heroes stay active)");
+        }
+        else
+        {
+            _hud = gameObject.AddComponent<StreamingSurvivalHud>();
+            _table = gameObject.AddComponent<StreamingSurvivalPlayersTable>();
+            if (GetComponent<StreamingSurvivalTrajectoryRecorder>() == null)
+                gameObject.AddComponent<StreamingSurvivalTrajectoryRecorder>();
+            if (GetComponent<StreamingSurvivalScenarioRunner>() == null)
+                gameObject.AddComponent<StreamingSurvivalScenarioRunner>();
+            _cleanupUntil = Time.unscaledTime + 8f;
+            StartNewRound("Раунд начался");
+        }
     }
 
     void Start()
     {
         TryPrepareWorld(force: true);
-        SetupCamAOnly();
+        if (!_followersOnlyMode)
+            SetupCamAOnly();
     }
 
     void Update()
     {
-        if (!_worldReady || Time.unscaledTime < _cleanupUntil)
+        if (!_worldReady || (!_followersOnlyMode && Time.unscaledTime < _cleanupUntil))
             TryPrepareWorld(force: false);
 
         // Drive viewers even when a player GO sits under an inactive Env root
@@ -140,6 +182,9 @@ public sealed class StreamingSurvivalController : MonoBehaviour
             if (p != null)
                 p.TickGameplay();
         }
+
+        if (_followersOnlyMode)
+            return;
 
         if (_inPause)
         {
@@ -166,6 +211,12 @@ public sealed class StreamingSurvivalController : MonoBehaviour
         ResolveBasePoint();
         ResolveFollowerSpawn(force: force);
         CacheJackVisualTemplate();
+        if (_followersOnlyMode)
+        {
+            if (_followerSpawnReady || force)
+                _worldReady = true;
+            return;
+        }
         ExtinguishWorldFires();
         HideAllHeroCharacters();
         HideLegacyHud();
@@ -186,6 +237,8 @@ public sealed class StreamingSurvivalController : MonoBehaviour
             jacks[i]?.ExtinguishCampfire();
 
         // убрать SS-костры прошлых раундов
+        StreamingSurvivalCampfireVfx.Extinguish();
+
         var old = GameObject.Find("SS_Campfire");
         if (old != null)
             Destroy(old);
@@ -412,47 +465,82 @@ public sealed class StreamingSurvivalController : MonoBehaviour
     {
         if (_jackVisualTemplate != null)
             return;
+        GameObject live = FindLiveJackVisual();
+        if (live == null)
+            return;
+        // Never instantiate/disable the live ML Jack — that registers a second
+        // JackLowLevelAgent and restarts the stream process on #join.
+        _jackVisualTemplate = BakeInactiveVisualPrefab(live);
+        Debug.Log($"[StreamingSurvival] template baked from {live.name} (inactive, no Agent, join-safe)");
+    }
+
+    static GameObject FindLiveJackVisual()
+    {
         var jacks = Object.FindObjectsByType<AgentGoToHouseDiscrete>(
             FindObjectsInactive.Include, FindObjectsSortMode.None);
-        // сначала именно JackHero (не Chubby/Jack)
-        for (int i = 0; i < jacks.Length; i++)
-        {
-            var j = jacks[i];
-            if (j == null || TrainingEnvSpace.IsGeorgeAgent(j)) continue;
-            if (IsSsClone(j.gameObject)) continue;
-            if (j.gameObject.name == "JackHero")
-            {
-                _jackVisualTemplate = j.gameObject;
-                Debug.Log("[StreamingSurvival] template = JackHero");
-                return;
-            }
-        }
-        for (int i = 0; i < jacks.Length; i++)
-        {
-            var j = jacks[i];
-            if (j == null || TrainingEnvSpace.IsGeorgeAgent(j)) continue;
-            if (IsSsClone(j.gameObject)) continue;
-            if (j.gameObject.name.IndexOf("JackHero", System.StringComparison.OrdinalIgnoreCase) >= 0)
-            {
-                _jackVisualTemplate = j.gameObject;
-                Debug.Log($"[StreamingSurvival] template = {j.gameObject.name}");
-                return;
-            }
-        }
-        // fallback только если JackHero нет в сцене
+        GameObject named = null;
+        GameObject any = null;
         for (int i = 0; i < jacks.Length; i++)
         {
             var j = jacks[i];
             if (j == null || TrainingEnvSpace.IsGeorgeAgent(j)) continue;
             if (IsSsClone(j.gameObject)) continue;
             string n = j.gameObject.name;
-            if (n == "Jack" || n.IndexOf("Chubby", System.StringComparison.OrdinalIgnoreCase) >= 0
-                || n.IndexOf("Chuby", System.StringComparison.OrdinalIgnoreCase) >= 0)
-                continue;
-            _jackVisualTemplate = j.gameObject;
-            Debug.LogWarning($"[StreamingSurvival] JackHero не найден, template={n}");
-            return;
+            if (n == "JackHero")
+                return j.gameObject;
+            if (named == null
+                && n.IndexOf("JackHero", System.StringComparison.OrdinalIgnoreCase) >= 0)
+                named = j.gameObject;
+            if (any == null
+                && n != "Jack"
+                && n.IndexOf("Chubby", System.StringComparison.OrdinalIgnoreCase) < 0
+                && n.IndexOf("Chuby", System.StringComparison.OrdinalIgnoreCase) < 0)
+                any = j.gameObject;
         }
+        return named != null ? named : any;
+    }
+
+    static GameObject BakeInactiveVisualPrefab(GameObject live)
+    {
+        var agents = live.GetComponentsInChildren<Agent>(true);
+        var decisions = live.GetComponentsInChildren<DecisionRequester>(true);
+        var behaviors = live.GetComponentsInChildren<BehaviorParameters>(true);
+        var prevAgent = new bool[agents.Length];
+        var prevDec = new bool[decisions.Length];
+        var prevBeh = new bool[behaviors.Length];
+        for (int i = 0; i < agents.Length; i++)
+        {
+            if (agents[i] == null) continue;
+            prevAgent[i] = agents[i].enabled;
+            agents[i].enabled = false;
+        }
+        for (int i = 0; i < decisions.Length; i++)
+        {
+            if (decisions[i] == null) continue;
+            prevDec[i] = decisions[i].enabled;
+            decisions[i].enabled = false;
+        }
+        for (int i = 0; i < behaviors.Length; i++)
+        {
+            if (behaviors[i] == null) continue;
+            prevBeh[i] = behaviors[i].enabled;
+            behaviors[i].enabled = false;
+        }
+
+        var go = Object.Instantiate(live);
+        go.name = "SSPlayerVisualPrefab";
+        go.SetActive(false);
+        StripTrainingComponents(go);
+        go.transform.SetParent(null, true);
+        DontDestroyOnLoad(go);
+
+        for (int i = 0; i < agents.Length; i++)
+            if (agents[i] != null) agents[i].enabled = prevAgent[i];
+        for (int i = 0; i < decisions.Length; i++)
+            if (decisions[i] != null) decisions[i].enabled = prevDec[i];
+        for (int i = 0; i < behaviors.Length; i++)
+            if (behaviors[i] != null) behaviors[i].enabled = prevBeh[i];
+        return go;
     }
 
     void ResolveHousePoint()
@@ -719,16 +807,19 @@ public sealed class StreamingSurvivalController : MonoBehaviour
         player.TeleportTo(spawn, "join_spawn");
         _players[key] = player;
         IgnoreCollisionsWithOtherPlayers(player);
-        // всегда обновляем таймер раунда при новом игроке (не телепортируем остальных)
-        _inPause = false;
-        _roundEndsAt = Time.time + stageSeconds;
-        if (firstPlayer)
+        if (!_followersOnlyMode)
         {
-            ShowBanner("Команда в игре — раунд!", 3f);
-            Debug.Log($"[SSRes] ROUND_START_FIRST_JOIN stage={stageSeconds}s");
+            // всегда обновляем таймер раунда при новом игроке (не телепортируем остальных)
+            _inPause = false;
+            _roundEndsAt = Time.time + stageSeconds;
+            if (firstPlayer)
+            {
+                ShowBanner("Команда в игре — раунд!", 3f);
+                Debug.Log($"[SSRes] ROUND_START_FIRST_JOIN stage={stageSeconds}s");
+            }
+            else
+                Debug.Log($"[SSRes] ROUND_TIMER_REFRESH players={_players.Count} left={RoundSecondsLeft:F0}s");
         }
-        else
-            Debug.Log($"[SSRes] ROUND_TIMER_REFRESH players={_players.Count} left={RoundSecondsLeft:F0}s");
         RefreshTable();
         Debug.Log($"[StreamingSurvival] spawned {go.name} at {spawn} flowerCenter={FollowerSpawnWorld}");
         return player;
@@ -738,23 +829,38 @@ public sealed class StreamingSurvivalController : MonoBehaviour
     {
         if (_jackVisualTemplate != null)
         {
-            bool wasActive = _jackVisualTemplate.activeSelf;
-            _jackVisualTemplate.SetActive(false);
             var go = Object.Instantiate(_jackVisualTemplate);
-            _jackVisualTemplate.SetActive(wasActive);
             go.name = "SSPlayer_" + key;
             go.SetActive(false);
             StripTrainingComponents(go);
-            foreach (var an in go.GetComponentsInChildren<Animator>(true))
+            if (!VerifyJoinCloneSafe(go))
             {
-                if (an == null) continue;
-                an.applyRootMotion = false;
-                an.SetFloat("Speed", 0f);
+                Debug.LogWarning(
+                    $"[StreamingSurvival] join clone had ML leftovers — second strip for {key}");
+                StripTrainingComponents(go);
             }
-            go.SetActive(true);
+            if (!VerifyJoinCloneSafe(go))
+                Debug.LogError(
+                    $"[StreamingSurvival] join clone STILL has Agent after strip: {key}");
             return go;
         }
 
+        Debug.LogWarning(
+            $"[StreamingSurvival] Jack visual template missing — capsule fallback for {key}");
+        return CreateCapsuleBody(key);
+    }
+
+    static bool VerifyJoinCloneSafe(GameObject go)
+    {
+        if (go == null) return false;
+        if (go.GetComponentInChildren<Agent>(true) != null) return false;
+        if (go.GetComponentInChildren<DecisionRequester>(true) != null) return false;
+        if (go.GetComponentInChildren<BehaviorParameters>(true) != null) return false;
+        return true;
+    }
+
+    static GameObject CreateCapsuleBody(string key)
+    {
         var capsule = GameObject.CreatePrimitive(PrimitiveType.Capsule);
         capsule.name = "SSPlayer_" + key;
         Object.Destroy(capsule.GetComponent<Collider>());
@@ -766,15 +872,50 @@ public sealed class StreamingSurvivalController : MonoBehaviour
     {
         if (go == null) return;
 
-        // Отключаем training/policy компоненты на клоне Jack (иначе клон сам бежит)
-        foreach (var a in go.GetComponentsInChildren<Agent>(true))
-            if (a != null) { a.enabled = false; Object.Destroy(a); }
+        // Join clone: модель Jack + Animator, но без ML-Agents (obs 15 vs 21 → crash стрима).
         foreach (var d in go.GetComponentsInChildren<DecisionRequester>(true))
-            if (d != null) { d.enabled = false; Object.Destroy(d); }
+            if (d != null) { d.enabled = false; Object.DestroyImmediate(d); }
         foreach (var b in go.GetComponentsInChildren<BehaviorParameters>(true))
-            if (b != null) { b.enabled = false; Object.Destroy(b); }
-        foreach (var l in go.GetComponentsInChildren<LilyScript>(true))
-            if (l != null) { l.enabled = false; Object.Destroy(l); }
+            if (b != null) { b.enabled = false; Object.DestroyImmediate(b); }
+        foreach (var a in go.GetComponentsInChildren<Agent>(true))
+            if (a != null) { a.enabled = false; Object.DestroyImmediate(a); }
+
+        foreach (var mb in go.GetComponentsInChildren<MonoBehaviour>(true))
+        {
+            if (mb == null || mb is StreamingSurvivalPlayer) continue;
+            if (mb is Agent)
+            {
+                mb.enabled = false;
+                Object.DestroyImmediate(mb);
+                continue;
+            }
+            string tn = mb.GetType().Name;
+            string ns = mb.GetType().Namespace ?? "";
+            if (ns.StartsWith("Unity.MLAgents", System.StringComparison.Ordinal))
+            {
+                mb.enabled = false;
+                Object.DestroyImmediate(mb);
+                continue;
+            }
+            if (ShouldStripJoinCloneScript(tn))
+            {
+                mb.enabled = false;
+                Object.DestroyImmediate(mb);
+            }
+        }
+
+        foreach (var cam in go.GetComponentsInChildren<Camera>(true))
+        {
+            if (cam == null) continue;
+            cam.enabled = false;
+            Object.DestroyImmediate(cam);
+        }
+        foreach (var listener in go.GetComponentsInChildren<AudioListener>(true))
+        {
+            if (listener == null) continue;
+            listener.enabled = false;
+            Object.DestroyImmediate(listener);
+        }
 
         foreach (var rb in go.GetComponentsInChildren<Rigidbody>(true))
         {
@@ -789,33 +930,45 @@ public sealed class StreamingSurvivalController : MonoBehaviour
         {
             if (nav == null) continue;
             nav.enabled = false;
-            Object.Destroy(nav);
+            Object.DestroyImmediate(nav);
         }
 
         foreach (var an in go.GetComponentsInChildren<Animator>(true))
         {
             if (an == null) continue;
             an.applyRootMotion = false;
+            an.cullingMode = AnimatorCullingMode.AlwaysAnimate;
             an.SetFloat("Speed", 0f);
         }
 
-        foreach (var mb in go.GetComponentsInChildren<MonoBehaviour>(true))
-        {
-            if (mb == null) continue;
-            if (mb is StreamingSurvivalPlayer) continue;
-            string tn = mb.GetType().Name;
-            if (tn.IndexOf("Sensor", System.StringComparison.OrdinalIgnoreCase) >= 0
-                || tn.IndexOf("RayPerception", System.StringComparison.OrdinalIgnoreCase) >= 0
-                || tn.IndexOf("Lidar", System.StringComparison.OrdinalIgnoreCase) >= 0
-                || tn.IndexOf("Observation", System.StringComparison.OrdinalIgnoreCase) >= 0
-                || tn.IndexOf("Reward", System.StringComparison.OrdinalIgnoreCase) >= 0
-                || tn.IndexOf("Training", System.StringComparison.OrdinalIgnoreCase) >= 0
-                || tn.IndexOf("ViewerSimple", System.StringComparison.OrdinalIgnoreCase) >= 0)
-            {
-                mb.enabled = false;
-                Object.Destroy(mb);
-            }
-        }
+        foreach (var leftover in go.GetComponentsInChildren<Agent>(true))
+            Debug.LogWarning(
+                $"[StreamingSurvival] join clone still has Agent on {leftover.gameObject.name}");
+    }
+
+    static bool ShouldStripJoinCloneScript(string typeName)
+    {
+        if (string.IsNullOrEmpty(typeName)) return false;
+        // ML / sensors / training
+        if (typeName.IndexOf("Sensor", System.StringComparison.OrdinalIgnoreCase) >= 0) return true;
+        if (typeName.IndexOf("RayPerception", System.StringComparison.OrdinalIgnoreCase) >= 0) return true;
+        if (typeName.IndexOf("Lidar", System.StringComparison.OrdinalIgnoreCase) >= 0) return true;
+        if (typeName.IndexOf("Observation", System.StringComparison.OrdinalIgnoreCase) >= 0) return true;
+        if (typeName.IndexOf("Reward", System.StringComparison.OrdinalIgnoreCase) >= 0) return true;
+        if (typeName.IndexOf("Training", System.StringComparison.OrdinalIgnoreCase) >= 0) return true;
+        if (typeName.IndexOf("ViewerSimple", System.StringComparison.OrdinalIgnoreCase) >= 0) return true;
+        // Jack/Lily/George ML gameplay — движение через StreamingSurvivalPlayer
+        if (typeName == "AgentGoToHouseDiscrete") return true;
+        if (typeName == "JackScript") return true;
+        if (typeName == "LilyScript") return true;
+        if (typeName == "GeorgeScript") return true;
+        if (typeName == "ManualPlayControl") return true;
+        if (typeName == "EnvTrainingConfig") return true;
+        // HUD обучения на клоне не нужен
+        if (typeName.IndexOf("Display", System.StringComparison.OrdinalIgnoreCase) >= 0) return true;
+        if (typeName == "HudHpBars") return true;
+        if (typeName == "TrainingGraphOverlay") return true;
+        return false;
     }
 
     public void RemovePlayer(string username)
@@ -889,8 +1042,8 @@ public sealed class StreamingSurvivalController : MonoBehaviour
 
     public void SyncUsers(List<StreamingSurvivalUserDto> users)
     {
-        // только состав игроков: кто есть / кого убрать.
-        // НЕ перезатирать SetAction — иначе сбрасывается очередь и прогресс добычи.
+        // Состав + для НОВЫХ тел после рестарта Unity восстановить action из roster.
+        // Уже живым игрокам action не трогаем (иначе сбросится очередь добычи).
         var keep = new HashSet<string>();
         if (users != null)
         {
@@ -901,7 +1054,14 @@ public sealed class StreamingSurvivalController : MonoBehaviour
                     continue;
                 string key = u.username.Trim().ToLowerInvariant();
                 keep.Add(key);
+                bool existed = _players.ContainsKey(key) && _players[key] != null;
                 EnsurePlayer(u.username);
+                if (!existed)
+                {
+                    string act = string.IsNullOrEmpty(u.action) ? "idle" : u.action;
+                    string actName = string.IsNullOrEmpty(u.action_name) ? "Ждёт у базы" : u.action_name;
+                    ApplyAction(u.username, act, actName, 1, null);
+                }
             }
         }
 

@@ -69,10 +69,11 @@ DEFAULT_CFG: dict[str, Any] = {
     "joint": {
         "init_jack": "97_stage2",
         "init_lily": "lily_1_stage2",
-        "init_george": "george_1_stage2",
+        "init_george": "george_1",
         "run_id": "jlg_finetune_1",
         "tb_run": "",
         "tb_runs": [],
+        "locked": None,
     },
     "chart_tags": [
         "Environment/Cumulative Reward",
@@ -119,16 +120,21 @@ _cfg_lock = threading.Lock()
 _jobs_lock = threading.Lock()
 _jobs: dict[str, dict[str, Any]] = {}
 _ssh_host_cache: str | None = None
-_ssh_gate = threading.Semaphore(2)  # не больше 2 параллельных ssh — иначе UI на Windows клинит
+_ssh_gate = threading.Semaphore(1)  # один живой ssh к lab — иначе на Windows копятся ssh.exe
 _ssh_active_lock = threading.Lock()
 # pid -> {proc, started, remote, host}
 _ssh_active: dict[int, dict[str, Any]] = {}
 _ssh_reaper_started = False
-_SSH_STALE_SEC = 35.0  # висячий ssh старше этого — kill
+_SSH_STALE_SEC = 22.0  # висячий ssh старше этого — kill
+_SSH_ORPHAN_SEC = 18.0  # сироты BatchMode вне учёта UI
+_SSH_WARN_COUNT = 6  # жёлтый/осторожно
+_SSH_BAD_COUNT = 10  # красный — близко к лимиту MaxSessions
+_ssh_count_cache: dict[str, Any] = {"t": 0.0, "local": 0}
+_ssh_count_lock = threading.Lock()
 _stats_lock = threading.Lock()
 _stats_cache: dict[str, Any] = {"t": 0.0, "data": None}
 _stats_inflight = False
-_STATS_CACHE_TTL = 6.0
+_STATS_CACHE_TTL = 8.0
 _STATS_STALE_MAX = 90.0
 _ss_sync_lock = threading.Lock()
 _ss_sync_last_at = 0.0
@@ -142,6 +148,7 @@ _EMPTY_ACTIVITY = {
     "stream": False,
     "streaming_survival": False,
     "llm_bot": False,
+    "obs": False,
     "tasks": [],
 }
 
@@ -279,6 +286,12 @@ def _ssh_bins() -> list[str]:
 
 
 def _ssh_probe(bin_: str, host: str, connect_timeout: int = 6) -> bool:
+    """Короткий ping. Идёт через общий gate — не плодит параллельные ssh.exe."""
+    if ui_runs_on_lab() or host == "local":
+        return True
+    got = _ssh_gate.acquire(timeout=2.0)
+    if not got:
+        return False
     try:
         r = subprocess.run(
             [
@@ -286,17 +299,110 @@ def _ssh_probe(bin_: str, host: str, connect_timeout: int = 6) -> bool:
                 "-o", "BatchMode=yes",
                 "-o", f"ConnectTimeout={connect_timeout}",
                 "-o", "ConnectionAttempts=1",
-                "-o", "ServerAliveInterval=3",
-                "-o", "ServerAliveCountMax=2",
+                "-o", "ServerAliveInterval=2",
+                "-o", "ServerAliveCountMax=1",
                 host,
                 "true",
             ],
             capture_output=True,
-            timeout=connect_timeout + 6,
+            timeout=connect_timeout + 3,
         )
         return r.returncode == 0
     except Exception:
         return False
+    finally:
+        _ssh_gate.release()
+
+
+def cleanup_orphan_batch_ssh(max_age: float | None = None) -> int:
+    """Убивает сиротские BatchMode ssh к lab (часто остаются после timeout на Windows).
+
+    Не трогает интерактивные/Cursor сессии без BatchMode=yes.
+    """
+    age_lim = float(_SSH_ORPHAN_SEC if max_age is None else max_age)
+    if os.name != "nt":
+        return 0
+    killed = 0
+    try:
+        r = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "$cut = (Get-Date).AddSeconds(-%d); "
+                "Get-CimInstance Win32_Process -Filter \"Name = 'ssh.exe'\" | "
+                "Where-Object { "
+                "  if (%d -le 0) { $true } "
+                "  else { $_.CreationDate -and ([Management.ManagementDateTimeConverter]::ToDateTime($_.CreationDate) -lt $cut) } "
+                "} | "
+                "ForEach-Object { "
+                "  $cl = [string]$_.CommandLine; "
+                "  if ($cl -match 'BatchMode=yes' -and ("
+                "      ($cl -match 'lab_comp') -or ($cl -match '192\\.168\\.194\\.7') -or "
+                "      ($cl -match '10\\.43\\.71\\.7') -or ($cl -match '192\\.168\\.50\\.18') -or "
+                "      ($cl -match 'lab_comp_local')"
+                "    )) { $_.ProcessId } "
+                "}" % (int(max(0, age_lim)), int(max(0, age_lim))),
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=8,
+        )
+        pids = []
+        for ln in (r.stdout or "").splitlines():
+            ln = ln.strip()
+            if ln.isdigit():
+                pids.append(int(ln))
+        tracked = set()
+        with _ssh_active_lock:
+            tracked = set(_ssh_active.keys())
+        for pid in pids:
+            if pid in tracked:
+                continue
+            try:
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(pid)],
+                    capture_output=True,
+                    timeout=4,
+                )
+                killed += 1
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return killed
+
+
+def cleanup_stale_ssh(max_age: float | None = None) -> int:
+    """Убивает висячие SSH, запущенные этим UI. Возвращает число убитых."""
+    age = float(_SSH_STALE_SEC if max_age is None else max_age)
+    now = time.time()
+    killed = 0
+    with _ssh_active_lock:
+        items = list(_ssh_active.items())
+    for pid, meta in items:
+        proc = meta.get("proc")
+        started = float(meta.get("started") or 0)
+        try:
+            alive = proc is not None and proc.poll() is None
+        except Exception:
+            alive = False
+        if not alive:
+            with _ssh_active_lock:
+                _ssh_active.pop(pid, None)
+            continue
+        if now - started < age:
+            continue
+        _kill_ssh_proc(proc)
+        with _ssh_active_lock:
+            _ssh_active.pop(pid, None)
+        killed += 1
+    # сироты BatchMode — отдельно, без рекурсии
+    if os.name == "nt":
+        killed += cleanup_orphan_batch_ssh(max_age=max(age, _SSH_ORPHAN_SEC))
+    return killed
 
 
 def _load_saved_ssh_host() -> str | None:
@@ -412,31 +518,103 @@ def _kill_ssh_proc(proc: subprocess.Popen) -> None:
         pass
 
 
-def cleanup_stale_ssh(max_age: float | None = None) -> int:
-    """Убивает висячие SSH, запущенные этим UI. Возвращает число убитых."""
-    age = float(_SSH_STALE_SEC if max_age is None else max_age)
+def _lab_ssh_cmdline_markers() -> tuple[str, ...]:
+    return (
+        "lab_comp",
+        "lab_comp_local",
+        "192.168.194.7",
+        "10.43.71.7",
+        "192.168.50.18",
+    )
+
+
+def _count_local_ssh_to_lab() -> int:
+    """Сколько ssh.exe/ssh на этом ПК смотрят на lab (без нового SSH)."""
+    markers = _lab_ssh_cmdline_markers()
     now = time.time()
-    killed = 0
+    with _ssh_count_lock:
+        age = now - float(_ssh_count_cache.get("t") or 0)
+        if age < 3.0 and _ssh_count_cache.get("t"):
+            return int(_ssh_count_cache.get("local") or 0)
+    n = 0
+    try:
+        if os.name == "nt":
+            r = subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-Command",
+                    "Get-CimInstance Win32_Process -Filter \"Name = 'ssh.exe'\" "
+                    "| Select-Object -ExpandProperty CommandLine",
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=4,
+            )
+            lines = (r.stdout or "").splitlines()
+        else:
+            r = subprocess.run(
+                ["ps", "-eo", "args="],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=3,
+            )
+            lines = [
+                ln
+                for ln in (r.stdout or "").splitlines()
+                if re.search(r"(^|[/\s])ssh(\.exe)?(\s|$)", ln)
+            ]
+        for ln in lines:
+            low = ln.lower()
+            if any(m.lower() in low for m in markers):
+                n += 1
+    except Exception:
+        n = 0
+    with _ssh_count_lock:
+        _ssh_count_cache["t"] = now
+        _ssh_count_cache["local"] = n
+    return n
+
+
+def ssh_sessions_snapshot(activity: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Сводка SSH для UI: локальные к lab + активные у UI + на lab (:22)."""
     with _ssh_active_lock:
-        items = list(_ssh_active.items())
-    for pid, meta in items:
-        proc = meta.get("proc")
-        started = float(meta.get("started") or 0)
+        ui_n = 0
+        for meta in _ssh_active.values():
+            proc = meta.get("proc")
+            try:
+                if proc is not None and proc.poll() is None:
+                    ui_n += 1
+            except Exception:
+                pass
+    local_n = _count_local_ssh_to_lab()
+    remote_n = None
+    if isinstance(activity, dict) and activity.get("ssh_remote") is not None:
         try:
-            alive = proc is not None and proc.poll() is None
-        except Exception:
-            alive = False
-        if not alive:
-            with _ssh_active_lock:
-                _ssh_active.pop(pid, None)
-            continue
-        if now - started < age:
-            continue
-        _kill_ssh_proc(proc)
-        with _ssh_active_lock:
-            _ssh_active.pop(pid, None)
-        killed += 1
-    return killed
+            remote_n = int(activity.get("ssh_remote"))
+        except (TypeError, ValueError):
+            remote_n = None
+    # Главный риск «too many sessions» — коннекты с ЭТОГО ПК к lab (BatchMode UI).
+    # remote (:22) считает ВСЕХ клиентов (Cursor и т.д.) — не раздуваем им красный total.
+    total = max(local_n, ui_n)
+    level = "ok"
+    if total >= _SSH_BAD_COUNT:
+        level = "bad"
+    elif total >= _SSH_WARN_COUNT:
+        level = "warn"
+    return {
+        "local": local_n,
+        "ui": ui_n,
+        "remote": remote_n,
+        "total": total,
+        "warn_at": _SSH_WARN_COUNT,
+        "bad_at": _SSH_BAD_COUNT,
+        "level": level,
+    }
 
 
 def _ensure_ssh_reaper() -> None:
@@ -446,12 +624,18 @@ def _ensure_ssh_reaper() -> None:
     _ssh_reaper_started = True
 
     def loop() -> None:
+        # сразу подчистить зомби от прошлого запуска UI
+        try:
+            cleanup_orphan_batch_ssh(max_age=8.0)
+            cleanup_stale_ssh(max_age=12.0)
+        except Exception:
+            pass
         while True:
             try:
                 cleanup_stale_ssh()
             except Exception:
                 pass
-            time.sleep(8.0)
+            time.sleep(5.0)
 
     threading.Thread(target=loop, name="ssh-stale-reaper", daemon=True).start()
 
@@ -611,6 +795,9 @@ def ssh_run(
                     _ssh_host_cache = h
                     _save_ssh_host(h)
                     return r
+                # connect fail — процесс мог остаться зомби на Windows
+                if proc is not None:
+                    _kill_ssh_proc(proc)
                 clear_ssh_host_cache()
             except Exception as e:
                 last_exc = e
@@ -1131,20 +1318,194 @@ def list_result_dirs(host: str) -> list[str]:
         return []
 
 
+def _fmt_steps(n: int | None) -> str:
+    if n is None or n < 0:
+        return ""
+    if n >= 1_000_000:
+        s = f"{n / 1_000_000:.1f}".rstrip("0").rstrip(".")
+        return f"{s}M"
+    if n >= 1000:
+        if n % 1000 == 0:
+            return f"{n // 1000}k"
+        return f"{n / 1000:.1f}".rstrip("0").rstrip(".") + "k"
+    return str(n)
+
+
+def probe_joint_run_weights(host: str, runs: dict[str, str]) -> dict[str, Any]:
+    """Проверка results/<run>/<behavior>/*.pt → exists + max step."""
+    # runs: { "jack": "97_stage2", "lily": "...", "george": "...", "run": "jlg_..." }
+    mapping = {
+        "jack": ("JackLowLevelAgent",),
+        "lily": ("LilyLowLevelAgent",),
+        "george": ("GeorgeLowLevelAgent",),
+        "run": ("JackLowLevelAgent", "LilyLowLevelAgent", "GeorgeLowLevelAgent"),
+    }
+    parts: list[str] = []
+    order: list[tuple[str, str]] = []
+    for key, behaviors in mapping.items():
+        rid = sanitize_run_id(runs.get(key) or "")
+        if not rid:
+            continue
+        for beh in behaviors:
+            order.append((key, beh))
+            parts.append(f"{rid}|{beh}")
+    if not parts:
+        return {"ok": True, "items": {}}
+
+    remote = f"""
+python3 - <<'PY'
+import os, re, json
+root = os.path.expanduser("{REMOTE_DIR}/results")
+specs = {parts!r}
+out = []
+for spec in specs:
+    run, beh = spec.split("|", 1)
+    d = os.path.join(root, run, beh)
+    exists = os.path.isdir(d)
+    best = -1
+    if exists:
+        rx = re.compile(r"^" + re.escape(beh) + r"-(\\d+)\\.pt$")
+        for name in os.listdir(d):
+            m = rx.match(name)
+            if m:
+                best = max(best, int(m.group(1)))
+        if best < 0 and os.path.isfile(os.path.join(d, "checkpoint.pt")):
+            best = 0
+    out.append({{"run": run, "behavior": beh, "exists": exists, "steps": best}})
+print(json.dumps(out, ensure_ascii=False))
+PY
+"""
+    try:
+        r = ssh_run(host, remote, timeout=25, gate_timeout=12.0)
+        rows = json.loads((r.stdout or "").strip().splitlines()[-1] if (r.stdout or "").strip() else "[]")
+    except Exception as e:
+        return {"ok": False, "error": str(e), "items": {}}
+
+    items: dict[str, Any] = {}
+    for key, _ in mapping.items():
+        rid = sanitize_run_id(runs.get(key) or "")
+        if not rid:
+            continue
+        beh_rows = [row for row in rows if row.get("run") == rid]
+        if key == "run":
+            steps_map = {
+                row["behavior"].replace("LowLevelAgent", ""): row.get("steps", -1)
+                for row in beh_rows
+            }
+            has_w = any(int(row.get("steps", -1)) >= 0 and row.get("exists") for row in beh_rows)
+            exists = any(row.get("exists") for row in beh_rows) or bool(beh_rows)
+            # folder may exist even if empty — check dir
+            if not beh_rows:
+                exists = False
+            parts_txt = []
+            for short, beh_full in (
+                ("Jack", "JackLowLevelAgent"),
+                ("Lily", "LilyLowLevelAgent"),
+                ("George", "GeorgeLowLevelAgent"),
+            ):
+                st = next((int(row.get("steps", -1)) for row in beh_rows if row.get("behavior") == beh_full), -1)
+                if st > 0:
+                    parts_txt.append(f"{short} {_fmt_steps(st)}")
+                elif st == 0:
+                    parts_txt.append(f"{short} ckpt")
+            items[key] = {
+                "run_id": rid,
+                "exists": exists,
+                "has_weights": has_w,
+                "steps": steps_map,
+                "label": ("есть · " + " · ".join(parts_txt)) if parts_txt else ("есть (нет .pt)" if exists else "нет папки"),
+            }
+        else:
+            want_beh = mapping[key][0]
+            row = next((x for x in beh_rows if x.get("behavior") == want_beh), None)
+            st = int(row.get("steps", -1)) if row else -1
+            exists = bool(row and row.get("exists"))
+            if st > 0:
+                label = f"есть · {_fmt_steps(st)}"
+            elif st == 0:
+                label = "есть · checkpoint.pt"
+            elif exists:
+                label = "есть (нет .pt)"
+            else:
+                label = "нет папки"
+            items[key] = {
+                "run_id": rid,
+                "exists": exists,
+                "has_weights": st >= 0 and exists,
+                "steps": st,
+                "label": label,
+            }
+    return {"ok": True, "items": items}
+
+
 def _parse_activity_json(raw: str) -> dict[str, Any]:
     empty = dict(_EMPTY_ACTIVITY)
     empty["tasks"] = []
+    empty["stream_fps"] = {}
     try:
         data = json.loads(raw) if raw.startswith("{") else empty
     except Exception:
         data = empty
+    if not isinstance(data, dict):
+        data = empty
+    out = dict(empty)
     for k in _EMPTY_ACTIVITY:
         if k == "tasks":
-            data["tasks"] = list(data.get("tasks") or [])
+            out["tasks"] = list(data.get("tasks") or [])
         else:
-            data[k] = bool(data.get(k))
-    data["ok"] = True
-    return data
+            out[k] = bool(data.get(k))
+    # stream_fps / ssh_remote не булевы — протаскиваем как есть
+    fps = data.get("stream_fps")
+    out["stream_fps"] = fps if isinstance(fps, dict) else {}
+    if data.get("ssh_remote") is not None:
+        try:
+            out["ssh_remote"] = int(data.get("ssh_remote"))
+        except Exception:
+            pass
+    # страховка: если в tasks есть stream/obs — флаги тоже true
+    for t in out["tasks"]:
+        if not isinstance(t, dict):
+            continue
+        kind = str(t.get("kind") or "")
+        if kind == "stream":
+            out["stream"] = True
+        if kind == "obs":
+            out["obs"] = True
+    out["ok"] = True
+    if isinstance(data.get("metrics"), dict):
+        out["metrics"] = data["metrics"]
+    return out
+
+
+def _extract_activity_json_line(blob: str) -> str:
+    """Берём самый полный ACTIVITY JSON (не случайный {…} из stderr)."""
+    best = ""
+    best_score = -1
+    for ln in (blob or "").splitlines():
+        s = ln.strip()
+        if not s.startswith("{") or "stream" not in s:
+            continue
+        score = 0
+        if '"tasks"' in s:
+            score += 5
+        if '"stream_fps"' in s:
+            score += 3
+        if '"obs"' in s:
+            score += 2
+        if '"llm_bot"' in s:
+            score += 1
+        score += min(len(s), 50000) // 1000
+        if score > best_score:
+            best_score = score
+            best = s
+    if best:
+        return best
+    # fallback: последняя строка-объект
+    for ln in reversed((blob or "").splitlines()):
+        s = ln.strip()
+        if s.startswith("{"):
+            return s
+    return ""
 
 
 # Remote: RAM + GPU + activity JSON в ОДНОМ ssh (иначе UI висит на двух вызовах).
@@ -1164,7 +1525,7 @@ ps -eo pid,pcpu,pmem,comm --sort=-pcpu | head -n 8
 echo
 echo '=== ACTIVITY_JSON ==='
 python3 - <<'PY'
-import json, os, re
+import json, os, re, time
 me = str(os.getpid())
 parent = str(os.getppid())
 cmds = []
@@ -1225,6 +1586,15 @@ stream = any(
     and ("forestStreamingSurvival" not in c)
     for c in cmds
 )
+if not stream:
+    try:
+        import subprocess as _sp
+        stream = (
+            _sp.call(["pgrep", "-f", "stream_onnx_infer\\.py"], stdout=_sp.DEVNULL, stderr=_sp.DEVNULL) == 0
+            or _sp.call(["pgrep", "-f", "forestStreamOnly"], stdout=_sp.DEVNULL, stderr=_sp.DEVNULL) == 0
+        )
+    except Exception:
+        pass
 streaming_survival = any(
     (not is_ui_noise(c)) and ("forestStreamingSurvival" in c)
     for c in cmds
@@ -1277,6 +1647,311 @@ if streaming_survival:
     tasks.append({"id": "streaming_survival", "kind": "streaming_survival", "label": "Streaming Survival", "kill": "streaming_survival"})
 if llm_bot:
     tasks.append({"id": "llm_bot", "kind": "llm_bot", "label": "LLM Bot", "kill": "llm_bot"})
+obs = any((not is_ui_noise(c)) and re.search(r"(?:^|[\s/])obs(?:\s|$)", c) for c in cmds)
+if not obs:
+    try:
+        import subprocess as _sp
+        obs = _sp.call(["pgrep", "-x", "obs"], stdout=_sp.DEVNULL, stderr=_sp.DEVNULL) == 0
+    except Exception:
+        obs = False
+if obs:
+    tasks.append({"id": "obs", "kind": "obs", "label": "OBS Studio (--startstreaming)", "kill": "obs"})
+
+def stream_fps():
+    root = os.path.expanduser("~/lab_work_space/forest_survival/results")
+    now = time.time()
+    js = os.path.join(root, "stream_fps.json")
+    jsonl = os.path.join(root, "stream_fps.jsonl")
+
+    def _recent_points(window_s: float = 10.5, max_pts: int = 25):
+        pts = []
+        if not os.path.isfile(jsonl):
+            return pts
+        try:
+            with open(jsonl, "rb") as f:
+                f.seek(0, 2)
+                n = f.tell()
+                f.seek(max(0, n - 262144))
+                tail = f.read().decode("utf-8", "replace")
+        except OSError:
+            return pts
+        cutoff = now - window_s
+        for ln in tail.splitlines():
+            ln = ln.strip()
+            if not ln:
+                continue
+            try:
+                d = json.loads(ln)
+            except Exception:
+                continue
+            if not isinstance(d, dict):
+                continue
+            ts = d.get("ts")
+            if not isinstance(ts, (int, float)) or ts < cutoff:
+                continue
+            fps_v = d.get("fps")
+            hitch_v = d.get("hitch_dt_ms")
+            pts.append(
+                {
+                    "ts": round(float(ts), 2),
+                    "fps": float(fps_v) if isinstance(fps_v, (int, float)) else None,
+                    "hitch_dt_ms": int(hitch_v) if isinstance(hitch_v, (int, float)) else None,
+                    "kind": str(d.get("kind") or ""),
+                }
+            )
+        if len(pts) > max_pts:
+            pts = pts[-max_pts:]
+        return pts
+
+    def _decorate(out):
+        hist = _recent_points(10.5, 25)
+        out["history_10s"] = hist
+        out["stream_on"] = bool(stream)
+        n = out.get("fps")
+        hitch = out.get("hitch_dt_ms")
+        lag_now = isinstance(n, (int, float)) and float(n) < 15.0
+        lag_now = lag_now or (isinstance(hitch, (int, float)) and int(hitch) >= 800)
+        lag_10s = any(
+            ((p.get("fps") is not None and float(p.get("fps")) < 15.0)
+             or (p.get("hitch_dt_ms") is not None and int(p.get("hitch_dt_ms")) >= 800))
+            for p in hist
+        )
+        out["lag_now"] = bool(lag_now)
+        out["lag_10s"] = bool(lag_10s)
+        # min/max: из snapshot сессии, иначе из jsonl за ~30 мин
+        fmin = out.get("fps_min")
+        fmax = out.get("fps_max")
+        if not isinstance(fmin, (int, float)) or not isinstance(fmax, (int, float)):
+            long_hist = _recent_points(30 * 60, 400)
+            vals = [
+                float(p["fps"])
+                for p in long_hist
+                if isinstance(p.get("fps"), (int, float))
+            ]
+            if isinstance(n, (int, float)):
+                vals.append(float(n))
+            if vals:
+                fmin = min(vals) if not isinstance(fmin, (int, float)) else fmin
+                fmax = max(vals) if not isinstance(fmax, (int, float)) else fmax
+        if isinstance(fmin, (int, float)):
+            out["fps_min"] = round(float(fmin), 1)
+        if isinstance(fmax, (int, float)):
+            out["fps_max"] = round(float(fmax), 1)
+        return out
+
+    if os.path.isfile(js) and (now - os.path.getmtime(js) < 12):
+        try:
+            with open(js, encoding="utf-8") as f:
+                d = json.load(f)
+            if isinstance(d, dict):
+                d["source"] = d.get("source") or "json"
+                d["age_s"] = round(now - os.path.getmtime(js), 1)
+                return _decorate(d)
+        except Exception:
+            pass
+    logs = []
+    try:
+        for name in os.listdir(root):
+            if name.startswith("stream_onnx_") and name.endswith(".log"):
+                logs.append(os.path.join(root, name))
+    except OSError:
+        return {}
+    if not logs:
+        return {}
+    path = max(logs, key=os.path.getmtime)
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            n = f.tell()
+            f.seek(max(0, n - 32000))
+            tail = f.read().decode("utf-8", "replace")
+    except OSError:
+        return {}
+    summary = hitch = ""
+    for ln in tail.splitlines():
+        if " fps≈" in ln and "steps=" in ln:
+            summary = ln.strip()
+        if "HITCH " in ln:
+            hitch = ln.strip()
+    out = {"source": "log", "log": os.path.basename(path), "summary": summary, "hitch": hitch}
+    m = re.search(
+        r"steps=(\d+) fps≈([\d.]+) step≈([\d.]+)ms hitches=(\d+) slow\(>(\d+)ms\)=(\d+)",
+        summary,
+    )
+    if m:
+        out.update(
+            steps=int(m.group(1)),
+            fps=float(m.group(2)),
+            step_ms=float(m.group(3)),
+            hitches=int(m.group(4)),
+            slow=int(m.group(6)),
+        )
+    hm = re.search(r"HITCH step=(\d+) dt=(\d+)ms .* / (\d+) FPS", hitch)
+    if hm:
+        out.update(
+            hitch_step=int(hm.group(1)),
+            hitch_dt_ms=int(hm.group(2)),
+            hitch_ema_fps=int(hm.group(3)),
+        )
+    try:
+        out["age_s"] = round(now - os.path.getmtime(path), 1)
+    except OSError:
+        pass
+    return _decorate(out)
+
+ssh_remote = 0
+try:
+    import subprocess as _sp
+    out = _sp.check_output(
+        "ss -tn state established '( sport = :22 )' 2>/dev/null | tail -n +2 | wc -l",
+        shell=True,
+        universal_newlines=True,
+        timeout=2,
+    )
+    ssh_remote = int((out or "0").strip() or 0)
+except Exception:
+    ssh_remote = 0
+
+def _gib(n):
+    return round(float(n) / (1024.0 ** 3), 1)
+
+def collect_metrics():
+    m = {}
+    try:
+        info = {}
+        with open("/proc/meminfo") as f:
+            for ln in f:
+                parts = ln.split()
+                if len(parts) >= 2:
+                    info[parts[0].rstrip(":")] = int(parts[1])
+        total_b = info.get("MemTotal", 0) * 1024
+        avail_b = info.get("MemAvailable", 0) * 1024
+        used_b = max(0, total_b - avail_b)
+        m["ram"] = {
+            "used_gib": _gib(used_b),
+            "total_gib": _gib(total_b),
+            "avail_gib": _gib(avail_b),
+            "pct": round(100.0 * used_b / total_b, 1) if total_b else 0.0,
+        }
+        st = info.get("SwapTotal", 0) * 1024
+        sf = info.get("SwapFree", 0) * 1024
+        su = max(0, st - sf)
+        m["swap"] = {
+            "used_gib": _gib(su),
+            "total_gib": _gib(st),
+            "pct": round(100.0 * su / st, 1) if st else 0.0,
+        }
+    except Exception:
+        pass
+    try:
+        import shutil
+        home = os.path.expanduser("~")
+        u = shutil.disk_usage(home)
+        m["disk"] = {
+            "path": home,
+            "free_gib": _gib(u.free),
+            "used_gib": _gib(u.used),
+            "total_gib": _gib(u.total),
+            "pct": round(100.0 * u.used / u.total, 1) if u.total else 0.0,
+        }
+    except Exception:
+        pass
+    gpus = []
+    try:
+        import subprocess as _sp
+        out = _sp.check_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,name,memory.used,memory.total,utilization.gpu,temperature.gpu",
+                "--format=csv,noheader,nounits",
+            ],
+            universal_newlines=True,
+            timeout=3,
+        )
+        for ln in (out or "").strip().splitlines():
+            parts = [p.strip() for p in ln.split(",")]
+            if len(parts) < 6:
+                continue
+            vu, vt = float(parts[2]), float(parts[3])
+            gpus.append({
+                "index": int(float(parts[0])),
+                "name": parts[1],
+                "vram_used_mib": vu,
+                "vram_total_mib": vt,
+                "vram_used_gib": round(vu / 1024.0, 1),
+                "vram_total_gib": round(vt / 1024.0, 1),
+                "vram_pct": round(100.0 * vu / vt, 1) if vt else 0.0,
+                "util": int(float(parts[4])),
+                "temp": int(float(parts[5])),
+            })
+    except Exception:
+        pass
+    m["gpus"] = gpus
+    procs = []
+    try:
+        import subprocess as _sp
+        import pwd
+        out = _sp.check_output(
+            ["nvidia-smi", "--query-compute-apps=pid,used_gpu_memory", "--format=csv,noheader,nounits"],
+            universal_newlines=True,
+            timeout=3,
+        )
+        for ln in (out or "").strip().splitlines():
+            parts = [p.strip() for p in ln.split(",")]
+            if len(parts) < 2:
+                continue
+            try:
+                pid = int(float(parts[0]))
+                used = float(parts[1])
+            except Exception:
+                continue
+            user, comm = "?", "?"
+            try:
+                with open("/proc/%d/status" % pid) as f:
+                    for sl in f:
+                        if sl.startswith("Name:"):
+                            comm = sl.split(":", 1)[1].strip()
+                        elif sl.startswith("Uid:"):
+                            uid = int(sl.split()[1])
+                            try:
+                                user = pwd.getpwuid(uid).pw_name
+                            except Exception:
+                                user = str(uid)
+            except Exception:
+                pass
+            procs.append({
+                "pid": pid,
+                "user": user,
+                "comm": comm,
+                "used_mib": used,
+                "used_gib": round(used / 1024.0, 1),
+                "label": "%s %.1fG" % (user, used / 1024.0),
+            })
+    except Exception:
+        pass
+    m["gpu_procs"] = procs
+    top = []
+    try:
+        import subprocess as _sp
+        out = _sp.check_output(
+            ["ps", "-eo", "pid,pcpu,pmem,comm", "--sort=-pcpu"],
+            universal_newlines=True,
+            timeout=2,
+        )
+        for ln in (out or "").strip().splitlines()[1:8]:
+            parts = ln.split(None, 3)
+            if len(parts) < 4:
+                continue
+            top.append({
+                "pid": int(parts[0]),
+                "cpu": float(parts[1]),
+                "mem": float(parts[2]),
+                "comm": parts[3],
+            })
+    except Exception:
+        pass
+    m["top_cpu"] = top
+    return m
 
 print(json.dumps({
     "jack": bool(jack),
@@ -1287,7 +1962,11 @@ print(json.dumps({
     "stream": bool(stream),
     "streaming_survival": bool(streaming_survival),
     "llm_bot": bool(llm_bot),
+    "obs": bool(obs),
     "tasks": tasks,
+    "stream_fps": stream_fps(),
+    "ssh_remote": int(ssh_remote),
+    "metrics": collect_metrics(),
 }))
 PY
 """
@@ -1308,31 +1987,45 @@ def fetch_lab_activity(host: str | None = None) -> dict[str, Any]:
 def _fetch_server_stats_uncached(host: str | None = None) -> dict[str, Any]:
     """RAM + nvidia-smi + activity JSON (SSH или local, если UI на lab)."""
     try:
+        t0 = time.time()
         r = ssh_run(host, _REMOTE_STATS_AND_ACTIVITY, timeout=18, gate_timeout=8.0)
+        latency_ms = int(max(0.0, (time.time() - t0) * 1000))
         used = "local" if ui_runs_on_lab() else (_ssh_host_cache or host or "?")
-        full = ((r.stdout or "") + (r.stderr or "")).strip()
+        # stdout отдельно: stderr часто содержит чужие {...} и ломал парсер activity
+        out_s = (r.stdout or "").strip()
+        err_s = (r.stderr or "").strip()
+        full = (out_s + ("\n" + err_s if err_s else "")).strip()
         marker = "=== ACTIVITY_JSON ==="
-        if marker in full:
+        metrics: dict[str, Any] = {}
+        if marker in out_s:
+            head, _, tail = out_s.partition(marker)
+            text = head.strip()
+            act_line = _extract_activity_json_line(tail)
+            activity = _parse_activity_json(act_line)
+            raw_m = activity.pop("metrics", None) if isinstance(activity, dict) else None
+            if isinstance(raw_m, dict):
+                metrics = raw_m
+        elif marker in full:
             head, _, tail = full.partition(marker)
             text = head.strip()
-            act_line = ""
-            for ln in reversed(tail.strip().splitlines()):
-                ln = ln.strip()
-                if ln.startswith("{"):
-                    act_line = ln
-                    break
+            act_line = _extract_activity_json_line(tail)
             activity = _parse_activity_json(act_line)
+            raw_m = activity.pop("metrics", None) if isinstance(activity, dict) else None
+            if isinstance(raw_m, dict):
+                metrics = raw_m
         else:
             text = full
             activity = dict(_EMPTY_ACTIVITY)
             activity["tasks"] = []
             activity["ok"] = False
         return {
-            "ok": r.returncode == 0 and bool(text),
+            "ok": r.returncode == 0 and bool(text or metrics or (activity or {}).get("ok")),
             "text": text or "(пусто)",
             "host": used,
             "mode": "local" if ui_runs_on_lab() else "ssh",
             "activity": activity,
+            "metrics": metrics,
+            "latency_ms": latency_ms,
             "pending": False,
             "tried": ["local"] if ui_runs_on_lab() else [],
         }
@@ -1348,6 +2041,8 @@ def _fetch_server_stats_uncached(host: str | None = None) -> dict[str, Any]:
             "host": "local" if ui_runs_on_lab() else (host or "?"),
             "mode": "local" if ui_runs_on_lab() else "ssh",
             "activity": act,
+            "metrics": {},
+            "latency_ms": None,
             "pending": False,
             "tried": list(ssh_candidates("lab_comp")),
         }
@@ -1362,6 +2057,8 @@ def _stats_pending_payload(host: str | None = None) -> dict[str, Any]:
         "text": "загрузка RAM / nvidia-smi c lab_comp...",
         "host": host or _ssh_host_cache or "lab_comp",
         "activity": act,
+        "metrics": {},
+        "latency_ms": None,
     }
 
 
@@ -1442,10 +2139,464 @@ def start_stats_background_loop() -> None:
     threading.Thread(target=loop, name="lab-stats-loop", daemon=True).start()
 
 
+_RE_SNAP_AGENT = re.compile(
+    r"^\s*(Jack|Lily|George)=(?:null|\((?P<x>-?\d+(?:\.\d+)?),(?P<z>-?\d+(?:\.\d+)?)\)"
+    r"(?:\s+y=(?P<y>-?\d+(?:\.\d+)?))?"
+    r"(?:\s+hp=(?P<hp>-?\d+))?"
+    r"(?:\s+sat=(?P<sat>-?\d+))?"
+    r"(?:\s+heat=(?P<heat>-?\d+))?"
+    r"(?:\s+water=(?P<water>-?\d+))?"
+    r"(?:\s+wood=(?P<wood>-?\d+))?"
+    r"(?P<dead>\s+DEAD)?)",
+    re.M,
+)
+_RE_SNAP_XZ_LIST = re.compile(
+    r"^\s*(trees|sheep|zombies)=(?:\[(?P<body>[^\]]*)\]|\[\])\s+n=(?P<n>\d+)(?:/(?P<target>\d+))?",
+    re.M,
+)
+_RE_XZ_PAIR = re.compile(r"\((-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)\)")
+_RE_RECT_XZ = re.compile(
+    r"\((-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?),sx=(-?\d+(?:\.\d+)?),sz=(-?\d+(?:\.\d+)?)\)"
+)
+_RE_LANDMARKS = re.compile(
+    r"^\s*landmarks(?:\s+house=\((?P<hx>-?\d+(?:\.\d+)?),(?P<hz>-?\d+(?:\.\d+)?)\))?"
+    r"(?:\s+lakes=(?:\[(?P<lakes>[^\]]*)\]|\[\]))?"
+    r"(?:\s+stones=(?:\[(?P<stones>[^\]]*)\]|\[\]))?"
+    r"(?:\s+n_stones=\d+)?"
+    r"(?:\s+fences=(?:\[(?P<fences>[^\]]*)\]|\[\]))?",
+    re.M,
+)
+
+# ForestScene / SS world map fallback (пока стрим без нового DLL).
+_PRES_LANDMARKS_FALLBACK_PATH = ROOT / "train_scripts" / "lab_comp" / "pres_world_landmarks_fallback.json"
+_PRES_LANDMARKS_FALLBACK: dict[str, Any] = {
+    "house": {"x": -3.27, "z": 18.85},
+    "lakes": [{"x": 21.96, "z": 33.84, "sx": 12.0, "sz": 10.0}],
+    "stones": [{"x": 22.23, "z": 18.05}],
+    "fences": [],
+    "source": "scene_fallback",
+}
+
+
+def _load_pres_landmarks_fallback() -> dict[str, Any]:
+    try:
+        if _PRES_LANDMARKS_FALLBACK_PATH.is_file():
+            data = json.loads(_PRES_LANDMARKS_FALLBACK_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and (data.get("house") or data.get("fences") or data.get("lakes")):
+                data.setdefault("source", "file_fallback")
+                return data
+    except Exception:
+        pass
+    return dict(_PRES_LANDMARKS_FALLBACK)
+
+
+def _parse_xz_list(body: str) -> list[dict[str, float]]:
+    out: list[dict[str, float]] = []
+    if not body:
+        return out
+    for m in _RE_XZ_PAIR.finditer(body):
+        out.append({"x": float(m.group(1)), "z": float(m.group(2))})
+    return out
+
+
+def _parse_rect_list(body: str) -> list[dict[str, float]]:
+    out: list[dict[str, float]] = []
+    if not body:
+        return out
+    for m in _RE_RECT_XZ.finditer(body):
+        out.append({
+            "x": float(m.group(1)),
+            "z": float(m.group(2)),
+            "sx": float(m.group(3)),
+            "sz": float(m.group(4)),
+        })
+    return out
+
+
+def _parse_landmarks_block(block: str) -> dict[str, Any] | None:
+    m = _RE_LANDMARKS.search(block)
+    if not m:
+        return None
+    lm: dict[str, Any] = {
+        "house": None,
+        "lakes": [],
+        "stones": [],
+        "fences": [],
+        "source": "log",
+    }
+    if m.group("hx") is not None:
+        lm["house"] = {"x": float(m.group("hx")), "z": float(m.group("hz"))}
+    lm["lakes"] = _parse_rect_list(m.group("lakes") or "")
+    lm["stones"] = _parse_xz_list(m.group("stones") or "")
+    lm["fences"] = _parse_rect_list(m.group("fences") or "")
+    if not lm["house"] and not lm["lakes"] and not lm["stones"] and not lm["fences"]:
+        return None
+    return lm
+
+
+def _ensure_landmarks(data: dict[str, Any]) -> dict[str, Any]:
+    """Подставляет fallback из ForestScene/SS map, если стрим ещё не пишет landmarks."""
+    lm = data.get("landmarks")
+    if isinstance(lm, dict) and (
+        lm.get("house") or lm.get("lakes") or lm.get("stones") or lm.get("fences")
+    ):
+        # если live/log дал дом/озеро без забора — дорисуем забор из fallback
+        fb = _load_pres_landmarks_fallback()
+        if not lm.get("fences") and fb.get("fences"):
+            lm = dict(lm)
+            lm["fences"] = fb["fences"]
+            if not lm.get("stones") and fb.get("stones"):
+                lm["stones"] = fb["stones"]
+            lm["source"] = str(lm.get("source") or "partial") + "+fence_fallback"
+            data["landmarks"] = lm
+    else:
+        data["landmarks"] = _load_pres_landmarks_fallback()
+    # кадры эпизода наследуют landmarks для карты
+    frames = data.get("episode_frames")
+    shared = data.get("landmarks")
+    if isinstance(frames, dict) and isinstance(shared, dict):
+        for key in ("start", "end"):
+            fr = frames.get(key)
+            if not isinstance(fr, dict):
+                continue
+            fl = fr.get("landmarks")
+            if not isinstance(fl, dict) or not (
+                fl.get("house") or fl.get("lakes") or fl.get("fences") or fl.get("stones")
+            ):
+                fr["landmarks"] = shared
+            elif not fl.get("fences") and shared.get("fences"):
+                fl = dict(fl)
+                fl["fences"] = shared["fences"]
+                if not fl.get("stones") and shared.get("stones"):
+                    fl["stones"] = shared["stones"]
+                fr["landmarks"] = fl
+    return data
+
+
+def _empty_agent(name: str) -> dict[str, Any]:
+    return {"name": name, "ok": False}
+
+
+def _map_frame_from_snap(snap: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Урезанный кадр для XZ-карты (начало/конец эпизода)."""
+    if not isinstance(snap, dict) or not snap.get("ok", True):
+        return None
+    keys = (
+        "ts", "reason", "episode_index", "t",
+        "trees", "sheep", "zombies",
+        "trees_n", "sheep_n", "zombies_n",
+        "trees_target", "sheep_target",
+        "jack", "lily", "george", "landmarks",
+    )
+    out = {k: snap.get(k) for k in keys if k in snap}
+    out["ok"] = True
+    return out
+
+
+def parse_presentation_world_log(text: str) -> dict[str, Any]:
+    """Парсит stream_world_snapshot.log → текущий SNAP + last_round / episode."""
+    if not text:
+        return {"ok": False, "error": "empty log"}
+
+    # Блоки SNAP: от строки [SNAP:…] до следующего timestamp-события/SNAP.
+    snap_starts = [m.start() for m in re.finditer(r"(?m)^\d{4}-\d{2}-\d{2}[^\n]*\[SNAP:", text)]
+    if not snap_starts:
+        return {"ok": False, "error": "no SNAP in log"}
+
+    def parse_snap(block: str) -> dict[str, Any]:
+        head = block.split("\n", 1)[0]
+        reason, env, ep_idx, tval = "tick", "?", 0, 0.0
+        hm = re.search(r"\[SNAP:([^\]]+)\]\s+env=(\S+)\s+ep=(\d+)\s+t=([\d.]+)", head)
+        if hm:
+            reason, env = hm.group(1), hm.group(2)
+            ep_idx, tval = int(hm.group(3)), float(hm.group(4))
+        else:
+            hm_old = re.search(r"\[SNAP:([^\]]+)\]\s+env=(\S+)\s+t=([\d.]+)", head)
+            if hm_old:
+                reason, env = hm_old.group(1), hm_old.group(2)
+                tval = float(hm_old.group(3))
+        ts = head[:23] if len(head) >= 23 else ""
+        agents = {"jack": _empty_agent("Jack"), "lily": _empty_agent("Lily"), "george": _empty_agent("George")}
+        for am in _RE_SNAP_AGENT.finditer(block):
+            name = am.group(1)
+            key = name.lower()
+            if am.group(0).endswith("=null") or "null" in am.group(0).split("=", 1)[-1][:4]:
+                agents[key] = _empty_agent(name)
+                continue
+            agents[key] = {
+                "name": name,
+                "ok": True,
+                "x": float(am.group("x")),
+                "z": float(am.group("z")),
+                "y": float(am.group("y") or 0),
+                "hp": int(am.group("hp") or -1),
+                "water": int(am.group("water") or -1),
+                "wood": int(am.group("wood") or -1),
+                "dead": bool(am.group("dead")),
+            }
+        world: dict[str, Any] = {
+            "trees": [], "sheep": [], "zombies": [],
+            "trees_n": 0, "sheep_n": 0, "zombies_n": 0,
+            "trees_target": 0, "sheep_target": 0,
+        }
+        for lm in _RE_SNAP_XZ_LIST.finditer(block):
+            kind = lm.group(1)
+            pts = _parse_xz_list(lm.group("body") or "")
+            n = int(lm.group("n") or 0)
+            target = int(lm.group("target") or 0)
+            world[kind] = pts
+            world[f"{kind}_n"] = n
+            if kind in ("trees", "sheep") and target:
+                world[f"{kind}_target"] = target
+        landmarks = _parse_landmarks_block(block)
+        out = {
+            "ok": True,
+            "ts": ts,
+            "reason": reason,
+            "env": env,
+            "episode_index": ep_idx,
+            "t": tval,
+            **world,
+            "jack": agents["jack"],
+            "lily": agents["lily"],
+            "george": agents["george"],
+        }
+        if landmarks:
+            out["landmarks"] = landmarks
+        return out
+
+    # episode / last_round из последовательности SNAP
+    episode = {"water": 0, "wood": 0, "sheep_killed": 0, "trees_chopped": 0}
+    last_round = {"water": 0, "wood": 0, "sheep_killed": 0, "trees_chopped": 0, "episode": 0, "at": ""}
+    prev_w = {"jack": -1, "lily": -1, "george": -1}
+    prev_wood = {"jack": -1, "george": -1}
+    prev_sheep = prev_trees = -1
+    ep_active = False
+    episode_index = 0
+    inferred_ep = 0
+    cur_start: dict[str, Any] | None = None
+    prev_snap: dict[str, Any] | None = None
+    last_completed_start: dict[str, Any] | None = None
+    last_completed_end: dict[str, Any] | None = None
+    last_completed_ep = 0
+
+    def gain(acc_key: str, who: str, now: int, store: dict) -> None:
+        if now < 0:
+            return
+        prev = store.get(who, -1)
+        if prev >= 0 and now > prev:
+            episode[acc_key] += now - prev
+        store[who] = now
+
+    for i, start in enumerate(snap_starts):
+        end = snap_starts[i + 1] if i + 1 < len(snap_starts) else len(text)
+        block = text[start:end]
+        snap = parse_snap(block)
+        snap_ep = int(snap.get("episode_index") or 0)
+        is_reset = "reset" in str(snap.get("reason") or "").lower()
+        if is_reset and ep_active:
+            last_round = {
+                "water": episode["water"],
+                "wood": episode["wood"],
+                "sheep_killed": episode["sheep_killed"],
+                "trees_chopped": episode["trees_chopped"],
+                "episode": episode_index or inferred_ep,
+                "at": snap.get("ts") or "",
+            }
+            # конец завершённого эпизода — последний SNAP до reset
+            end_fr = _map_frame_from_snap(prev_snap) or _map_frame_from_snap(snap)
+            last_completed_end = end_fr
+            last_completed_start = cur_start
+            last_completed_ep = int(last_round.get("episode") or 0)
+            episode = {"water": 0, "wood": 0, "sheep_killed": 0, "trees_chopped": 0}
+            ep_active = False
+        jw = int((snap.get("jack") or {}).get("water") or -1)
+        lw = int((snap.get("lily") or {}).get("water") or -1)
+        gw = int((snap.get("george") or {}).get("water") or -1)
+        jwood = int((snap.get("jack") or {}).get("wood") or -1)
+        gwood = int((snap.get("george") or {}).get("wood") or -1)
+        sn = int(snap.get("sheep_n") or 0)
+        tn = int(snap.get("trees_n") or 0)
+        if is_reset or not ep_active:
+            if is_reset:
+                inferred_ep += 1
+            elif inferred_ep <= 0:
+                inferred_ep = 1
+            episode_index = snap_ep if snap_ep > 0 else inferred_ep
+            ep_active = True
+            episode = {"water": 0, "wood": 0, "sheep_killed": 0, "trees_chopped": 0}
+            prev_w = {"jack": jw, "lily": lw, "george": gw}
+            prev_wood = {"jack": jwood, "george": gwood}
+            prev_sheep, prev_trees = sn, tn
+            cur_start = _map_frame_from_snap(snap)
+            prev_snap = snap
+            continue
+        if snap_ep > 0:
+            episode_index = snap_ep
+        gain("water", "jack", jw, prev_w)
+        gain("water", "lily", lw, prev_w)
+        gain("water", "george", gw, prev_w)
+        gain("wood", "jack", jwood, prev_wood)
+        gain("wood", "george", gwood, prev_wood)
+        if prev_sheep >= 0 and sn < prev_sheep:
+            episode["sheep_killed"] += prev_sheep - sn
+        if prev_trees >= 0 and tn < prev_trees:
+            episode["trees_chopped"] += prev_trees - tn
+        prev_sheep, prev_trees = sn, tn
+        prev_snap = snap
+
+    last = parse_snap(text[snap_starts[-1]:])
+    if int(last.get("episode_index") or 0) > 0:
+        episode_index = int(last["episode_index"])
+    elif episode_index <= 0:
+        episode_index = inferred_ep or 1
+    last["episode_index"] = episode_index
+    last["episode"] = episode
+    last["last_round"] = last_round
+    last["source"] = "log"
+    # Кадры: предпочтительно последний завершённый эпизод; иначе start текущий + live как «сейчас»
+    fr_start = last_completed_start or cur_start or _map_frame_from_snap(last)
+    fr_end = last_completed_end or _map_frame_from_snap(last)
+    pending = last_completed_end is None
+    ep_for_frames = last_completed_ep or (int(last_round.get("episode") or 0) if not pending else episode_index)
+    last["episode_frames"] = {
+        "episode": ep_for_frames,
+        "pending": pending,
+        "start": fr_start,
+        "end": fr_end,
+    }
+    return _ensure_landmarks(last)
+
+
+_pres_world_cache: dict[str, Any] = {"t": 0.0, "key": "", "data": None}
+_pres_world_lock = threading.Lock()
+_PRES_WORLD_TTL = 8.0
+
+
+def fetch_presentation_world(host: str | None, run_id: str) -> dict[str, Any]:
+    """Читает stream_world_live.json (предпочтительно) или парсит snapshot.log с lab."""
+    rid = sanitize_run_id(run_id) if (run_id or "").strip() else ""
+    key = rid or "_"
+    now = time.time()
+    with _pres_world_lock:
+        if (
+            _pres_world_cache.get("data") is not None
+            and _pres_world_cache.get("key") == key
+            and now - float(_pres_world_cache.get("t") or 0) < _PRES_WORLD_TTL
+        ):
+            return dict(_pres_world_cache["data"])
+
+    h = host or _ssh_host_cache or "lab_comp"
+    remote = f"""
+set +e
+RID={sh_quote(rid)}
+ROOT={REMOTE_DIR}/results
+pick_json=""
+pick_log=""
+if [ -n "$RID" ] && [ -f "$ROOT/$RID/stream_world_live.json" ]; then pick_json="$ROOT/$RID/stream_world_live.json"; fi
+if [ -z "$pick_json" ] && [ -f "$ROOT/stream_world_live.json" ]; then pick_json="$ROOT/stream_world_live.json"; fi
+if [ -n "$RID" ] && [ -f "$ROOT/$RID/stream_world_snapshot.log" ]; then pick_log="$ROOT/$RID/stream_world_snapshot.log"; fi
+if [ -z "$pick_log" ] && [ -f "$ROOT/stream_world_snapshot.log" ]; then pick_log="$ROOT/stream_world_snapshot.log"; fi
+if [ -z "$pick_log" ]; then
+  pick_log=$(ls -1t "$ROOT"/*/stream_world_snapshot.log 2>/dev/null | head -1)
+fi
+echo "=== META ==="
+echo "json=$pick_json"
+echo "log=$pick_log"
+if [ -n "$pick_json" ]; then
+  echo "=== JSON ==="
+  cat "$pick_json" 2>/dev/null
+  echo
+fi
+if [ -n "$pick_log" ]; then
+  echo "=== LOG ==="
+  tail -c 180000 "$pick_log" 2>/dev/null
+fi
+"""
+    try:
+        r = ssh_run(h, remote, timeout=25, gate_timeout=3.0, skip_if_busy=True)
+        raw = ((r.stdout or "") + (r.stderr or "")).strip()
+    except TimeoutError as e:
+        # SSH занят другим опросом — отдать кэш / мягкий pending, не плодить сессии
+        with _pres_world_lock:
+            cached = _pres_world_cache.get("data")
+            if isinstance(cached, dict) and cached.get("ok"):
+                out = dict(cached)
+                out["pending"] = True
+                out["note"] = "ssh busy — cached"
+                return out
+        return {"ok": False, "pending": True, "error": str(e), "run_id": rid}
+    except Exception as e:
+        out = {"ok": False, "error": str(e), "run_id": rid}
+        with _pres_world_lock:
+            _pres_world_cache.update(t=now, key=key, data=out)
+        return out
+
+    meta_json = ""
+    meta_log = ""
+    json_body = ""
+    log_body = ""
+    if "=== META ===" in raw:
+        _, _, rest = raw.partition("=== META ===")
+        if "=== JSON ===" in rest:
+            meta_part, _, after_json = rest.partition("=== JSON ===")
+            for ln in meta_part.splitlines():
+                if ln.startswith("json="):
+                    meta_json = ln[5:].strip()
+                if ln.startswith("log="):
+                    meta_log = ln[4:].strip()
+            if "=== LOG ===" in after_json:
+                json_body, _, log_body = after_json.partition("=== LOG ===")
+            else:
+                json_body = after_json
+        elif "=== LOG ===" in rest:
+            meta_part, _, log_body = rest.partition("=== LOG ===")
+            for ln in meta_part.splitlines():
+                if ln.startswith("json="):
+                    meta_json = ln[5:].strip()
+                if ln.startswith("log="):
+                    meta_log = ln[4:].strip()
+        else:
+            for ln in rest.splitlines():
+                if ln.startswith("json="):
+                    meta_json = ln[5:].strip()
+                if ln.startswith("log="):
+                    meta_log = ln[4:].strip()
+    else:
+        log_body = raw
+
+    json_body = json_body.strip()
+    if json_body.startswith("{"):
+        try:
+            data = json.loads(json_body)
+            if isinstance(data, dict) and data.get("ok", True):
+                data["ok"] = True
+                data["source"] = "json"
+                data["run_id"] = rid
+                data["path_json"] = meta_json
+                data["path_log"] = meta_log
+                if not data.get("episode_index"):
+                    ep_obj = data.get("episode")
+                    if isinstance(ep_obj, dict) and ep_obj.get("index"):
+                        data["episode_index"] = ep_obj.get("index")
+                data = _ensure_landmarks(data)
+                with _pres_world_lock:
+                    _pres_world_cache.update(t=now, key=key, data=data)
+                return data
+        except Exception:
+            pass
+
+    parsed = parse_presentation_world_log(log_body.strip())
+    parsed["run_id"] = rid
+    parsed["path_json"] = meta_json
+    parsed["path_log"] = meta_log
+    with _pres_world_lock:
+        _pres_world_cache.update(t=now, key=key, data=parsed)
+    return parsed
+
+
 # ── actions ─────────────────────────────────────────────────────────
 
-
-def action_deploy(cfg: dict, skip_build: bool = False) -> str:
     build = cfg.get("build") or DEFAULT_BUILD
     env = os.environ.copy()
     env["BUILD"] = build
@@ -1629,6 +2780,140 @@ def action_kill_stream(cfg: dict) -> str:
                 f"cd {REMOTE_DIR} && bash train_scripts/lab_comp/kill_stream.bash",
                 timeout=60,
             )
+            append_log(jid, (r.stdout or "") + (r.stderr or ""))
+            finish_job(jid, r.returncode)
+        except Exception as e:
+            append_log(jid, str(e))
+            finish_job(jid, 1)
+
+    threading.Thread(target=runner, daemon=True).start()
+    return jid
+
+
+def action_restart_obs(cfg: dict) -> str:
+    """Рестарт OBS Studio с --startstreaming (сразу в эфир). Unity не трогает."""
+    host = resolve_ssh_host(cfg.get("ssh_host") or "lab_comp")
+    jid = new_job("restart_obs", "restart_obs.bash")
+
+    def runner() -> None:
+        try:
+            r = ssh_run(
+                host,
+                f"cd {REMOTE_DIR} && bash train_scripts/lab_comp/restart_obs.bash",
+                timeout=90,
+            )
+            append_log(jid, (r.stdout or "") + (r.stderr or ""))
+            finish_job(jid, r.returncode)
+        except Exception as e:
+            append_log(jid, str(e))
+            finish_job(jid, 1)
+
+    threading.Thread(target=runner, daemon=True).start()
+    return jid
+
+
+def action_start_obs_stream(cfg: dict, run_id: str = "") -> str:
+    """Полный эфир: Presentation (если надо) + OBS --startstreaming."""
+    host = resolve_ssh_host(cfg.get("ssh_host") or "lab_comp")
+    rid = sanitize_run_id(run_id) if (run_id or "").strip() else sanitize_run_id(
+        ((cfg.get("joint") or {}).get("run_id") or cfg.get("stream_run_id") or "")
+    )
+    if not rid:
+        raise ValueError("Нужен RUN_ID для стрима")
+    jid = new_job("start_obs_stream", f"start_obs_stream {rid}")
+
+    def runner() -> None:
+        try:
+            r = ssh_run(
+                host,
+                f"cd {REMOTE_DIR} && export RUN_ID={sh_quote(rid)} && "
+                f"bash train_scripts/lab_comp/start_obs_stream.bash",
+                timeout=180,
+            )
+            append_log(jid, (r.stdout or "") + (r.stderr or ""))
+            finish_job(jid, r.returncode)
+        except Exception as e:
+            append_log(jid, str(e))
+            finish_job(jid, 1)
+
+    threading.Thread(target=runner, daemon=True).start()
+    return jid
+
+
+def action_stop_obs_stream(cfg: dict) -> str:
+    """Стоп эфира: Presentation + OBS."""
+    host = resolve_ssh_host(cfg.get("ssh_host") or "lab_comp")
+    jid = new_job("stop_obs_stream", "stop_obs_stream.bash")
+
+    def runner() -> None:
+        try:
+            r = ssh_run(
+                host,
+                f"cd {REMOTE_DIR} && bash train_scripts/lab_comp/stop_obs_stream.bash",
+                timeout=90,
+            )
+            append_log(jid, (r.stdout or "") + (r.stderr or ""))
+            finish_job(jid, r.returncode)
+        except Exception as e:
+            append_log(jid, str(e))
+            finish_job(jid, 1)
+
+    threading.Thread(target=runner, daemon=True).start()
+    return jid
+
+def action_repair_spawn(cfg: dict, run_id: str = "", force: bool = True) -> str:
+    """Детект пустого леса/овец по snapshot + флаг .forest_repair_spawners для Unity.
+
+    force=True (кнопка UI): всегда пишет флаг ResetSpawners.
+    force=False: только если trees/sheep ниже порога в последнем SNAP.
+    """
+    host = resolve_ssh_host(cfg.get("ssh_host") or "lab_comp")
+    rid = sanitize_run_id(run_id) if (run_id or "").strip() else sanitize_run_id(
+        ((cfg.get("joint") or {}).get("run_id") or cfg.get("stream_run_id") or "")
+    )
+    mode = "force" if force else "detect"
+    jid = new_job("repair_spawn", f"spawn_repair {mode} {rid or '_'}")
+
+    def runner() -> None:
+        try:
+            rid_q = sh_quote(rid) if rid else "''"
+            if force:
+                cmd = f"""
+set +e
+cd {REMOTE_DIR}
+cat > .forest_repair_spawners <<'EOF'
+manual ui repair_spawn
+utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+run_id={rid}
+reason=force_ui
+EOF
+# подставить реальный utc
+sed -i "s|^utc=.*|utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)|" .forest_repair_spawners 2>/dev/null || true
+echo "wrote .forest_repair_spawners"
+cat .forest_repair_spawners
+sleep 10
+if [ -f .forest_repair_spawners_result ]; then
+  echo '=== result ==='
+  cat .forest_repair_spawners_result
+elif [ -f .forest_repair_spawners ]; then
+  echo 'WARN: flag still present — Unity StreamSpawnRepairWatcher not running (нужен свежий DLL)?'
+fi
+echo EXIT:0
+"""
+            else:
+                cmd = f"""
+set +e
+cd {REMOTE_DIR}
+source ~/anaconda3/etc/profile.d/conda.sh 2>/dev/null
+conda activate mlagents 2>/dev/null || true
+python3 -u train_scripts/lab_comp/watch_stream_spawn_repair.py --once --run-id {rid_q} --bad-streak 1 --repair-cooldown 0
+echo EXIT:$?
+if [ -f .forest_repair_spawners_result ]; then
+  echo '=== result ==='
+  cat .forest_repair_spawners_result
+fi
+"""
+            r = ssh_run(host, cmd, timeout=45)
             append_log(jid, (r.stdout or "") + (r.stderr or ""))
             finish_job(jid, r.returncode)
         except Exception as e:
@@ -3170,12 +4455,62 @@ body {
   background: var(--bg); color: var(--text); line-height: 1.35;
 }
 header {
-  padding: 14px 20px; border-bottom: 1px solid var(--border);
-  display: flex; gap: 16px; align-items: center; flex-wrap: wrap;
-  background: var(--panel);
+  padding: 0; border-bottom: 1px solid var(--border);
+  background: linear-gradient(180deg, #1c2230 0%, #141820 100%);
 }
-header h1 { font-size: 18px; margin: 0; font-weight: 650; }
-header .meta { color: var(--muted); font-size: 13px; }
+.topnav {
+  display: flex; gap: 8px; padding: 10px 14px 8px; align-items: stretch;
+  max-width: 1100px; margin: 0 auto; width: 100%; box-sizing: border-box;
+}
+.mode-tab {
+  flex: 1; text-align: center; padding: 12px 10px 14px; border-radius: 12px;
+  border: 1px solid var(--border); background: #171c28; color: var(--muted);
+  cursor: pointer; font-size: 14px; font-weight: 650; letter-spacing: 0.01em;
+  transition: border-color .15s, background .15s, color .15s, box-shadow .15s;
+  position: relative;
+}
+.mode-tab:hover { border-color: #4a628a; color: var(--text); background: #1c2434; }
+.mode-tab.active {
+  color: #e8f0ff; background: linear-gradient(180deg, #2a3d5c 0%, #1e2d46 100%);
+  border-color: #5a84c4; box-shadow: 0 0 0 1px rgba(106,166,255,.25);
+}
+.mode-tab.has-live::after {
+  content: ""; position: absolute; left: 18%; right: 18%; bottom: 5px; height: 3px;
+  border-radius: 999px; background: var(--bad);
+  box-shadow: 0 0 10px rgba(239,107,107,.7);
+}
+/* live: только красная обводка + полоска снизу, без заливки всей вкладки */
+.mode-tab.has-live {
+  border-color: #c45a5a;
+  box-shadow: 0 0 0 1px rgba(239,107,107,.4);
+}
+.mode-tab.active.has-live {
+  border-color: #ef6b6b;
+  box-shadow: 0 0 0 1px rgba(239,107,107,.5);
+}
+.status-bar {
+  padding: 2px 16px 8px; font-size: 11px; color: var(--muted); min-height: 1.2em;
+  max-width: 1100px; margin: 0 auto; width: 100%; box-sizing: border-box;
+}
+.status-bar #hdrMeta { color: var(--muted); }
+.subtabs { display: flex; gap: 6px; margin-bottom: 4px; }
+.subtab {
+  flex: 1; text-align: center; padding: 8px 10px; border-radius: 8px;
+  border: 1px solid var(--border); background: var(--panel2); color: var(--muted);
+  cursor: pointer; font-size: 13px;
+}
+.subtab:hover { border-color: var(--accent); color: var(--text); }
+.subtab.active {
+  color: #d7e6ff; background: #243552; border-color: #3a5f99; font-weight: 600;
+}
+.subtab.has-live { box-shadow: inset 0 -2px 0 var(--bad); }
+/* warn-live только для аварийных вкладок; OBS Stream = только нижняя полоска (has-live) */
+.subtab.warn-live {
+  border-color: #ef6b6b;
+  background: #4a1f2a;
+  color: #ffd9d9;
+}
+.pill.warn { color: #0b1220; background: var(--warn); border-color: transparent; font-weight: 650; }
 main { padding: 16px 20px 40px; display: grid; gap: 16px; }
 .row { display: grid; gap: 16px; grid-template-columns: 1fr; }
 @media (min-width: 1100px) {
@@ -3211,17 +4546,6 @@ main { padding: 16px 20px 40px; display: grid; gap: 16px; }
   0%, 100% { box-shadow: 0 0 0 1px rgba(106,166,255,.4), 0 0 10px rgba(106,166,255,.2); }
   50% { box-shadow: 0 0 0 2px rgba(106,166,255,.8), 0 0 20px rgba(106,166,255,.45); }
 }
-.subtabs { display: flex; gap: 6px; margin-bottom: 4px; }
-.subtab {
-  flex: 1; text-align: center; padding: 8px 10px; border-radius: 8px;
-  border: 1px solid var(--border); background: var(--panel2); color: var(--muted);
-  cursor: pointer; font-size: 13px;
-}
-.subtab:hover { border-color: var(--accent); color: var(--text); }
-.subtab.active {
-  color: #d7e6ff; background: #243552; border-color: #3a5f99; font-weight: 600;
-}
-.subtab.has-live { box-shadow: inset 0 -2px 0 var(--bad); }
 .subpanel { display: none; flex-direction: column; gap: 10px; }
 .subpanel.active { display: flex; }
 .pill.live {
@@ -3236,8 +4560,15 @@ main { padding: 16px 20px 40px; display: grid; gap: 16px; }
   color: var(--muted);
 }
 .pill.on { color: #0b1220; background: var(--ok); border-color: transparent; }
+input:disabled, select:disabled {
+  opacity: 0.75; cursor: not-allowed; background: #181c26; color: #c5cddc;
+}
 .field { display: grid; gap: 4px; }
 .field label { font-size: 11px; color: var(--muted); }
+.field.locked label::after {
+  content: " · зафиксировано";
+  color: var(--bad); font-weight: 600; font-size: 10px;
+}
 .field input, .field select {
   background: var(--panel2); border: 1px solid var(--border); color: var(--text);
   border-radius: 6px; padding: 7px 9px; font-size: 13px; width: 100%;
@@ -3253,6 +4584,12 @@ button, .btn {
 button:hover { border-color: var(--accent); }
 button.primary { background: #243552; border-color: #3a5f99; color: #d7e6ff; }
 button.danger { background: #3a2226; border-color: #7a3a42; color: #ffd0d4; }
+button.live-on {
+  background: #3a2226; border-color: #ef6b6b; color: #ffd0d4; font-weight: 650;
+  box-shadow: 0 0 0 1px rgba(239,107,107,.55), 0 0 14px rgba(239,107,107,.4);
+  animation: cardPulse 1.2s ease-in-out infinite;
+}
+button.live-on:hover { border-color: #ff8a8a; }
 button.jack { border-color: #3a5f99; }
 button.lily { border-color: #6b4a8a; }
 button.george { border-color: #3d6b52; }
@@ -3292,11 +4629,179 @@ button.george { border-color: #3d6b52; }
 }
 .hint { font-size: 12px; color: var(--muted); }
 .err { color: var(--bad); font-size: 12px; }
+.run-status {
+  display: block; margin-top: 4px; font-size: 11px; font-family: ui-monospace, Consolas, monospace;
+  color: var(--muted); min-height: 1.2em;
+}
+.run-status.ok { color: #3ecf8e; }
+.run-status.missing { color: #e07070; }
+.run-status.checking { color: var(--muted); opacity: 0.8; }
 .server-pre {
   background: #0d0f14; border: 1px solid var(--border); border-radius: 8px;
   padding: 10px; font-family: ui-monospace, Consolas, monospace; font-size: 11px;
   white-space: pre-wrap; color: #c9d0de; max-height: 160px; overflow: auto; margin: 0;
 }
+.host-card {
+  background: #141820; border: 1px solid #2a3344; border-radius: 12px;
+  padding: 14px 14px 12px; display: flex; flex-direction: column; gap: 12px;
+}
+.host-card-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+}
+.host-card-title {
+  font-size: 18px; font-weight: 700; color: #f2f5fa; letter-spacing: 0.01em;
+}
+.host-online {
+  font-size: 11px; font-weight: 650; letter-spacing: 0.04em; text-transform: uppercase;
+  padding: 4px 10px; border-radius: 999px; border: 1px solid #2f6b4a;
+  color: #7dffb3; background: #163528;
+}
+.host-online.off {
+  border-color: #6b3a3a; color: #ffb0b0; background: #3a1c1c;
+}
+.host-online.pending {
+  border-color: #6b5a2a; color: #ffe6a0; background: #3a3218;
+}
+.host-meter { display: grid; gap: 4px; }
+.host-meter-row {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 10px;
+  font-size: 12px;
+}
+.host-meter-label {
+  color: #9aa6b8; font-weight: 650; font-size: 11px; letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.host-meter-val { color: #d7dee9; font-variant-numeric: tabular-nums; text-align: right; }
+.host-bar {
+  height: 7px; border-radius: 999px; background: #222937; overflow: hidden;
+}
+.host-bar > i {
+  display: block; height: 100%; width: 0%; border-radius: inherit;
+  transition: width .35s ease;
+}
+.host-bar.ram > i { background: linear-gradient(90deg, #3ecf8e, #6dffb5); }
+.host-bar.disk > i { background: linear-gradient(90deg, #9b6bff, #c4a0ff); }
+.host-bar.vram > i { background: linear-gradient(90deg, #4ea1ff, #8ec5ff); }
+.host-bar.util > i { background: linear-gradient(90deg, #f0a33a, #ffd27a); }
+.host-bar.fps > i { background: linear-gradient(90deg, #6aa6ff, #9ec4ff); }
+.host-bar.fps.warn > i { background: linear-gradient(90deg, #f0a33a, #ffd27a); }
+.host-bar.fps.bad > i { background: linear-gradient(90deg, #ef6b6b, #ff9a9a); }
+.host-card.fps-warn {
+  border-color: #8a6a2a;
+  box-shadow: 0 0 0 1px rgba(240,163,58,.35);
+}
+.host-card.fps-bad {
+  border-color: #c45a5a;
+  box-shadow: 0 0 0 1px rgba(239,107,107,.45), 0 0 14px rgba(239,107,107,.25);
+}
+.host-fps-status {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 12px; font-weight: 700; letter-spacing: 0.03em;
+  padding: 4px 10px; border-radius: 999px; margin-bottom: 8px;
+}
+.host-fps-status.ok {
+  color: #7dffb3; background: #163528; border: 1px solid #2f6b4a;
+}
+.host-fps-status.warn {
+  color: #ffe6a0; background: #3a3218; border: 1px solid #6b5a2a;
+}
+.host-fps-status.bad {
+  color: #ffd0d4; background: #3a1c1c; border: 1px solid #7a3a42;
+}
+.host-gpu {
+  background: #10151e; border: 1px solid #273247; border-radius: 10px;
+  padding: 10px; display: grid; gap: 10px;
+}
+.host-gpu-head {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 8px;
+  flex-wrap: wrap;
+}
+.host-gpu-head strong { font-size: 13px; color: #e8eef8; }
+.host-gpu-head span { font-size: 12px; color: #9aa6b8; }
+.host-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.host-chip {
+  font-size: 11px; padding: 3px 8px; border-radius: 999px;
+  background: #1a2740; border: 1px solid #35517a; color: #b7d0f5;
+}
+.host-chip.cpu {
+  background: #1c222c; border-color: #3a4456; color: #c5cddc;
+}
+.host-raw summary {
+  cursor: pointer; color: var(--muted); font-size: 11px; user-select: none;
+}
+.host-raw[open] summary { margin-bottom: 6px; }
+.pres-world {
+  margin-top: 12px; padding: 12px; border-radius: 12px;
+  background: #141820; border: 1px solid #2a3344;
+  display: flex; flex-direction: column; gap: 10px;
+}
+.pres-world-head {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 10px; flex-wrap: wrap;
+}
+.pres-world-head h3 { margin: 0; font-size: 14px; font-weight: 700; }
+.pres-kpis {
+  display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px;
+}
+@media (min-width: 900px) {
+  .pres-kpis { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+}
+.pres-kpi {
+  background: #10151e; border: 1px solid #273247; border-radius: 10px;
+  padding: 8px 10px; display: grid; gap: 2px;
+}
+.pres-kpi.accent { border-color: #3a5f99; background: #152033; }
+.pres-kpi .k {
+  font-size: 10px; color: #9aa6b8; text-transform: uppercase; letter-spacing: 0.04em; font-weight: 650;
+}
+.pres-kpi .v {
+  font-size: 18px; font-weight: 700; color: #e8eef8; font-variant-numeric: tabular-nums;
+}
+.pres-agents {
+  display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px;
+}
+.pres-agent {
+  background: #10151e; border: 1px solid #273247; border-radius: 10px; padding: 8px 10px;
+  font-size: 12px;
+}
+.pres-agent .name { font-weight: 700; margin-bottom: 2px; }
+.pres-agent.jack .name { color: #6aa6ff; }
+.pres-agent.lily .name { color: #e070b0; }
+.pres-agent.george .name { color: #3ecf8e; }
+.pres-agent.dead { opacity: 0.55; border-color: #7a3a42; }
+.pres-map-wrap {
+  background: #0d1016; border: 1px solid #273247; border-radius: 10px; padding: 8px;
+}
+.pres-map-pair {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 10px;
+}
+@media (max-width: 900px) {
+  .pres-map-pair { grid-template-columns: 1fr; }
+}
+.pres-map-title {
+  font-size: 12px; font-weight: 650; color: #c5d0e0; margin: 0 0 6px;
+}
+.pres-map-title .sub { font-weight: 500; color: #7a8499; margin-left: 6px; }
+#presWorldMapStart, #presWorldMapEnd {
+  width: 100%; height: auto; display: block; border-radius: 8px;
+  background: #0a0c10;
+}
+.pres-map-legend {
+  display: flex; flex-wrap: wrap; gap: 10px; margin-top: 6px; font-size: 11px; color: #9aa6b8;
+}
+.pres-map-legend .lg::before {
+  content: ""; display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+  margin-right: 5px; vertical-align: middle;
+}
+.pres-map-legend .jack::before { background: #6aa6ff; }
+.pres-map-legend .lily::before { background: #e070b0; }
+.pres-map-legend .george::before { background: #3ecf8e; }
+.pres-map-legend .tree::before { background: #4a8f4a; border-radius: 2px; }
+.pres-map-legend .sheep::before { background: #e8e0d0; }
+.pres-map-legend .zombie::before { background: #c45a5a; }
+.pres-map-legend .lake::before { background: #3a7ec8; border-radius: 2px; }
+.pres-map-legend .house::before { background: #c9a227; border-radius: 2px; }
+.pres-map-legend .fence::before { background: #8b6914; border-radius: 1px; }
+.pres-map-legend .stone::before { background: #9a9aa0; border-radius: 2px; }
 .lab-tasks {
   display: flex; flex-direction: column; gap: 6px; margin: 8px 0 4px;
   min-height: 28px;
@@ -3353,27 +4858,34 @@ button.george { border-color: #3d6b52; }
 </head>
 <body>
 <header>
-  <h1>Forest Lab</h1>
-  <span class="meta" id="hdrMeta">старт…</span>
-  <span class="meta">UI локальный · train/stats только через ssh lab_comp</span>
-  <div style="margin-left:auto" class="btns">
-    <button id="btnRefreshTb">Обновить TB</button>
-    <button class="danger" id="btnKill" title="Только train: mlagents + headless Unity (стрим/validate не трогает)">⏹ Стоп train</button>
-  </div>
+  <nav class="topnav" role="tablist" aria-label="Разделы">
+    <button type="button" class="mode-tab active" id="tab-mode-training" data-mode="training">Forest Lab Train</button>
+    <button type="button" class="mode-tab" id="tab-mode-streaming" data-mode="streaming">Survival followers</button>
+    <button type="button" class="mode-tab" id="tab-mode-obs" data-mode="obs">OBS Stream</button>
+  </nav>
+  <div class="status-bar"><span id="hdrMeta"></span></div>
 </header>
 <main>
-  <div class="subtabs" style="max-width:720px;margin-bottom:4px">
-    <button type="button" class="subtab active" id="tab-mode-training" data-mode="training">Forest Lab Train</button>
-    <button type="button" class="subtab" id="tab-mode-streaming" data-mode="streaming">Survival followers</button>
-  </div>
-
   <section class="card" id="card-server">
     <h2>Сервер <code>lab_comp</code> <span id="serverModeLabel">(SSH / local)</span> <span class="pill" id="serverPill">—</span></h2>
     <p class="hint" id="serverHostHint">RAM / nvidia-smi с lab. Если UI запущен на самом lab — режим local (без SSH к себе). С Windows UI ходит по SSH.</p>
-    <pre class="server-pre" id="serverStats">загрузка RAM / nvidia-smi с lab_comp…</pre>
+    <div class="host-card" id="serverHostCard">
+      <div class="host-card-head">
+        <div class="host-card-title" id="serverHostTitle">lab_comp</div>
+        <div class="host-online pending" id="serverHostOnline">…</div>
+      </div>
+      <div id="serverHostMeters"><div class="hint">загрузка метрик…</div></div>
+    </div>
+    <details class="host-raw">
+      <summary>сырой SSH-вывод</summary>
+      <pre class="server-pre" id="serverStats">загрузка RAM / nvidia-smi с lab_comp…</pre>
+    </details>
     <h2 style="margin-top:10px;font-size:14px">Сейчас на lab <span class="pill" id="labTasksPill">—</span></h2>
     <div class="lab-tasks" id="labTasks"><div class="lab-tasks-empty">нет активных задач</div></div>
-    <p class="hint">× гасит только этот тип процесса (train / validate / stream / Streaming Survival). OBS не трогает.</p>
+    <p class="hint">× гасит только этот тип процесса (train / validate / stream / Streaming Survival / OBS).</p>
+    <h2 style="margin-top:10px;font-size:14px">SSH сессии <span class="pill" id="obsSshPill">—</span></h2>
+    <pre class="server-pre" id="obsSshNow">считаем…</pre>
+    <p class="hint" id="obsSshHint">Локальные ssh → lab + сессии на lab (:22). Зелёный &lt; 6, жёлтый 6–9, красный ≥ 10 (лимит «too many»).</p>
     <h2 style="margin-top:8px">Лог действий <span class="pill" id="jobPill">—</span></h2>
     <div class="field">
       <label>Активная задача</label>
@@ -3387,6 +4899,8 @@ button.george { border-color: #3d6b52; }
     <h2>Блок Forest Lab Train</h2>
     <p class="hint">Одним кликом гасит train + validate + Presentation onnx-стрим. Survival followers и OBS не трогает.</p>
     <div class="btns">
+      <button type="button" id="btnRefreshTb">Обновить TB</button>
+      <button type="button" class="danger" id="btnKill" title="Только train: mlagents + headless Unity (стрим/validate не трогает)">⏹ Стоп train</button>
       <button type="button" class="danger" id="btnKillModeTraining">⏹ Стоп весь блок Train</button>
     </div>
   </section>
@@ -3479,29 +4993,34 @@ button.george { border-color: #3d6b52; }
       <div class="card" id="card-joint" style="border:none;padding:0;background:transparent;box-shadow:none">
         <h2>Совместное дообучение Jack + Lily + George</h2>
         <p class="hint">
-          Укажи папки <code>results/…</code> с готовыми весами троих. Они только читаются.
-          Чекпоинты пишутся в новую папку RUN_ID (базы не перезаписываются).
+          Базы <code>results/…</code> только читаются. Чекпоинты пишутся в «Новую папку»
+          (если папка уже есть с весами — автоматически Resume).
         </p>
         <div class="grid2">
           <div class="field">
-            <label>База Jack (INIT_FROM_JACK)</label>
+            <label>База Jack</label>
             <input id="jointInitJack" />
+            <span class="run-status" id="jointStatusJack">—</span>
           </div>
           <div class="field">
-            <label>База Lily (INIT_FROM_LILY)</label>
+            <label>База Lily</label>
             <input id="jointInitLily" />
+            <span class="run-status" id="jointStatusLily">—</span>
           </div>
         </div>
         <div class="grid2">
           <div class="field">
-            <label>База George (INIT_FROM_GEORGE)</label>
+            <label>База George</label>
             <input id="jointInitGeorge" />
+            <span class="run-status" id="jointStatusGeorge">—</span>
           </div>
           <div class="field">
-            <label>Новая папка RUN_ID (куда писать)</label>
+            <label>Новая папка</label>
             <input id="jointRunId" />
+            <span class="run-status" id="jointStatusRun">—</span>
           </div>
         </div>
+        <p class="hint" id="jointLiveBanner" style="display:none;margin:4px 0 0;color:#ffd0d4;font-weight:600"></p>
         <div class="grid2">
           <div class="field">
             <label>TB runs (несколько: Ctrl/Shift+клик)</label>
@@ -3510,16 +5029,15 @@ button.george { border-color: #3d6b52; }
           <div class="field">
             <label>Быстрый выбор</label>
             <div class="btns" style="flex-wrap:wrap">
-              <button type="button" id="btnJointTbTrio">Трое из RUN_ID</button>
-              <button type="button" id="btnJointTbClear">Сбросить TB</button>
+              <button type="button" id="btnJointTbTrio" title="Только выбрать Jack+Lily+George из новой папки">Трое из новой папки</button>
+              <button type="button" class="primary" id="btnJointTbDraw" title="Скачать серии TB и нарисовать Cumulative Reward">Нарисовать TB</button>
+              <button type="button" class="danger" id="btnJointTbClear" title="Снять выбор runs и очистить график">Выключить TB</button>
             </div>
-            <p class="hint" style="margin:0">На графике сразу Jack + Lily + George (Cumulative Reward).</p>
+            <p class="hint" style="margin:0">Трое — только выбор. Нарисовать TB — график. Выключить — убрать график.</p>
           </div>
         </div>
         <div class="btns train-btns">
-          <button class="primary" id="btnJointTrain">▶ Дообучить троих в новую папку</button>
-          <button id="btnJointResume">Resume этой папки</button>
-          <button id="btnRestartJointTrain" title="Стоп → чистка процессов → resume той же RUN_ID">↻ Перезапуск обучения</button>
+          <button class="primary" id="btnJointTrain" title="Если папка уже есть — Resume, иначе старт с баз">▶ Запуск дообучения</button>
           <button class="danger" id="btnKillJointTrain" title="Убить joint/любой train (mlagents + headless). Стрим и validate не трогает.">⏹ Стоп обучение</button>
         </div>
         <div class="legend" id="legend-joint"></div>
@@ -3540,10 +5058,58 @@ button.george { border-color: #3d6b52; }
         </div>
         <div class="btns train-btns">
           <button class="primary" id="btnJointStream">▶ Стрим Presentation (бесконечно)</button>
-          <button id="btnRestartJointStream" title="Стоп → чистка → старт Presentation заново">↻ Перезапуск стрима</button>
           <button class="danger" id="btnKillStream" title="Убить только бесконечный стрим. Train и validate не трогает.">⏹ Стоп стрим</button>
+          <button type="button" id="btnRepairSpawn" title="Если trees/sheep = 0 по snapshot — флаг ResetTrees/ResetSheep в Unity">🔧 Починить спавн</button>
         </div>
         <p class="hint">Синхронизируется с RUN_ID на вкладке обучения при сохранении конфига.</p>
+
+        <div class="pres-world" id="presWorldCard">
+          <div class="pres-world-head">
+            <h3>Мир стрима <span class="pill" id="presWorldPill">—</span> <span class="pill" id="presWorldFpsPill">—</span></h3>
+            <span class="hint" id="presWorldMeta">ждём snapshot…</span>
+          </div>
+          <div class="host-card" id="streamFpsCard" style="padding:10px;margin:0 0 10px">
+            <div id="streamFpsMeters"><div class="hint">ждём hitch/fps…</div></div>
+            <details class="host-raw" style="margin-top:6px">
+              <summary>детали FPS</summary>
+              <pre class="server-pre" id="streamFps">ждём hitch/fps из stream_onnx лога…</pre>
+            </details>
+            <p class="hint" style="margin:6px 0 0">Окно ~500 шагов · <code>stream_onnx_*.log</code> / <code>stream_fps.json</code>. Ниже ~15 — стрим лагает.</p>
+          </div>
+          <div class="pres-kpis" id="presWorldKpis">
+            <div class="pres-kpi"><span class="k">Эпизод</span><span class="v" id="presKpiEpisode">—</span></div>
+            <div class="pres-kpi"><span class="k">Овцы</span><span class="v" id="presKpiSheep">—</span></div>
+            <div class="pres-kpi"><span class="k">Деревья</span><span class="v" id="presKpiTrees">—</span></div>
+            <div class="pres-kpi"><span class="k">Зомби</span><span class="v" id="presKpiZombies">—</span></div>
+            <div class="pres-kpi accent"><span class="k">Раунд · вода</span><span class="v" id="presKpiWater">—</span></div>
+            <div class="pres-kpi accent"><span class="k">Раунд · дерево</span><span class="v" id="presKpiWood">—</span></div>
+            <div class="pres-kpi accent"><span class="k">Раунд · овцы</span><span class="v" id="presKpiSheepKill">—</span></div>
+          </div>
+          <div class="pres-agents" id="presWorldAgents"></div>
+          <div class="pres-map-pair">
+            <div class="pres-map-wrap">
+              <div class="pres-map-title">Начало эпизода <span class="sub" id="presMapStartTitle">—</span></div>
+              <canvas id="presWorldMapStart" width="640" height="360" title="Кадр начала эпизода"></canvas>
+            </div>
+            <div class="pres-map-wrap">
+              <div class="pres-map-title">Конец эпизода <span class="sub" id="presMapEndTitle">—</span></div>
+              <canvas id="presWorldMapEnd" width="640" height="360" title="Кадр конца эпизода"></canvas>
+            </div>
+          </div>
+          <div class="pres-map-legend" style="margin-top:8px">
+            <span class="lg jack">Jack</span>
+            <span class="lg lily">Lily</span>
+            <span class="lg george">George</span>
+            <span class="lg tree">деревья</span>
+            <span class="lg sheep">овцы</span>
+            <span class="lg zombie">зомби</span>
+            <span class="lg lake">озеро</span>
+            <span class="lg house">дом</span>
+            <span class="lg fence">забор</span>
+            <span class="lg stone">камни</span>
+          </div>
+          <p class="hint" style="margin:0">Два кадра последнего завершённого эпизода (или «сейчас», пока раунд ещё идёт). Ориентиры — дом / озеро / забор / камни.</p>
+        </div>
       </div>
     </div>
   </section>
@@ -3552,7 +5118,7 @@ button.george { border-color: #3d6b52; }
   <div id="panel-mode-streaming" class="mode-panel" style="display:none">
   <section class="card" style="margin-bottom:10px">
     <h2>Блок Survival followers</h2>
-    <p class="hint">Одним кликом гасит Streaming Survival + LLM Bot. Train / Presentation onnx / OBS не трогает.</p>
+    <p class="hint">Одним кликом гасит Streaming Survival (+ preview). LLM Bot теперь во вкладке OBS Stream.</p>
     <div class="btns">
       <button type="button" class="danger" id="btnKillModeStreaming">⏹ Стоп весь блок Survival</button>
     </div>
@@ -3569,50 +5135,17 @@ button.george { border-color: #3d6b52; }
 
     <section class="card" id="card-ss-preview">
       <h2>Lab screen preview <span class="pill" id="ssPreviewPill">off</span></h2>
-      <p class="hint">Живой скриншот <b>lab_comp DISPLAY=:1</b> (Unity Streaming Survival) через SSH. Не трогает train / OBS.</p>
+      <p class="hint">Скриншот <b>lab_comp DISPLAY=:1</b> только по кнопке — кадр не крутится сам. Не трогает train / OBS.</p>
       <div class="btns" style="flex-wrap:wrap">
-        <button type="button" class="primary" id="btnSsPreviewStart">▶ Start preview</button>
-        <button type="button" class="danger" id="btnSsPreviewStop">⏹ Stop preview</button>
+        <button type="button" class="primary" id="btnSsPreviewStart">▶ Показать (live)</button>
+        <button type="button" class="danger" id="btnSsPreviewStop">⏹ Скрыть</button>
         <button type="button" id="btnSsPreviewOnce">1 кадр</button>
       </div>
-      <p class="hint" id="ssPreviewMeta" style="min-height:1.2em">preview off</p>
-      <div style="margin-top:8px;background:#0b0f16;border:1px solid #2a3344;border-radius:8px;overflow:hidden;min-height:180px;display:flex;align-items:center;justify-content:center">
+      <p class="hint" id="ssPreviewMeta" style="min-height:1.2em">preview off — кадр скрыт</p>
+      <div id="ssPreviewBox" style="margin-top:8px;background:#0b0f16;border:1px solid #2a3344;border-radius:8px;overflow:hidden;min-height:120px;display:flex;align-items:center;justify-content:center">
         <img id="ssPreviewImg" alt="lab screen preview" style="max-width:100%;width:100%;height:auto;display:none;background:#000" />
-        <span id="ssPreviewPlaceholder" style="color:#7a8499;font-size:13px;padding:24px">Нажми Start preview</span>
+        <span id="ssPreviewPlaceholder" style="color:#7a8499;font-size:13px;padding:24px">Кадр скрыт — жми «Показать» или «1 кадр»</span>
       </div>
-    </section>
-
-    <section class="card" id="card-llm-bot">
-      <h2>LLM Bot <span class="pill" id="llmBotPill">stopped</span></h2>
-      <p class="hint">Бот на <b>lab_comp</b> → UDP :5055 в Streaming Survival. Local debug без follower-check.</p>
-      <div class="llm-status" id="llmStatusGrid">
-        <div>Bot: <b id="llmStBot">—</b></div>
-        <div>Mode: <b id="llmStMode">—</b></div>
-        <div>Python deps: <b id="llmStDeps">—</b></div>
-        <div>Ollama: <b id="llmStOllama">—</b></div>
-        <div>Model: <b id="llmStModel">—</b></div>
-        <div>HTTP :8765: <b id="llmStHttp">—</b></div>
-      </div>
-      <p class="hint" id="llmLastError" style="color:#ff8e8e;min-height:1em"></p>
-      <div class="btns" style="flex-wrap:wrap">
-        <button type="button" class="primary" id="btnLlmStart">Start LLM Bot</button>
-        <button type="button" class="danger" id="btnLlmStop">Stop LLM Bot</button>
-        <button type="button" id="btnLlmListen">Listen Twitch Chat: OFF</button>
-      </div>
-      <label style="font-size:12px;color:var(--muted);margin-top:10px;display:block">Local Debug Chat — #join / #do</label>
-      <div class="llm-chat" id="llmChat"></div>
-      <div class="btns" style="align-items:stretch;flex-wrap:wrap">
-        <input id="llmLocalNick" style="width:140px" placeholder="ник" value="viewer" title="Ник персонажа в игре" />
-        <input id="llmLocalMsg" style="flex:1;min-width:120px" placeholder="#join или #do добывай воду"
-          value="#do добывай воду" />
-        <button type="button" class="primary" id="btnLlmLocalSend">Send</button>
-        <button type="button" id="btnLlmExitDebug" title="Убрать debug_user из мира">#exit debug_user</button>
-        <button type="button" id="btnLlmChatClear">Clear</button>
-      </div>
-      <label style="font-size:12px;color:var(--muted);margin-top:10px;display:block">Debug actions (клик = #do)</label>
-      <div class="btns" id="ssDebugActions" style="flex-wrap:wrap;gap:6px;margin-top:6px"></div>
-      <label style="font-size:12px;color:var(--muted);margin-top:10px;display:block">Setup / bot logs</label>
-      <pre class="llm-setup-log" id="llmBotLog">(пусто)</pre>
     </section>
 
     <section class="card" id="card-ss-diagnostics">
@@ -3644,6 +5177,78 @@ button.george { border-color: #3d6b52; }
       <pre class="llm-setup-log" id="ssDiagLog" style="max-height:200px;display:none"></pre>
     </section>
   </div><!-- /panel-mode-streaming -->
+
+  <div id="panel-mode-obs" class="mode-panel" style="display:none">
+    <section class="card" id="card-obs-stream">
+      <h2>OBS Stream</h2>
+      <div class="btns" style="flex-wrap:wrap;margin:4px 0 8px">
+        <button type="button" class="primary" id="btnObsStartStream" title="Unity Presentation + OBS --startstreaming">● Запись</button>
+        <button type="button" class="danger" id="btnObsStopStream" title="Стоп Presentation + OBS">⏹ Стоп стрим</button>
+      </div>
+      <p class="hint" id="obsProcHint">статус…</p>
+    </section>
+
+    <section class="card" id="card-llm-bot">
+      <h2>LLM Bot <span class="pill" id="llmBotPill">stopped</span></h2>
+      <p class="hint">Бот на <b>lab_comp</b> → UDP :5055 (Twitch / local debug). Roster + #stats в SQLite.</p>
+      <div class="llm-status" id="llmStatusGrid">
+        <div>Bot: <b id="llmStBot">—</b></div>
+        <div>Mode: <b id="llmStMode">—</b></div>
+        <div>Python deps: <b id="llmStDeps">—</b></div>
+        <div>Ollama: <b id="llmStOllama">—</b></div>
+        <div>Model: <b id="llmStModel">—</b></div>
+        <div>HTTP :8765: <b id="llmStHttp">—</b></div>
+      </div>
+      <p class="hint" id="llmLastError" style="color:#ff8e8e;min-height:1em"></p>
+      <div class="card" style="margin:10px 0;padding:10px 12px;border:1px solid #2a3344;background:#0b0f16">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap">
+          <strong>Игроки (SQLite)</strong>
+          <span class="pill" id="llmRosterPill">0</span>
+          <button type="button" id="btnLlmRosterMode" title="Переключить: только в игре / вся история">В игре</button>
+          <button type="button" id="btnLlmRosterResync" title="Отправить список в Unity после рестарта стрима">↻ Resync → Unity</button>
+        </div>
+        <p class="hint" style="margin:6px 0 8px">База <code>stream_bot.sqlite3</code>: кто писал #join, когда, вода/дерево/овцы/костры. #exit → не «в игре», но в истории остаётся. После рестарта стрима жми Resync (или он сам после restart_stream).</p>
+        <div id="llmRosterEmpty" class="hint" style="padding:6px 0">Пока никого — зрители пишут #join в чат</div>
+        <div style="overflow:auto;max-height:320px">
+          <table id="llmRosterTable" style="width:100%;border-collapse:collapse;font-size:12px;display:none">
+            <thead>
+              <tr style="color:#9aa4b8;text-align:left">
+                <th style="padding:4px 6px">#</th>
+                <th style="padding:4px 6px">Ник</th>
+                <th style="padding:4px 6px">Статус</th>
+                <th style="padding:4px 6px">Действие</th>
+                <th style="padding:4px 6px">Вход</th>
+                <th style="padding:4px 6px">💧</th>
+                <th style="padding:4px 6px">🪵</th>
+                <th style="padding:4px 6px">🐑</th>
+                <th style="padding:4px 6px">🔥</th>
+              </tr>
+            </thead>
+            <tbody id="llmRosterBody"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="btns" style="flex-wrap:wrap">
+        <button type="button" class="primary" id="btnLlmStart">Start LLM Bot</button>
+        <button type="button" class="danger" id="btnLlmStop">Stop LLM Bot</button>
+        <button type="button" id="btnLlmListen">Listen Twitch Chat: OFF</button>
+      </div>
+      <label style="font-size:12px;color:var(--muted);margin-top:10px;display:block">Local Debug Chat — #join / #do</label>
+      <div class="llm-chat" id="llmChat"></div>
+      <div class="btns" style="align-items:stretch;flex-wrap:wrap">
+        <input id="llmLocalNick" style="width:140px" placeholder="ник" value="viewer" title="Ник персонажа в игре" />
+        <input id="llmLocalMsg" style="flex:1;min-width:120px" placeholder="#join или #do добывай воду"
+          value="#do добывай воду" />
+        <button type="button" class="primary" id="btnLlmLocalSend">Send</button>
+        <button type="button" id="btnLlmExitDebug" title="Убрать debug_user из мира">#exit debug_user</button>
+        <button type="button" id="btnLlmChatClear">Clear</button>
+      </div>
+      <label style="font-size:12px;color:var(--muted);margin-top:10px;display:block">Debug actions (клик = #do)</label>
+      <div class="btns" id="ssDebugActions" style="flex-wrap:wrap;gap:6px;margin-top:6px"></div>
+      <label style="font-size:12px;color:var(--muted);margin-top:10px;display:block">Setup / bot logs</label>
+      <pre class="llm-setup-log" id="llmBotLog">(пусто)</pre>
+    </section>
+  </div><!-- /panel-mode-obs -->
 </main>
 <div class="modal-bg" id="detailModal">
   <div class="modal">
@@ -3670,9 +5275,12 @@ async function api(path, opts) {
     || (path || "").indexOf("/api/llm_bot/status") === 0
     || (path || "").indexOf("/api/llm_bot/local_chat") === 0
     || (path || "").indexOf("/api/ss_preview/") === 0
+    || (path || "").indexOf("/api/presentation_world") === 0
     || (path || "").indexOf("/api/tb/") === 0;
+  // joint weights = SSH на lab, может быть 15–40с — не рвать на 12с
+  const jointW = (path || "").indexOf("/api/joint/run_weights") === 0;
   const ms = (path || "").indexOf("/api/ss_diagnostics/") === 0 ? 600000
-    : (soft ? 12000 : 180000);
+    : (jointW ? 60000 : (soft ? 12000 : 180000));
   const timer = setTimeout(() => ctrl.abort(), ms);
   try {
     r = await fetch(path, Object.assign({}, opts || {}, { signal: ctrl.signal }));
@@ -3795,6 +5403,192 @@ function collectJoint() {
   };
 }
 
+const JOINT_LOCK_IDS = ["jointInitJack", "jointInitLily", "jointInitGeorge", "jointRunId"];
+let _jointLockGraceUntil = 0;
+let _jointStoppingUntil = 0;
+
+function isJointStopping() {
+  return Date.now() < _jointStoppingUntil;
+}
+
+function beginJointStopping() {
+  _jointLockGraceUntil = 0;
+  _jointStoppingUntil = Date.now() + 120000;
+  applyJointTrainLock(true);
+}
+
+function setKillTrainBtn(mode) {
+  const btnKill = document.getElementById("btnKillJointTrain");
+  if (!btnKill) return;
+  if (mode === "stopping") {
+    btnKill.textContent = "● Останавливается…";
+    btnKill.classList.add("live-on");
+    btnKill.disabled = true;
+    btnKill.title = "Идёт остановка train на lab — дождись завершения";
+  } else {
+    btnKill.textContent = "⏹ Стоп обучение";
+    btnKill.classList.remove("live-on");
+    btnKill.disabled = false;
+    btnKill.title = "Убить joint/любой train (mlagents + headless). Стрим и validate не трогает.";
+  }
+}
+
+function readJointLocked() {
+  const L = (CFG && CFG.joint && CFG.joint.locked) || null;
+  if (!L || typeof L !== "object") return null;
+  if (!L.init_jack && !L.init_lily && !L.init_george && !L.run_id) return null;
+  return {
+    init_jack: String(L.init_jack || ""),
+    init_lily: String(L.init_lily || ""),
+    init_george: String(L.init_george || ""),
+    run_id: String(L.run_id || ""),
+  };
+}
+
+async function persistJointLocked(snap) {
+  if (!CFG) CFG = {};
+  if (!CFG.joint) CFG.joint = {};
+  CFG.joint.locked = snap;
+  try {
+    const body = {
+      build: document.getElementById("buildName").value.trim(),
+      tb_url: document.getElementById("tbUrl").value.trim(),
+      jack: collectHero("jack"),
+      lily: collectHero("lily"),
+      george: collectHero("george"),
+      joint: Object.assign({}, collectJoint(), { locked: snap }),
+    };
+    CFG = (await api("/api/config", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(body),
+    })).config;
+  } catch (_) {}
+}
+
+function applyJointTrainLock(jointRunning) {
+  const btn = document.getElementById("btnJointTrain");
+  const banner = document.getElementById("jointLiveBanner");
+  let snap = readJointLocked();
+
+  // Пользователь нажал стоп — пока процессы ещё живы, не возвращаем «Запущено».
+  if (isJointStopping()) {
+    if (!jointRunning) {
+      _jointStoppingUntil = 0;
+      // fall through → idle unlock
+    } else {
+      if (!snap) {
+        snap = collectJoint();
+        persistJointLocked({
+          init_jack: snap.init_jack,
+          init_lily: snap.init_lily,
+          init_george: snap.init_george,
+          run_id: snap.run_id,
+        });
+      }
+      const setVal = (id, v) => {
+        const n = document.getElementById(id);
+        if (n && v != null) n.value = v;
+      };
+      setVal("jointInitJack", snap.init_jack);
+      setVal("jointInitLily", snap.init_lily);
+      setVal("jointInitGeorge", snap.init_george);
+      setVal("jointRunId", snap.run_id);
+      for (const id of JOINT_LOCK_IDS) {
+        const n = document.getElementById(id);
+        if (!n) continue;
+        n.disabled = true;
+        if (n.parentElement) n.parentElement.classList.add("locked");
+      }
+      if (btn) {
+        btn.textContent = "● Остановка…";
+        btn.classList.remove("live-on");
+        btn.classList.remove("primary");
+        btn.disabled = true;
+        btn.title = "Остановка обучения — запуск недоступен";
+      }
+      setKillTrainBtn("stopping");
+      if (banner) {
+        banner.style.display = "block";
+        banner.textContent =
+          "Остановка: Jack←" + (snap.init_jack || "?")
+          + " · Lily←" + (snap.init_lily || "?")
+          + " · George←" + (snap.init_george || "?")
+          + "  →  " + (snap.run_id || "?");
+      }
+      return;
+    }
+  }
+
+  // Сразу после старта activity ещё может не видеть train — не снимаем lock.
+  if (!jointRunning && snap && Date.now() < _jointLockGraceUntil) {
+    jointRunning = true;
+  }
+  if (jointRunning) {
+    if (!snap) {
+      snap = collectJoint();
+      persistJointLocked({
+        init_jack: snap.init_jack,
+        init_lily: snap.init_lily,
+        init_george: snap.init_george,
+        run_id: snap.run_id,
+      });
+    }
+    const setVal = (id, v) => {
+      const n = document.getElementById(id);
+      if (n && v != null) n.value = v;
+    };
+    setVal("jointInitJack", snap.init_jack);
+    setVal("jointInitLily", snap.init_lily);
+    setVal("jointInitGeorge", snap.init_george);
+    setVal("jointRunId", snap.run_id);
+    for (const id of JOINT_LOCK_IDS) {
+      const n = document.getElementById(id);
+      if (!n) continue;
+      n.disabled = true;
+      if (n.parentElement) n.parentElement.classList.add("locked");
+    }
+    if (btn) {
+      btn.textContent = "● Запущено";
+      btn.classList.add("live-on");
+      btn.classList.remove("primary");
+      btn.disabled = true;
+      btn.title = "Обучение идёт — поля зафиксированы. Стоп обучение, чтобы менять.";
+    }
+    setKillTrainBtn("idle");
+    if (banner) {
+      banner.style.display = "block";
+      banner.textContent =
+        "Запущено: Jack←" + (snap.init_jack || "?")
+        + " · Lily←" + (snap.init_lily || "?")
+        + " · George←" + (snap.init_george || "?")
+        + "  →  " + (snap.run_id || "?");
+    }
+  } else {
+    _jointLockGraceUntil = 0;
+    _jointStoppingUntil = 0;
+    for (const id of JOINT_LOCK_IDS) {
+      const n = document.getElementById(id);
+      if (!n) continue;
+      n.disabled = false;
+      if (n.parentElement) n.parentElement.classList.remove("locked");
+    }
+    if (btn) {
+      btn.textContent = "▶ Запуск дообучения";
+      btn.classList.remove("live-on");
+      btn.classList.add("primary");
+      btn.disabled = false;
+      btn.title = "Если папка уже есть — Resume, иначе старт с баз";
+    }
+    setKillTrainBtn("idle");
+    if (banner) {
+      banner.style.display = "none";
+      banner.textContent = "";
+    }
+    if (readJointLocked()) persistJointLocked(null);
+  }
+}
+
 function jointPreferRuns(runId) {
   const rid = (runId || "").trim();
   if (!rid) return [];
@@ -3803,20 +5597,25 @@ function jointPreferRuns(runId) {
 
 function fillJointCard() {
   const j = (CFG && CFG.joint) || {};
-  document.getElementById("jointInitJack").value = j.init_jack || "";
-  document.getElementById("jointInitLily").value = j.init_lily || "";
-  document.getElementById("jointInitGeorge").value = j.init_george || "";
-  document.getElementById("jointRunId").value = j.run_id || "";
+  const locked = readJointLocked();
+  const src = locked || j;
+  document.getElementById("jointInitJack").value = src.init_jack || "";
+  document.getElementById("jointInitLily").value = src.init_lily || "";
+  document.getElementById("jointInitGeorge").value = src.init_george || "";
+  document.getElementById("jointRunId").value = src.run_id || j.run_id || "";
   const streamRun = document.getElementById("streamRunId");
-  if (streamRun) streamRun.value = j.run_id || "";
+  if (streamRun) streamRun.value = (locked && locked.run_id) || j.run_id || "";
   const sel = document.getElementById("jointTb");
+  const liveRid = (document.getElementById("jointRunId").value || "").trim() || (j.run_id || "");
   let cur = Array.isArray(j.tb_runs) ? j.tb_runs.filter(Boolean) : [];
   if (!cur.length && j.tb_run) cur = [j.tb_run];
-  // Если ничего не выбрано — по умолчанию трое из RUN_ID (если есть в TB).
-  if (!cur.length) cur = jointPreferRuns(j.run_id);
+  const prefer = jointPreferRuns(liveRid);
+  // Если сохранённые TB runs не из текущей «Новой папки» — берём тройку из поля.
+  if (prefer.length && (!cur.length || !cur.some((r) => r.startsWith(liveRid + "/")))) {
+    cur = prefer;
+  }
 
   sel.innerHTML = "";
-  const prefer = jointPreferRuns(j.run_id);
   const seen = new Set();
   for (const r of [...prefer, ...(TB_RUNS||[])]) {
     if (!r || seen.has(r)) continue;
@@ -3832,45 +5631,182 @@ function fillJointCard() {
     o.selected = true;
     sel.append(o);
   }
+  refreshJointWeightStatus();
 }
 
 function selectJointTbTrio() {
   const rid = document.getElementById("jointRunId").value.trim();
   const want = new Set(jointPreferRuns(rid));
-  if (!want.size) { flash("hdrMeta", "joint: укажи RUN_ID"); return; }
+  if (!want.size) { flash("hdrMeta", "joint: укажи новую папку"); return; }
   const sel = document.getElementById("jointTb");
-  // Добавить опции, если TB ещё не знает run
   for (const r of want) {
     if (![...sel.options].some((o) => o.value === r)) {
       sel.append(el("option", {value:r, text:r}));
     }
   }
   for (const o of sel.options) o.selected = want.has(o.value);
-  loadJointChart();
   saveCfg();
+  flash("hdrMeta", `TB выбраны: трое из ${rid} — жми «Нарисовать TB»`);
 }
 
-function clearJointTb() {
+function setJointTbBtnBusy(btn, busyText) {
+  if (!btn) return () => {};
+  const prev = {
+    text: btn.textContent,
+    disabled: btn.disabled,
+    title: btn.title,
+    live: btn.classList.contains("live-on"),
+  };
+  btn.textContent = busyText;
+  btn.disabled = true;
+  btn.classList.add("live-on");
+  btn.title = busyText;
+  return () => {
+    btn.textContent = prev.text;
+    btn.disabled = prev.disabled;
+    btn.title = prev.title;
+    if (!prev.live) btn.classList.remove("live-on");
+  };
+}
+
+async function drawJointTb() {
   const sel = document.getElementById("jointTb");
-  for (const o of sel.options) o.selected = false;
-  loadJointChart();
-  saveCfg();
+  const runs = [...sel.selectedOptions].map((o) => o.value.trim()).filter(Boolean);
+  if (!runs.length) {
+    flash("hdrMeta", "TB: сначала выбери runs (или «Трое из новой папки»)");
+    return;
+  }
+  const btn = document.getElementById("btnJointTbDraw");
+  const restore = setJointTbBtnBusy(btn, "● Рисуется…");
+  flash("hdrMeta", "TB: рисую…");
+  try {
+    await loadJointChart();
+    await saveCfg();
+    flash("hdrMeta", `TB нарисован · ${runs.length} run(s)`);
+  } catch (e) {
+    flash("hdrMeta", "TB err: " + (e.message || e));
+  } finally {
+    restore();
+  }
 }
 
-async function trainJoint(resume=false) {
+async function clearJointTb() {
+  const btn = document.getElementById("btnJointTbClear");
+  const restore = setJointTbBtnBusy(btn, "● Выключается…");
+  flash("hdrMeta", "TB: выключаю…");
+  try {
+    const sel = document.getElementById("jointTb");
+    for (const o of sel.options) o.selected = false;
+    await loadJointChart();
+    await saveCfg();
+    flash("hdrMeta", "TB выключен");
+  } catch (e) {
+    flash("hdrMeta", "TB err: " + (e.message || e));
+  } finally {
+    restore();
+  }
+}
+
+let _jointWeightTimer = null;
+function scheduleJointWeightStatus() {
+  if (_jointWeightTimer) clearTimeout(_jointWeightTimer);
+  _jointWeightTimer = setTimeout(() => refreshJointWeightStatus(), 350);
+}
+
+function setJointStatusEl(id, item) {
+  const eln = document.getElementById(id);
+  if (!eln) return;
+  if (!item) {
+    eln.className = "run-status";
+    eln.textContent = "—";
+    return;
+  }
+  const ok = !!(item.exists && item.has_weights);
+  eln.className = "run-status " + (ok ? "ok" : (item.exists ? "ok" : "missing"));
+  eln.textContent = item.label || (ok ? "есть" : "нет папки");
+}
+
+async function refreshJointWeightStatus() {
+  const j = collectJoint();
+  for (const id of ["jointStatusJack","jointStatusLily","jointStatusGeorge","jointStatusRun"]) {
+    const eln = document.getElementById(id);
+    if (eln) { eln.className = "run-status checking"; eln.textContent = "…"; }
+  }
+  if (!j.init_jack && !j.init_lily && !j.init_george && !j.run_id) {
+    setJointStatusEl("jointStatusJack", null);
+    setJointStatusEl("jointStatusLily", null);
+    setJointStatusEl("jointStatusGeorge", null);
+    setJointStatusEl("jointStatusRun", null);
+    return;
+  }
+  try {
+    const q = new URLSearchParams({
+      jack: j.init_jack || "",
+      lily: j.init_lily || "",
+      george: j.init_george || "",
+      run_id: j.run_id || "",
+    });
+    const data = await api("/api/joint/run_weights?" + q.toString());
+    const items = (data && data.items) || {};
+    if (data && data.ok === false && !Object.keys(items).length) {
+      const err = String(data.error || "ssh fail");
+      for (const id of ["jointStatusJack","jointStatusLily","jointStatusGeorge","jointStatusRun"]) {
+        const eln = document.getElementById(id);
+        if (eln) { eln.className = "run-status missing"; eln.textContent = "ssh: " + err.slice(0, 80); }
+      }
+      return;
+    }
+    setJointStatusEl("jointStatusJack", items.jack);
+    setJointStatusEl("jointStatusLily", items.lily);
+    setJointStatusEl("jointStatusGeorge", items.george);
+    setJointStatusEl("jointStatusRun", items.run);
+  } catch (e) {
+    const msg = String((e && e.message) || e || "err");
+    for (const id of ["jointStatusJack","jointStatusLily","jointStatusGeorge","jointStatusRun"]) {
+      const eln = document.getElementById(id);
+      if (eln) { eln.className = "run-status missing"; eln.textContent = "не удалось проверить · " + msg.slice(0, 60); }
+    }
+  }
+}
+
+async function trainJoint() {
   await saveCfg();
   const j = collectJoint();
   if (!j.init_jack || !j.init_lily || !j.init_george || !j.run_id) {
-    flash("hdrMeta", "joint: заполни 3 базы и RUN_ID");
+    flash("hdrMeta", "joint: заполни 3 базы и новую папку");
     return;
   }
+  let resume = false;
+  try {
+    const q = new URLSearchParams({
+      jack: j.init_jack, lily: j.init_lily, george: j.init_george, run_id: j.run_id,
+    });
+    const info = await api("/api/joint/run_weights?" + q.toString());
+    const run = (info && info.items && info.items.run) || {};
+    resume = !!(run.exists && run.has_weights);
+  } catch (_) {
+    resume = false;
+  }
+  const snap = {
+    init_jack: j.init_jack,
+    init_lily: j.init_lily,
+    init_george: j.init_george,
+    run_id: j.run_id,
+  };
+  await persistJointLocked(snap);
+  _jointLockGraceUntil = Date.now() + 60000;
+  applyJointTrainLock(true);
   const resp = await api("/api/action", {
     method:"POST", headers:{"Content-Type":"application/json"},
     body: JSON.stringify({action:"joint_train", resume, ...j}),
   });
   LAST_JOB = resp.job_id;
-  flash("hdrMeta", `joint train → ${j.run_id}`);
+  flash("hdrMeta", resume
+    ? `resume дообучения → ${j.run_id}`
+    : `запуск дообучения → ${j.run_id}`);
   pollJobs();
+  setTimeout(pollServer, 1500);
+  setTimeout(pollServer, 5000);
 }
 
 async function startJointStream() {
@@ -3880,16 +5816,96 @@ async function startJointStream() {
   if (!run_id) { flash("hdrMeta", "stream: укажи RUN_ID"); return; }
   document.getElementById("jointRunId").value = run_id;
   document.getElementById("streamRunId").value = run_id;
+  _streamStoppingUntil = 0;
+  _streamStartingUntil = Date.now() + 90000;
+  applyStreamButtons("starting");
+  schedulePresWorldPoll(true);
+  flash("hdrMeta", `stream Presentation → ${run_id}`);
   try {
     const resp = await api("/api/action", {
       method:"POST", headers:{"Content-Type":"application/json"},
       body: JSON.stringify({ action:"joint_stream", run_id }),
     });
     LAST_JOB = resp.job_id;
-    flash("hdrMeta", `stream Presentation → ${run_id}`);
     pollJobs();
+    setTimeout(pollServer, 2000);
+    setTimeout(pollServer, 8000);
   } catch (e) {
+    _streamStartingUntil = 0;
+    applyStreamButtons("stopped");
     alert(e.message||e);
+  }
+}
+
+let _streamStartingUntil = 0;
+let _streamStoppingUntil = 0;
+
+function isStreamStarting() { return Date.now() < _streamStartingUntil; }
+function isStreamStopping() { return Date.now() < _streamStoppingUntil; }
+
+function applyStreamButtons(streamState) {
+  const btnStart = document.getElementById("btnJointStream");
+  const btnStop = document.getElementById("btnKillStream");
+  const runInp = document.getElementById("streamRunId");
+  if (!btnStart || !btnStop) return;
+  let st = String(streamState || "stopped");
+  if (st === "true" || st === "1") st = "running";
+  if (st === "false" || st === "0") st = "stopped";
+  if (isStreamStopping() && st !== "stopped") st = "stopping";
+  if (isStreamStarting() && st !== "running" && st !== "stopping") st = "starting";
+
+  const lockRun = (st === "running" || st === "starting" || st === "stopping");
+  if (runInp) {
+    runInp.disabled = lockRun;
+    if (runInp.parentElement) runInp.parentElement.classList.toggle("locked", lockRun);
+  }
+
+  if (st === "running") {
+    _streamStartingUntil = 0;
+    _streamStoppingUntil = 0;
+    btnStart.textContent = "● Запущено";
+    btnStart.classList.add("live-on");
+    btnStart.classList.remove("primary");
+    btnStart.disabled = true;
+    btnStart.title = "Стрим уже идёт — останови Стоп стрим";
+    btnStop.textContent = "⏹ Стоп стрим";
+    btnStop.classList.remove("live-on");
+    btnStop.disabled = false;
+    btnStop.title = "Убить только бесконечный стрим. Train и validate не трогает.";
+  } else if (st === "starting") {
+    btnStart.textContent = "● Запускается…";
+    btnStart.classList.add("live-on");
+    btnStart.classList.remove("primary");
+    btnStart.disabled = true;
+    btnStart.title = "Идёт запуск Presentation-стрима на lab";
+    btnStop.textContent = "⏹ Стоп стрим";
+    btnStop.classList.remove("live-on");
+    btnStop.disabled = true;
+    btnStop.title = "Дождись запуска";
+  } else if (st === "stopping") {
+    btnStart.textContent = "● Остановка…";
+    btnStart.classList.remove("live-on");
+    btnStart.classList.remove("primary");
+    btnStart.disabled = true;
+    btnStart.title = "Идёт остановка стрима";
+    btnStop.textContent = "● Останавливается…";
+    btnStop.classList.add("live-on");
+    btnStop.disabled = true;
+    btnStop.title = "Идёт остановка Presentation-стрима";
+  } else {
+    if (st === "stopped") {
+      _streamStartingUntil = 0;
+      _streamStoppingUntil = 0;
+    }
+    btnStart.textContent = "▶ Стрим Presentation (бесконечно)";
+    btnStart.classList.remove("live-on");
+    btnStart.classList.add("primary");
+    btnStart.disabled = false;
+    btnStart.title = "";
+    btnStop.textContent = "⏹ Стоп стрим";
+    btnStop.classList.remove("live-on");
+    btnStop.disabled = false;
+    btnStop.title = "Убить только бесконечный стрим. Train и validate не трогает.";
   }
 }
 
@@ -3901,15 +5917,20 @@ function switchJointTab(panelId) {
   for (const panel of document.querySelectorAll("#card-joint-wrap .subpanel")) {
     panel.classList.toggle("active", panel.id === panelId);
   }
+  if (panelId === "panel-joint-stream") pollPresWorld();
   saveUiView();
 }
 
 function switchModeTab(mode) {
   const train = mode === "training";
+  const streaming = mode === "streaming";
+  const obs = mode === "obs";
   document.getElementById("tab-mode-training").classList.toggle("active", train);
-  document.getElementById("tab-mode-streaming").classList.toggle("active", !train);
+  document.getElementById("tab-mode-streaming").classList.toggle("active", streaming);
+  document.getElementById("tab-mode-obs").classList.toggle("active", obs);
   document.getElementById("panel-mode-training").style.display = train ? "" : "none";
-  document.getElementById("panel-mode-streaming").style.display = train ? "none" : "";
+  document.getElementById("panel-mode-streaming").style.display = streaming ? "" : "none";
+  document.getElementById("panel-mode-obs").style.display = obs ? "" : "none";
   saveUiView();
 }
 
@@ -3937,9 +5958,11 @@ function saveUiView() {
   try {
     const streaming = !!(document.getElementById("tab-mode-streaming")
       && document.getElementById("tab-mode-streaming").classList.contains("active"));
+    const obs = !!(document.getElementById("tab-mode-obs")
+      && document.getElementById("tab-mode-obs").classList.contains("active"));
     const jointBtn = document.querySelector("#card-joint-wrap .subtab.active");
     const view = {
-      mode: streaming ? "streaming" : "training",
+      mode: obs ? "obs" : (streaming ? "streaming" : "training"),
       joint: (jointBtn && jointBtn.dataset.panel) || "panel-joint-train",
       scrollY: Math.max(0, window.scrollY || window.pageYOffset || 0),
       anchor: _nearestVisibleCardId() || "",
@@ -3956,13 +5979,17 @@ function restoreUiView() {
     view = null;
   }
   if (!view || typeof view !== "object") return;
-  if (view.mode === "streaming" || view.mode === "training") {
+  if (view.mode === "streaming" || view.mode === "training" || view.mode === "obs") {
     // Avoid recursive save noise while restoring.
     const train = view.mode === "training";
+    const streaming = view.mode === "streaming";
+    const obs = view.mode === "obs";
     document.getElementById("tab-mode-training").classList.toggle("active", train);
-    document.getElementById("tab-mode-streaming").classList.toggle("active", !train);
+    document.getElementById("tab-mode-streaming").classList.toggle("active", streaming);
+    document.getElementById("tab-mode-obs").classList.toggle("active", obs);
     document.getElementById("panel-mode-training").style.display = train ? "" : "none";
-    document.getElementById("panel-mode-streaming").style.display = train ? "none" : "";
+    document.getElementById("panel-mode-streaming").style.display = streaming ? "" : "none";
+    document.getElementById("panel-mode-obs").style.display = obs ? "" : "none";
   }
   if (view.joint) {
     for (const btn of document.querySelectorAll("#card-joint-wrap .subtab")) {
@@ -4048,6 +6075,9 @@ async function killValidateOnly() {
 async function killStreamOnly() {
   if (!confirm("Остановить только бесконечный стрим Presentation? Train и validate не трогаем.")) return;
   flash("hdrMeta", "стоп стрим…");
+  _streamStartingUntil = 0;
+  _streamStoppingUntil = Date.now() + 90000;
+  applyStreamButtons("stopping");
   try {
     const j = await api("/api/action", {
       method:"POST", headers:{"Content-Type":"application/json"},
@@ -4056,14 +6086,39 @@ async function killStreamOnly() {
     LAST_JOB = j.job_id;
     pollJobs();
     setTimeout(pollServer, 1500);
+    setTimeout(pollServer, 5000);
+    setTimeout(pollServer, 12000);
   } catch (e) {
+    _streamStoppingUntil = 0;
+    applyStreamButtons("running");
     alert(e.message||e);
   }
+}
+
+async function repairStreamSpawn() {
+  if (!confirm("Починить спавн деревьев/овец в Presentation?\\n\\nСкрипт напишет .forest_repair_spawners → Unity сделает ResetSpawners.\\nНужен свежий билд со StreamSpawnRepairWatcher + фикс TreeSpawner.")) return;
+  flash("hdrMeta", "repair spawn…");
+  try {
+    const j = await api("/api/action", {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({
+        action: "repair_spawn",
+        run_id: (document.getElementById("streamRunId")||{}).value || (document.getElementById("jointRunId")||{}).value || "",
+        force: true,
+      }),
+    });
+    LAST_JOB = j.job_id;
+    pollJobs();
+  } catch (e) { alert(e.message||e); }
 }
 
 async function killModeTraining() {
   if (!confirm("Стоп весь блок Forest Lab Train?\\n\\nУбьёт: train + validate + Presentation stream.\\nНе трогает: Survival followers, OBS.")) return;
   flash("hdrMeta", "стоп блок Train…");
+  beginJointStopping();
+  _streamStartingUntil = 0;
+  _streamStoppingUntil = Date.now() + 90000;
+  applyStreamButtons("stopping");
   try {
     const j = await api("/api/action", {
       method:"POST", headers:{"Content-Type":"application/json"},
@@ -4073,12 +6128,22 @@ async function killModeTraining() {
     pollJobs();
     setTimeout(pollServer, 1500);
     setTimeout(pollServer, 5000);
-  } catch (e) { alert(e.message||e); }
+    setTimeout(pollServer, 15000);
+  } catch (e) {
+    _jointStoppingUntil = 0;
+    applyJointTrainLock(false);
+    _streamStoppingUntil = 0;
+    applyStreamButtons("running");
+    alert(e.message||e);
+  }
 }
 
 async function killModeStreaming() {
   if (!confirm("Стоп весь блок Survival followers?\\n\\nУбьёт: Streaming Survival + LLM Bot.\\nНе трогает: train, Presentation onnx, OBS.")) return;
   flash("hdrMeta", "стоп блок Survival…");
+  _llmStartingUntil = 0;
+  _llmStoppingUntil = Date.now() + 90000;
+  applyLlmBotButtons("stopping");
   try {
     const j = await api("/api/action", {
       method:"POST", headers:{"Content-Type":"application/json"},
@@ -4089,12 +6154,17 @@ async function killModeStreaming() {
     pollJobs();
     setTimeout(pollServer, 1500);
     setTimeout(pollServer, 5000);
-  } catch (e) { alert(e.message||e); }
+    setTimeout(pollLlmBot, 3000);
+  } catch (e) {
+    _llmStoppingUntil = 0;
+    alert(e.message||e);
+  }
 }
 
 async function killTrainOnly() {
   if (!confirm("Остановить train на lab (mlagents + headless Unity)? Стрим и validate не трогаем.")) return;
   flash("hdrMeta", "стоп train…");
+  beginJointStopping();
   try {
     const j = await api("/api/action", {
       method:"POST", headers:{"Content-Type":"application/json"},
@@ -4104,7 +6174,10 @@ async function killTrainOnly() {
     pollJobs();
     setTimeout(pollServer, 1500);
     setTimeout(pollServer, 4000);
+    setTimeout(pollServer, 12000);
   } catch (e) {
+    _jointStoppingUntil = 0;
+    applyJointTrainLock(true);
     alert(e.message||e);
   }
 }
@@ -4112,6 +6185,65 @@ async function killTrainOnly() {
 const LLM_API = "/api/llm_bot";
 let LLM_LISTEN = false;
 let LLM_POLL_TIMER = null;
+let _llmStartingUntil = 0;
+let _llmStoppingUntil = 0;
+
+function applyLlmBotButtons(botState) {
+  const btnStart = document.getElementById("btnLlmStart");
+  const btnStop = document.getElementById("btnLlmStop");
+  if (!btnStart || !btnStop) return;
+  let st = String(botState || "stopped");
+  if (Date.now() < _llmStoppingUntil && st !== "stopped" && st !== "error") st = "stopping";
+  if (Date.now() < _llmStartingUntil && st !== "running" && st !== "error" && st !== "stopping") st = "starting";
+  if (st === "running") {
+    _llmStartingUntil = 0;
+    _llmStoppingUntil = 0;
+    btnStart.textContent = "● Запущено";
+    btnStart.classList.add("live-on");
+    btnStart.classList.remove("primary");
+    btnStart.disabled = true;
+    btnStart.title = "LLM Bot уже работает на lab";
+    btnStop.textContent = "⏹ Stop LLM Bot";
+    btnStop.classList.remove("live-on");
+    btnStop.disabled = false;
+    btnStop.title = "Остановить LLM Bot на lab";
+  } else if (st === "starting") {
+    btnStart.textContent = "● Запускается…";
+    btnStart.classList.add("live-on");
+    btnStart.classList.remove("primary");
+    btnStart.disabled = true;
+    btnStart.title = "Идёт запуск LLM Bot на lab";
+    btnStop.textContent = "⏹ Stop LLM Bot";
+    btnStop.classList.remove("live-on");
+    btnStop.disabled = true;
+    btnStop.title = "Дождись запуска или ошибки";
+  } else if (st === "stopping") {
+    btnStart.textContent = "● Остановка…";
+    btnStart.classList.remove("live-on");
+    btnStart.classList.remove("primary");
+    btnStart.disabled = true;
+    btnStart.title = "Идёт остановка LLM Bot";
+    btnStop.textContent = "● Останавливается…";
+    btnStop.classList.add("live-on");
+    btnStop.disabled = true;
+    btnStop.title = "Идёт остановка LLM Bot на lab";
+  } else {
+    // stopped / error / unknown
+    if (st === "stopped" || st === "error") {
+      _llmStartingUntil = 0;
+      _llmStoppingUntil = 0;
+    }
+    btnStart.textContent = "▶ Start LLM Bot";
+    btnStart.classList.remove("live-on");
+    btnStart.classList.add("primary");
+    btnStart.disabled = false;
+    btnStart.title = "Запустить LLM Bot на lab_comp";
+    btnStop.textContent = "⏹ Stop LLM Bot";
+    btnStop.classList.remove("live-on");
+    btnStop.disabled = false;
+    btnStop.title = "Остановить LLM Bot на lab";
+  }
+}
 
 function renderSsDebugActions(s) {
   const host = document.getElementById("ssDebugActions");
@@ -4176,13 +6308,19 @@ function renderLlmStatus(s) {
   const live = (st === "running" || st === "starting");
   if (pill) {
     pill.textContent = st;
-    pill.className = "pill" + (live ? " live" : "");
+    pill.className = "pill" + (live || st === "stopping" ? " live" : "");
   }
-  setCardState("card-llm-bot", live, false);
+  setCardState("card-llm-bot", live || st === "stopping", false);
+  applyLlmBotButtons(st);
   const modeSs = document.getElementById("tab-mode-streaming");
   if (modeSs) {
     const ssLive = !!(document.getElementById("card-ss") && document.getElementById("card-ss").classList.contains("running"));
-    modeSs.classList.toggle("has-live", ssLive || live);
+    const previewLive = !!(document.getElementById("card-ss-preview") && document.getElementById("card-ss-preview").classList.contains("running"));
+    modeSs.classList.toggle("has-live", ssLive || previewLive);
+  }
+  const modeObs = document.getElementById("tab-mode-obs");
+  if (modeObs) {
+    // не гасим has-live из‑за bot; applyLabActivity выставит по stream/obs
   }
   const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
   set("llmStBot", st + (s.host ? (" @ " + s.host) : " @ lab_comp"));
@@ -4194,6 +6332,7 @@ function renderLlmStatus(s) {
   set("llmStHttp", s.bot_http_ready ? "ready" : "down");
   const err = document.getElementById("llmLastError");
   if (err) err.textContent = s.last_error ? ("Last error: " + s.last_error) : "";
+  renderLlmRoster(s.roster || s.active_users || [], s.roster_count, s.players || null);
   const btnL = document.getElementById("btnLlmListen");
   if (btnL) btnL.textContent = LLM_LISTEN ? "Listen Twitch Chat: ON" : "Listen Twitch Chat: OFF";
 
@@ -4225,6 +6364,75 @@ function renderLlmStatus(s) {
   }
 }
 
+let LLM_ROSTER_HISTORY = false;
+let LLM_ROSTER_CACHE = { roster: [], players: [], roster_count: 0 };
+
+function fmtRosterTime(ts) {
+  if (!ts) return "—";
+  try {
+    const d = new Date(Number(ts) * 1000);
+    if (Number.isNaN(d.getTime())) return "—";
+    return d.toLocaleString("ru-RU", { day:"2-digit", month:"2-digit", hour:"2-digit", minute:"2-digit" });
+  } catch (_) { return "—"; }
+}
+
+function renderLlmRoster(roster, count, players) {
+  const activeRows = Array.isArray(roster) ? roster : [];
+  const histRows = Array.isArray(players) ? players : activeRows;
+  LLM_ROSTER_CACHE = {
+    roster: activeRows,
+    players: histRows,
+    roster_count: (count != null) ? Number(count) : activeRows.length,
+  };
+  const rows = LLM_ROSTER_HISTORY ? histRows : activeRows;
+  const nActive = LLM_ROSTER_CACHE.roster_count;
+  const pill = document.getElementById("llmRosterPill");
+  const empty = document.getElementById("llmRosterEmpty");
+  const table = document.getElementById("llmRosterTable");
+  const body = document.getElementById("llmRosterBody");
+  const modeBtn = document.getElementById("btnLlmRosterMode");
+  if (modeBtn) modeBtn.textContent = LLM_ROSTER_HISTORY ? "Вся история" : "В игре";
+  if (pill) {
+    pill.textContent = LLM_ROSTER_HISTORY
+      ? (rows.length + " / " + nActive + " in")
+      : String(nActive);
+  }
+  if (!body || !table || !empty) return;
+  if (!rows.length) {
+    empty.style.display = "block";
+    table.style.display = "none";
+    body.innerHTML = "";
+    return;
+  }
+  empty.style.display = "none";
+  table.style.display = "table";
+  const esc = (t) => String(t)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const num = (v) => {
+    const n = Number(v);
+    return Number.isFinite(n) ? String(n) : "0";
+  };
+  body.innerHTML = rows.map((u, i) => {
+    const name = esc(u.username || u.user || "?");
+    const act = esc(u.action_name || u.action || "idle");
+    const since = fmtRosterTime(u.joined_at);
+    const live = !!(u.is_active === true || u.is_active === 1 || (!LLM_ROSTER_HISTORY));
+    const st = live ? '<span style="color:#3ecf8e">in</span>' : '<span style="color:#7a8499">out</span>';
+    const dim = live ? "" : "opacity:.65";
+    return `<tr style="border-top:1px solid #1e2633;${dim}">
+      <td style="padding:4px 6px;color:#7a8499">${i + 1}</td>
+      <td style="padding:4px 6px"><b>${name}</b></td>
+      <td style="padding:4px 6px">${st}</td>
+      <td style="padding:4px 6px">${act}</td>
+      <td style="padding:4px 6px;color:#9aa4b8;white-space:nowrap">${since}</td>
+      <td style="padding:4px 6px">${num(u.total_water_collected)}</td>
+      <td style="padding:4px 6px">${num(u.total_wood_collected)}</td>
+      <td style="padding:4px 6px">${num(u.total_sheep_killed)}</td>
+      <td style="padding:4px 6px">${num(u.total_campfires_built)}</td>
+    </tr>`;
+  }).join("");
+}
+
 async function pollLlmBot() {
   try {
     const s = await api(LLM_API + "/status");
@@ -4239,16 +6447,36 @@ function wireLlmBotUi() {
   if (!document.getElementById("btnLlmStart")) return;
   document.getElementById("btnLlmStart").onclick = async () => {
     flash("hdrMeta", "LLM bot starting…");
+    _llmStoppingUntil = 0;
+    _llmStartingUntil = Date.now() + 120000;
+    applyLlmBotButtons("starting");
     try {
       const s = await api(LLM_API + "/start", { method: "POST", headers: {"Content-Type":"application/json"}, body: "{}" });
       renderLlmStatus(s);
-    } catch (e) { alert(e.message || e); }
+      setTimeout(pollLlmBot, 1500);
+      setTimeout(pollLlmBot, 5000);
+    } catch (e) {
+      _llmStartingUntil = 0;
+      applyLlmBotButtons("stopped");
+      alert(e.message || e);
+    }
   };
   document.getElementById("btnLlmStop").onclick = async () => {
+    flash("hdrMeta", "LLM bot stopping…");
+    _llmStartingUntil = 0;
+    _llmStoppingUntil = Date.now() + 90000;
+    applyLlmBotButtons("stopping");
     try {
       const s = await api(LLM_API + "/stop", { method: "POST", headers: {"Content-Type":"application/json"}, body: "{}" });
       renderLlmStatus(s);
-    } catch (e) { alert(e.message || e); }
+      setTimeout(pollLlmBot, 1500);
+      setTimeout(pollLlmBot, 5000);
+      setTimeout(pollServer, 2000);
+    } catch (e) {
+      _llmStoppingUntil = 0;
+      applyLlmBotButtons("running");
+      alert(e.message || e);
+    }
   };
   document.getElementById("btnLlmListen").onclick = async () => {
     const next = !LLM_LISTEN;
@@ -4300,6 +6528,20 @@ function wireLlmBotUi() {
       await pollLlmBot();
     } catch (e) { alert(e.message || e); }
   };
+  const btnResync = document.getElementById("btnLlmRosterResync");
+  if (btnResync) btnResync.onclick = async () => {
+    flash("hdrMeta", "roster resync → Unity…");
+    try {
+      const r = await api(LLM_API + "/resync_roster", { method: "POST", headers: {"Content-Type":"application/json"}, body: "{}" });
+      if (r.status) renderLlmStatus(r.status);
+      else await pollLlmBot();
+    } catch (e) { alert(e.message || e); }
+  };
+  const btnMode = document.getElementById("btnLlmRosterMode");
+  if (btnMode) btnMode.onclick = () => {
+    LLM_ROSTER_HISTORY = !LLM_ROSTER_HISTORY;
+    renderLlmRoster(LLM_ROSTER_CACHE.roster, LLM_ROSTER_CACHE.roster_count, LLM_ROSTER_CACHE.players);
+  };
   pollLlmBot();
   if (LLM_POLL_TIMER) clearInterval(LLM_POLL_TIMER);
   LLM_POLL_TIMER = setInterval(pollLlmBot, 2000);
@@ -4335,13 +6577,15 @@ async function loadJointChart() {
 }
 
 async function saveCfg() {
+  const j = collectJoint();
+  j.locked = readJointLocked();
   const body = {
     build: document.getElementById("buildName").value.trim(),
     tb_url: document.getElementById("tbUrl").value.trim(),
     jack: collectHero("jack"),
     lily: collectHero("lily"),
     george: collectHero("george"),
-    joint: collectJoint(),
+    joint: j,
   };
   CFG = (await api("/api/config", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)})).config;
   flash("hdrMeta", "настройки сохранены");
@@ -4568,7 +6812,7 @@ async function openDetail(hero, title) {
 async function openJointDetail() {
   const sel = document.getElementById("jointTb");
   const runs = [...sel.selectedOptions].map((o) => o.value.trim()).filter(Boolean);
-  return openDetailRuns("Joint finetune", runs, "Сначала выбери TB runs (Трое из RUN_ID)");
+  return openDetailRuns("Joint finetune", runs, "Сначала выбери TB runs и нажми «Нарисовать TB»");
 }
 
 async function openDetailRuns(title, runs, emptyHint) {
@@ -4666,13 +6910,111 @@ async function pollServer() {
       pill.textContent = mode === "local" ? "local err" : "ssh err";
       pill.className = "pill";
     }
+    renderServerHost(s);
     applyLabActivity(s.activity || {});
+    renderStreamFps((s.activity || {}).stream_fps || {});
+    renderObsSsh(s.ssh_sessions || {});
+    const streamOn = !!(s.activity && s.activity.stream);
+    if (streamOn) schedulePresWorldPoll(true);
+    else if (_presWorldTimer) { /* keep last frame; soft refresh less often */ schedulePresWorldPoll(false); }
   } catch (e) {
     document.getElementById("serverStats").textContent = "server_stats: " + (e.message||e);
     document.getElementById("serverPill").textContent = "err";
     document.getElementById("serverPill").className = "pill";
+    renderServerHost({ ok:false, host:"lab_comp", metrics:{}, text: String(e.message||e) });
     applyLabActivity({});
+    renderStreamFps({});
+    renderObsSsh({});
   }
+}
+
+function hostMeterHtml(label, valueHtml, pct, barClass) {
+  const p = Math.max(0, Math.min(100, Number(pct) || 0));
+  return (
+    '<div class="host-meter">'
+    + '<div class="host-meter-row"><span class="host-meter-label">' + label + '</span>'
+    + '<span class="host-meter-val">' + valueHtml + '</span></div>'
+    + '<div class="host-bar ' + barClass + '"><i style="width:' + p.toFixed(1) + '%"></i></div>'
+    + '</div>'
+  );
+}
+
+function renderServerHost(s) {
+  const title = document.getElementById("serverHostTitle");
+  const online = document.getElementById("serverHostOnline");
+  const meters = document.getElementById("serverHostMeters");
+  if (!meters) return;
+  const host = (s && s.host) || "lab_comp";
+  if (title) title.textContent = host === "local" ? "lab_comp (local)" : host;
+  const lat = s && s.latency_ms != null ? Number(s.latency_ms) : NaN;
+  if (online) {
+    if (s && s.ok) {
+      online.className = "host-online";
+      online.textContent = "ONLINE" + (lat === lat ? (" · " + Math.round(lat) + " MS") : "");
+    } else if (s && s.pending) {
+      online.className = "host-online pending";
+      online.textContent = "ОПРОС…";
+    } else {
+      online.className = "host-online off";
+      online.textContent = "OFFLINE";
+    }
+  }
+  const m = (s && s.metrics) || {};
+  const parts = [];
+  const ram = m.ram || null;
+  if (ram) {
+    parts.push(hostMeterHtml(
+      "RAM",
+      (ram.used_gib != null ? ram.used_gib + " GiB / " + ram.total_gib + " GiB · " + ram.pct + "%" : "—"),
+      ram.pct,
+      "ram"
+    ));
+  }
+  const disk = m.disk || null;
+  if (disk) {
+    parts.push(hostMeterHtml(
+      "DISK",
+      "свободно " + disk.free_gib + " GiB · занято " + disk.used_gib + " GiB / " + disk.total_gib + " GiB · " + disk.pct + "%",
+      disk.pct,
+      "disk"
+    ));
+  }
+  const gpus = Array.isArray(m.gpus) ? m.gpus : [];
+  const gpuProcs = Array.isArray(m.gpu_procs) ? m.gpu_procs : [];
+  for (const g of gpus) {
+    const chips = gpuProcs.map((p) =>
+      '<span class="host-chip">' + (p.label || ((p.user || "?") + " " + (p.used_gib != null ? p.used_gib + "G" : ""))) + "</span>"
+    ).join("");
+    parts.push(
+      '<div class="host-gpu">'
+      + '<div class="host-gpu-head"><strong>GPU ' + (g.index != null ? g.index : 0) + '</strong>'
+      + '<span>' + (g.name || "NVIDIA") + (g.temp != null ? (" · " + g.temp + "°C") : "") + '</span></div>'
+      + (chips ? ('<div class="host-chips">' + chips + '</div>') : "")
+      + hostMeterHtml(
+        "VRAM",
+        (g.vram_used_gib != null ? g.vram_used_gib + " GiB / " + g.vram_total_gib + " GiB · " + g.vram_pct + "%" : "—"),
+        g.vram_pct,
+        "vram"
+      )
+      + hostMeterHtml("UTIL", (g.util != null ? g.util + "%" : "—"), g.util, "util")
+      + '</div>'
+    );
+  }
+  const top = Array.isArray(m.top_cpu) ? m.top_cpu.slice(0, 6) : [];
+  if (top.length) {
+    parts.push(
+      '<div class="host-chips">'
+      + top.map((p) =>
+        '<span class="host-chip cpu">' + (p.comm || "?") + " " + Math.round(p.cpu || 0) + "%</span>"
+      ).join("")
+      + '</div>'
+    );
+  }
+  if (!parts.length) {
+    meters.innerHTML = '<div class="hint">' + ((s && s.text) ? "нет структурированных метрик — см. сырой вывод" : "загрузка метрик…") + '</div>';
+    return;
+  }
+  meters.innerHTML = parts.join("");
 }
 
 function setCardState(id, running, streaming) {
@@ -4707,6 +7049,9 @@ function applyLabActivity(a) {
   const joint = !!a.joint, validate = !!a.validate, stream = !!a.stream;
   const ss = !!a.streaming_survival;
   const bot = !!a.llm_bot;
+  const obsOn = !!a.obs;
+  window._labObsOn = obsOn;
+  window._labStreamOn = stream;
   setCardState("card-jack", jack, false);
   setCardState("card-lily", lily, false);
   setCardState("card-george", george, false);
@@ -4717,6 +7062,9 @@ function applyLabActivity(a) {
   // Survival followers: красный мигающий блок когда процесс жив.
   setCardState("card-ss", ss, false);
   setCardState("card-llm-bot", bot, false);
+  setCardState("card-obs-stream", stream || obsOn, false);
+  // сразу обновить pill/подсказку OBS (не ждать stream_fps)
+  renderObsStream(Object.assign({ stream_on: stream }, (a.stream_fps && typeof a.stream_fps === "object") ? a.stream_fps : {}));
   // Preview card keeps its own running state from ssPreviewApplyStatus — don't clear it here.
   const previewLive = !!(document.getElementById("card-ss-preview")
     && document.getElementById("card-ss-preview").classList.contains("running"));
@@ -4725,14 +7073,29 @@ function applyLabActivity(a) {
   const tabStream = document.getElementById("tab-joint-stream");
   if (tabTrain) tabTrain.classList.toggle("has-live", joint);
   if (tabStream) tabStream.classList.toggle("has-live", stream);
+  const modeTrain = document.getElementById("tab-mode-training");
+  if (modeTrain) modeTrain.classList.toggle("has-live", joint || jack || lily || george || validate);
   const modeSs = document.getElementById("tab-mode-streaming");
-  if (modeSs) modeSs.classList.toggle("has-live", ss || bot || previewLive);
+  if (modeSs) modeSs.classList.toggle("has-live", ss || previewLive);
+  const modeObs = document.getElementById("tab-mode-obs");
+  if (modeObs) {
+    // Красная вкладка только когда эфир (Unity и/или OBS), не из‑за LLM Bot.
+    modeObs.classList.toggle("has-live", stream || obsOn);
+    modeObs.classList.remove("warn-live");
+  }
 
   setPillLive("pill-jack", jack, false, null);
   setPillLive("pill-lily", lily, false, null);
   setPillLive("pill-george", george, false, null);
   setPillLive("pill-joint", joint, false, "finetune");
   setPillLive("pill-stream", stream, false, "idle");
+
+  applyJointTrainLock(!!joint);
+
+  if (isStreamStopping()) applyStreamButtons("stopping");
+  else if (stream) applyStreamButtons("running");
+  else if (isStreamStarting()) applyStreamButtons("starting");
+  else applyStreamButtons("stopped");
 
   const ssPill = document.getElementById("ssPill");
   if (ssPill) {
@@ -4757,6 +7120,577 @@ function applyLabActivity(a) {
   }
 
   renderLabTasks(a);
+}
+
+let _presWorldTimer = null;
+let _presWorldBusy = false;
+let _presWorldFrameCache = { start: null, end: null, episode: 0, pending: true };
+
+function schedulePresWorldPoll(live) {
+  if (_presWorldTimer) clearInterval(_presWorldTimer);
+  const ms = live ? 8000 : 25000;
+  pollPresWorld();
+  _presWorldTimer = setInterval(pollPresWorld, ms);
+}
+
+async function pollPresWorld() {
+  if (_presWorldBusy) return;
+  const runEl = document.getElementById("streamRunId") || document.getElementById("jointRunId");
+  const run_id = ((runEl && runEl.value) || "").trim();
+  _presWorldBusy = true;
+  try {
+    const q = run_id ? ("?run_id=" + encodeURIComponent(run_id)) : "";
+    const data = await api("/api/presentation_world" + q);
+    renderPresWorld(data);
+  } catch (e) {
+    const pill = document.getElementById("presWorldPill");
+    if (pill) { pill.textContent = "err"; pill.className = "pill"; }
+    const meta = document.getElementById("presWorldMeta");
+    if (meta) meta.textContent = String(e.message || e);
+  } finally {
+    _presWorldBusy = false;
+  }
+}
+
+function _presNum(v, fallback) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function _presFrameFromLive(data) {
+  if (!data || !data.ok) return null;
+  return {
+    ok: true,
+    ts: data.ts || "",
+    episode_index: data.episode_index,
+    trees: data.trees, sheep: data.sheep, zombies: data.zombies,
+    trees_n: data.trees_n, sheep_n: data.sheep_n, zombies_n: data.zombies_n,
+    trees_target: data.trees_target, sheep_target: data.sheep_target,
+    jack: data.jack, lily: data.lily, george: data.george,
+    landmarks: data.landmarks,
+  };
+}
+
+function renderPresWorld(data) {
+  const pill = document.getElementById("presWorldPill");
+  const meta = document.getElementById("presWorldMeta");
+  const agentsHost = document.getElementById("presWorldAgents");
+  if (!data || !data.ok) {
+    if (pill) { pill.textContent = "нет данных"; pill.className = "pill"; }
+    if (meta) meta.textContent = (data && data.error) ? data.error : "snapshot ещё не появился";
+    return;
+  }
+  if (pill) { pill.textContent = "live"; pill.className = "pill on"; }
+  if (meta) {
+    const bits = [];
+    if (data.run_id) bits.push(data.run_id);
+    if (data.source) bits.push(data.source);
+    if (data.ts) bits.push(data.ts);
+    else if (data.reason) bits.push(data.reason);
+    meta.textContent = bits.join(" · ") || "ok";
+  }
+  const setTxt = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+  const sheepN = _presNum(data.sheep_n, 0);
+  const sheepT = _presNum(data.sheep_target, 0);
+  const treeN = _presNum(data.trees_n, 0);
+  const treeT = _presNum(data.trees_target, 0);
+  const zN = _presNum(data.zombies_n, 0);
+  const ep = data.episode || {};
+  const lr = data.last_round || {};
+  const epIdx = _presNum(data.episode_index, 0)
+    || _presNum(ep.index, 0)
+    || _presNum(lr.episode, 0);
+  setTxt("presKpiEpisode", epIdx > 0 ? String(epIdx) : "—");
+  setTxt("presKpiSheep", sheepT ? (sheepN + " / " + sheepT) : String(sheepN));
+  setTxt("presKpiTrees", treeT ? (treeN + " / " + treeT) : String(treeN));
+  setTxt("presKpiZombies", String(zN));
+
+  const waterShow = _presNum(lr.water, 0) || _presNum(ep.water, 0);
+  const woodShow = _presNum(lr.wood, 0) || _presNum(ep.wood, 0);
+  const sheepKill = _presNum(lr.sheep_killed, 0) || _presNum(ep.sheep_killed, 0);
+  const treesChop = _presNum(lr.trees_chopped, 0) || _presNum(ep.trees_chopped, 0);
+  setTxt("presKpiWater", String(waterShow));
+  setTxt("presKpiWood", String(woodShow) + (treesChop ? (" · −" + treesChop + " дерев") : ""));
+  setTxt("presKpiSheepKill", String(sheepKill));
+
+  const order = [
+    { key: "jack", label: "Jack" },
+    { key: "lily", label: "Lily" },
+    { key: "george", label: "George" },
+  ];
+  if (agentsHost) {
+    agentsHost.innerHTML = order.map(({ key, label }) => {
+      const a = data[key] || {};
+      if (!a.ok) {
+        return '<div class="pres-agent ' + key + '"><div class="name">' + label + '</div><div>нет на карте</div></div>';
+      }
+      const dead = a.dead ? " dead" : "";
+      const wood = (a.wood != null && a.wood >= 0) ? (" · wood " + a.wood) : "";
+      return '<div class="pres-agent ' + key + dead + '">'
+        + '<div class="name">' + label + (a.dead ? " · DEAD" : "") + "</div>"
+        + "<div>hp " + (a.hp != null ? a.hp : "—")
+        + " · water " + (a.water != null ? a.water : "—") + wood + "</div>"
+        + "<div>xz (" + Number(a.x).toFixed(1) + ", " + Number(a.z).toFixed(1) + ")</div>"
+        + "</div>";
+    }).join("");
+  }
+
+  const frames = data.episode_frames || {};
+  let startFr = frames.start || null;
+  let endFr = frames.end || null;
+  let pending = !!frames.pending;
+  let frEp = _presNum(frames.episode, 0);
+  if (!startFr || !endFr) {
+    const live = _presFrameFromLive(data);
+    if (!startFr) startFr = live;
+    if (!endFr) endFr = live;
+    pending = true;
+    frEp = frEp || epIdx;
+  }
+  _presWorldFrameCache = { start: startFr, end: endFr, episode: frEp, pending: pending };
+
+  const stTitle = document.getElementById("presMapStartTitle");
+  const enTitle = document.getElementById("presMapEndTitle");
+  if (stTitle) {
+    stTitle.textContent = frEp
+      ? ("#" + frEp + (startFr && startFr.ts ? (" · " + String(startFr.ts).slice(11, 19)) : ""))
+      : "—";
+  }
+  if (enTitle) {
+    enTitle.textContent = pending
+      ? ("ещё идёт" + (endFr && endFr.ts ? (" · " + String(endFr.ts).slice(11, 19)) : ""))
+      : (frEp
+        ? ("#" + frEp + (endFr && endFr.ts ? (" · " + String(endFr.ts).slice(11, 19)) : ""))
+        : "—");
+  }
+
+  const cam = _presSharedCamera([startFr, endFr, data]);
+  drawPresWorldMap("presWorldMapStart", startFr, cam);
+  drawPresWorldMap("presWorldMapEnd", endFr, cam);
+}
+
+function _presCollectPts(data) {
+  const pts = [];
+  if (!data) return pts;
+  const lm = data.landmarks || {};
+  for (const k of ["trees", "sheep", "zombies"]) {
+    const arr = Array.isArray(data[k]) ? data[k] : [];
+    for (const p of arr) if (p && p.x != null) pts.push(p);
+  }
+  for (const key of ["jack", "lily", "george"]) {
+    const a = data[key];
+    if (a && a.ok) pts.push(a);
+  }
+  if (lm.house && lm.house.x != null) pts.push(lm.house);
+  for (const p of (lm.lakes || [])) if (p && p.x != null) pts.push(p);
+  for (const p of (lm.stones || [])) if (p && p.x != null) pts.push(p);
+  for (const p of (lm.fences || [])) if (p && p.x != null) pts.push(p);
+  for (const r of [...(lm.lakes || []), ...(lm.fences || [])]) {
+    if (!r || r.x == null) continue;
+    const hx = (Number(r.sx) || 0) * 0.5;
+    const hz = (Number(r.sz) || 0) * 0.5;
+    pts.push({ x: r.x - hx, z: r.z - hz });
+    pts.push({ x: r.x + hx, z: r.z + hz });
+  }
+  return pts;
+}
+
+function _presSharedCamera(frames) {
+  let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+  for (const fr of frames) {
+    for (const p of _presCollectPts(fr)) {
+      minX = Math.min(minX, p.x); maxX = Math.max(maxX, p.x);
+      minZ = Math.min(minZ, p.z); maxZ = Math.max(maxZ, p.z);
+    }
+  }
+  if (!(minX < maxX) || !(minZ < maxZ)) {
+    minX = -10; maxX = 30; minZ = 5; maxZ = 40;
+  }
+  const pad = 4;
+  return { minX: minX - pad, maxX: maxX + pad, minZ: minZ - pad, maxZ: maxZ + pad };
+}
+
+function drawPresWorldMap(canvasId, data, cam) {
+  const canvas = document.getElementById(canvasId);
+  if (!canvas || !canvas.getContext) return;
+  const ctx = canvas.getContext("2d");
+  const W = canvas.width, H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = "#0a0c10";
+  ctx.fillRect(0, 0, W, H);
+
+  if (!data || !data.ok) {
+    ctx.fillStyle = "#6a7384";
+    ctx.font = "14px sans-serif";
+    ctx.fillText("нет кадра", 16, 28);
+    return;
+  }
+
+  const lm = data.landmarks || {};
+  const pts = _presCollectPts(data);
+  if (!pts.length) {
+    ctx.fillStyle = "#6a7384";
+    ctx.font = "14px sans-serif";
+    ctx.fillText("нет точек мира", 16, 28);
+    return;
+  }
+  const minX = cam.minX, maxX = cam.maxX, minZ = cam.minZ, maxZ = cam.maxZ;
+  const spanX = Math.max(1, maxX - minX);
+  const spanZ = Math.max(1, maxZ - minZ);
+  const margin = 16;
+  const scale = Math.min((W - margin * 2) / spanX, (H - margin * 2) / spanZ);
+  const ox = (W - spanX * scale) / 2;
+  const oy = (H - spanZ * scale) / 2;
+  const toXY = (x, z) => ({
+    x: ox + (x - minX) * scale,
+    y: oy + (maxZ - z) * scale,
+  });
+
+  ctx.strokeStyle = "rgba(255,255,255,0.05)";
+  ctx.lineWidth = 1;
+  for (let g = Math.floor(minX); g <= maxX; g += 5) {
+    const a = toXY(g, minZ), b = toXY(g, maxZ);
+    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+  }
+  for (let g = Math.floor(minZ); g <= maxZ; g += 5) {
+    const a = toXY(minX, g), b = toXY(maxX, g);
+    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+  }
+
+  for (const lake of (lm.lakes || [])) {
+    if (!lake || lake.x == null) continue;
+    const sx = Math.max(2, Number(lake.sx) || 8);
+    const sz = Math.max(2, Number(lake.sz) || 6);
+    const c = toXY(lake.x, lake.z);
+    const rx = Math.max(4, sx * scale * 0.5);
+    const ry = Math.max(4, sz * scale * 0.5);
+    ctx.fillStyle = "rgba(58,126,200,0.35)";
+    ctx.strokeStyle = "rgba(120,180,240,0.7)";
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.ellipse(c.x, c.y, rx, ry, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+    ctx.fillStyle = "#9ec8f0";
+    ctx.font = "10px sans-serif";
+    ctx.fillText("озеро", c.x - 14, c.y + 3);
+  }
+
+  ctx.fillStyle = "rgba(139,105,20,0.75)";
+  for (const f of (lm.fences || [])) {
+    if (!f || f.x == null) continue;
+    const sx = Math.max(0.35, Number(f.sx) || 0.5);
+    const sz = Math.max(0.35, Number(f.sz) || 0.5);
+    const c = toXY(f.x, f.z);
+    const w = Math.max(2, sx * scale);
+    const h = Math.max(2, sz * scale);
+    ctx.fillRect(c.x - w / 2, c.y - h / 2, w, h);
+  }
+
+  ctx.fillStyle = "#9a9aa0";
+  for (const s of (lm.stones || [])) {
+    if (!s || s.x == null) continue;
+    const c = toXY(s.x, s.z);
+    ctx.beginPath();
+    ctx.arc(c.x, c.y, 3.5, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  if (lm.house && lm.house.x != null) {
+    const c = toXY(lm.house.x, lm.house.z);
+    ctx.fillStyle = "#c9a227";
+    ctx.fillRect(c.x - 6, c.y - 6, 12, 12);
+    ctx.strokeStyle = "#f0d878";
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(c.x - 6, c.y - 6, 12, 12);
+    ctx.fillStyle = "#f5e6a8";
+    ctx.font = "10px sans-serif";
+    ctx.fillText("дом", c.x - 10, c.y - 9);
+  }
+
+  const drawDots = (arr, color, r) => {
+    ctx.fillStyle = color;
+    for (const p of (arr || [])) {
+      if (!p || p.x == null) continue;
+      const c = toXY(p.x, p.z);
+      ctx.beginPath();
+      ctx.arc(c.x, c.y, r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  };
+  drawDots(data.trees, "#4a8f4a", 2.5);
+  drawDots(data.sheep, "#e8e0d0", 3);
+  drawDots(data.zombies, "#c45a5a", 3.5);
+
+  const agentColors = { jack: "#6aa6ff", lily: "#e070b0", george: "#3ecf8e" };
+  for (const key of ["jack", "lily", "george"]) {
+    const a = data[key];
+    if (!a || !a.ok) continue;
+    const c = toXY(a.x, a.z);
+    ctx.fillStyle = agentColors[key];
+    ctx.beginPath();
+    ctx.arc(c.x, c.y, a.dead ? 5 : 7, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = "#0b1220";
+    ctx.font = "bold 10px sans-serif";
+    ctx.fillText(key[0].toUpperCase(), c.x - 3.5, c.y + 3.5);
+  }
+}
+
+function renderStreamFps(fps) {
+  // Единственное место FPS: «Мир стрима» (meters + KPI + pill).
+  const pre = document.getElementById("streamFps");
+  const meters = document.getElementById("streamFpsMeters");
+  const card = document.getElementById("streamFpsCard");
+  const f = fps && typeof fps === "object" ? fps : {};
+  const n = Number(f.fps);
+  const hitchMs = Number(f.hitch_dt_ms);
+  const lagNow = !!f.lag_now || (n === n && n < 15) || (hitchMs === hitchMs && hitchMs >= 800);
+  const soft = (n === n && n < 20 && !lagNow);
+  if (pre) {
+    const lines = [];
+    if (n === n) {
+      const mark = lagNow ? "  ← НИЗКИЙ FPS" : (soft ? "  ← слабо" : "");
+      let line = `fps ≈ ${n.toFixed(1)}`;
+      const fmin = Number(f.fps_min), fmax = Number(f.fps_max);
+      if (fmin === fmin && fmax === fmax) line += `   min ${fmin.toFixed(0)}   max ${fmax.toFixed(0)}`;
+      line += `   step ≈ ${Number(f.step_ms||0).toFixed(0)} ms   steps=${f.steps||"?"}${mark}`;
+      lines.push(line);
+    }
+    if (f.hitches != null) lines.push(`hitches (окно) ${f.hitches}   slow>50ms ${f.slow||0}`);
+    if (hitchMs === hitchMs) lines.push(`last hitch ${hitchMs} ms  (step ${f.hitch_step||"?"}, ~${f.hitch_ema_fps||"?"} FPS)`);
+    if (f.summary) lines.push(String(f.summary).replace(/^\[stream_onnx\]\s*/, ""));
+    if (f.hitch && !hitchMs) lines.push(String(f.hitch).replace(/^\[stream_onnx\]\s*/, ""));
+    if (f.age_s != null) lines.push(`обновлено ${f.age_s}s назад · ${f.source||"?"}${f.log ? " · "+f.log : ""}`);
+    pre.textContent = lines.length ? lines.join("\n") : "нет данных (стрим не пишет лог)";
+  }
+  if (card) {
+    card.classList.toggle("fps-bad", !!lagNow && n === n);
+    card.classList.toggle("fps-warn", !!soft);
+  }
+  if (meters) {
+    if (!(n === n)) {
+      meters.innerHTML = '<div class="hint">нет данных (стрим не пишет лог)</div>';
+    } else {
+      const target = 30;
+      const pct = Math.max(0, Math.min(100, (n / target) * 100));
+      let barCls = "fps";
+      let statusCls = "ok";
+      let statusTxt = "OK · нормальный FPS";
+      if (lagNow) {
+        barCls += " bad";
+        statusCls = "bad";
+        statusTxt = "НИЗКИЙ FPS · стрим лагает (<15)";
+      } else if (soft) {
+        barCls += " warn";
+        statusCls = "warn";
+        statusTxt = "СЛАБЫЙ FPS · лучше проверить (<20)";
+      }
+      const extra = [];
+      if (f.step_ms != null) extra.push("step " + Number(f.step_ms).toFixed(0) + " ms");
+      const fmin = Number(f.fps_min), fmax = Number(f.fps_max);
+      if (fmin === fmin && fmax === fmax) extra.push("min " + fmin.toFixed(0) + " · max " + fmax.toFixed(0));
+      if (hitchMs === hitchMs) extra.push("hitch " + hitchMs + " ms");
+      if (f.age_s != null) extra.push(f.age_s + "s назад");
+      meters.innerHTML =
+        '<div class="host-fps-status ' + statusCls + '">' + statusTxt + "</div>"
+        + hostMeterHtml(
+          lagNow ? "FPS · НИЗКИЙ" : (soft ? "FPS · слабо" : "FPS"),
+          n.toFixed(1) + " / ~" + target + (extra.length ? (" · " + extra.join(" · ")) : ""),
+          pct,
+          barCls
+        );
+    }
+  }
+  renderPresWorldFps(f);
+  renderObsStream(f);
+}
+
+let _obsStartingUntil = 0;
+let _obsStoppingUntil = 0;
+
+function applyObsStreamButtons(state) {
+  const btnStart = document.getElementById("btnObsStartStream");
+  const btnStop = document.getElementById("btnObsStopStream");
+  if (!btnStart || !btnStop) return;
+  let st = String(state || "stopped");
+  if (Date.now() < _obsStoppingUntil && st !== "stopped") st = "stopping";
+  if (Date.now() < _obsStartingUntil && st !== "running" && st !== "stopping") st = "starting";
+  if (st === "running") {
+    _obsStartingUntil = 0;
+    _obsStoppingUntil = 0;
+    btnStart.textContent = "● Запущено";
+    btnStart.classList.add("live-on");
+    btnStart.classList.remove("primary");
+    btnStart.disabled = true;
+    btnStart.title = "Стрим уже в эфире (Unity + OBS)";
+    btnStop.textContent = "⏹ Стоп стрим";
+    btnStop.classList.remove("live-on");
+    btnStop.disabled = false;
+    btnStop.title = "Остановить Presentation + OBS";
+  } else if (st === "starting") {
+    btnStart.textContent = "● Запускается…";
+    btnStart.classList.add("live-on");
+    btnStart.classList.remove("primary");
+    btnStart.disabled = true;
+    btnStart.title = "Идёт запуск эфира";
+    btnStop.textContent = "⏹ Стоп стрим";
+    btnStop.classList.remove("live-on");
+    btnStop.disabled = true;
+  } else if (st === "stopping") {
+    btnStart.textContent = "● Остановка…";
+    btnStart.classList.remove("live-on");
+    btnStart.classList.remove("primary");
+    btnStart.disabled = true;
+    btnStop.textContent = "● Останавливается…";
+    btnStop.classList.add("live-on");
+    btnStop.disabled = true;
+  } else {
+    if (st === "stopped") {
+      _obsStartingUntil = 0;
+      _obsStoppingUntil = 0;
+    }
+    btnStart.textContent = "● Запись";
+    btnStart.classList.remove("live-on");
+    btnStart.classList.add("primary");
+    btnStart.disabled = false;
+    btnStart.title = "Запустить Presentation + OBS в эфир";
+    btnStop.textContent = "⏹ Стоп стрим";
+    btnStop.classList.remove("live-on");
+    btnStop.disabled = false;
+  }
+}
+
+function renderObsStream(f) {
+  const hint = document.getElementById("obsProcHint");
+  const card = document.getElementById("card-obs-stream");
+  const streamOn = !!(f && f.stream_on) || !!window._labStreamOn;
+  const obsOn = !!(window._labObsOn);
+  const live = !!(streamOn && obsOn);
+  const partial = !live && (streamOn || obsOn);
+  if (hint) {
+    if (live) hint.textContent = "в эфире · Unity ON · OBS ON";
+    else if (partial) {
+      hint.textContent = "частично · Unity " + (streamOn ? "ON" : "off")
+        + " · OBS " + (obsOn ? "ON" : "off");
+    } else hint.textContent = "стрим выключен";
+  }
+  if (card) card.classList.toggle("running", live || partial);
+  if (Date.now() < _obsStoppingUntil) applyObsStreamButtons("stopping");
+  else if (Date.now() < _obsStartingUntil && !live) applyObsStreamButtons("starting");
+  else if (live) applyObsStreamButtons("running");
+  else applyObsStreamButtons("stopped");
+}
+
+async function startObsStream() {
+  const runId = (document.getElementById("streamRunId")||{}).value
+    || (document.getElementById("jointRunId")||{}).value || "";
+  if (!runId) { alert("Нужен RUN_ID (вкладка Train → обучение / стрим)"); return; }
+  if (!confirm("● Запись / в эфир?\\n\\nPresentation + OBS\\nRUN_ID="+runId)) return;
+  flash("hdrMeta", "● запись…");
+  _obsStoppingUntil = 0;
+  _obsStartingUntil = Date.now() + 120000;
+  applyObsStreamButtons("starting");
+  try {
+    const j = await api("/api/action", {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ action:"start_obs_stream", run_id: runId }),
+    });
+    LAST_JOB = j.job_id;
+    pollJobs();
+    setTimeout(pollServer, 5000);
+    setTimeout(pollServer, 15000);
+  } catch (e) {
+    _obsStartingUntil = 0;
+    applyObsStreamButtons("stopped");
+    alert(e.message||e);
+  }
+}
+
+async function stopObsStream() {
+  if (!confirm("⏹ Стоп стрим?\\n\\nГасим Presentation + OBS. Train не трогаем.")) return;
+  flash("hdrMeta", "стоп стрим…");
+  _obsStartingUntil = 0;
+  _obsStoppingUntil = Date.now() + 90000;
+  applyObsStreamButtons("stopping");
+  try {
+    const j = await api("/api/action", {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ action:"stop_obs_stream" }),
+    });
+    LAST_JOB = j.job_id;
+    pollJobs();
+    setTimeout(pollServer, 3000);
+    setTimeout(pollServer, 8000);
+  } catch (e) {
+    _obsStoppingUntil = 0;
+    applyObsStreamButtons("running");
+    alert(e.message||e);
+  }
+}
+
+function renderPresWorldFps(fps) {
+  const f = fps && typeof fps === "object" ? fps : {};
+  const n = Number(f.fps);
+  const fmin = Number(f.fps_min);
+  const fmax = Number(f.fps_max);
+  const hitchMs = Number(f.hitch_dt_ms);
+  const lagNow = !!f.lag_now || (n === n && n < 15) || (hitchMs === hitchMs && hitchMs >= 800);
+  const soft = (n === n && n < 20 && !lagNow);
+  const pill = document.getElementById("presWorldFpsPill");
+  if (!pill) return;
+  if (!(n === n)) {
+    pill.textContent = "—";
+    pill.className = "pill";
+    return;
+  }
+  let ptxt = n.toFixed(0) + " fps";
+  if (fmin === fmin && fmax === fmax) ptxt += " · " + fmin.toFixed(0) + "–" + fmax.toFixed(0);
+  if (lagNow) {
+    pill.textContent = ptxt + " · НИЗКИЙ";
+    pill.className = "pill live";
+  } else if (soft) {
+    pill.textContent = ptxt + " · слабо";
+    pill.className = "pill warn";
+  } else {
+    pill.textContent = ptxt;
+    pill.className = "pill on";
+  }
+}
+
+function renderObsSsh(s) {
+  const pre = document.getElementById("obsSshNow");
+  const pill = document.getElementById("obsSshPill");
+  const hint = document.getElementById("obsSshHint");
+  if (!pre || !pill) return;
+  s = s || {};
+  const local = Number(s.local);
+  const ui = Number(s.ui);
+  const remote = s.remote == null ? null : Number(s.remote);
+  const total = Number(s.total);
+  const warnAt = Number(s.warn_at) || 6;
+  const badAt = Number(s.bad_at) || 10;
+  const level = String(s.level || "ok");
+  const lines = [];
+  lines.push(`всего ≈ ${total === total ? total : "?"}  (warn≥${warnAt}, bad≥${badAt})`);
+  lines.push(`локально ssh→lab: ${local === local ? local : "?"}`);
+  lines.push(`активные у этого UI: ${ui === ui ? ui : "?"}`);
+  lines.push(`на lab (:22): ${remote == null || !(remote === remote) ? "—" : remote}`);
+  if (s.error) lines.push(`err: ${s.error}`);
+  pre.textContent = lines.join("\n");
+  if (level === "bad") {
+    pill.textContent = (total === total ? total : "?") + " ssh";
+    pill.className = "pill live";
+  } else if (level === "warn") {
+    pill.textContent = (total === total ? total : "?") + " ssh";
+    pill.className = "pill warn";
+  } else {
+    pill.textContent = (total === total ? total : "0") + " ssh";
+    pill.className = "pill on";
+  }
+  if (hint) {
+    hint.style.color = level === "bad" ? "var(--bad)" : (level === "warn" ? "var(--warn)" : "");
+  }
 }
 
 function renderLabTasks(a) {
@@ -4822,12 +7756,21 @@ async function killLabTask(kind, label) {
   if (kind === "llm_bot") {
     if (!confirm("Остановить LLM Bot на lab?" + (label ? "\n\n" + label : ""))) return;
     flash("hdrMeta", "стоп llm_bot…");
+    _llmStartingUntil = 0;
+    _llmStoppingUntil = Date.now() + 90000;
+    applyLlmBotButtons("stopping");
     try {
       const s = await api(LLM_API + "/stop", { method: "POST", headers: {"Content-Type":"application/json"}, body: "{}" });
       renderLlmStatus(s);
+      setTimeout(pollLlmBot, 1500);
+      setTimeout(pollLlmBot, 5000);
       setTimeout(pollServer, 1200);
       setTimeout(pollServer, 3500);
-    } catch (e) { alert(e.message || e); }
+    } catch (e) {
+      _llmStoppingUntil = 0;
+      applyLlmBotButtons("running");
+      alert(e.message || e);
+    }
     return;
   }
   const map = {
@@ -4835,11 +7778,18 @@ async function killLabTask(kind, label) {
     validate: { action: "kill_validate", ask: "Остановить только validate (mp4)?" },
     stream: { action: "kill_stream", ask: "Остановить только бесконечный стрим Presentation? OBS не гасим." },
     streaming_survival: { action: "stop_streaming_survival", ask: "Остановить Streaming Survival? Train / Presentation onnx не трогаем." },
+    obs: { action: "stop_obs_stream", ask: "Остановить OBS + Presentation стрим?" },
   };
   const conf = map[kind];
   if (!conf) { alert("Неизвестный тип: " + kind); return; }
   if (!confirm(conf.ask + (label ? "\n\n" + label : ""))) return;
   flash("hdrMeta", "стоп " + kind + "…");
+  if (kind === "train") beginJointStopping();
+  if (kind === "stream") {
+    _streamStartingUntil = 0;
+    _streamStoppingUntil = Date.now() + 90000;
+    applyStreamButtons("stopping");
+  }
   try {
     const j = await api("/api/action", {
       method: "POST", headers: {"Content-Type":"application/json"},
@@ -4849,7 +7799,16 @@ async function killLabTask(kind, label) {
     pollJobs();
     setTimeout(pollServer, 1500);
     setTimeout(pollServer, 4000);
+    if (kind === "train" || kind === "stream") setTimeout(pollServer, 12000);
   } catch (e) {
+    if (kind === "train") {
+      _jointStoppingUntil = 0;
+      applyJointTrainLock(true);
+    }
+    if (kind === "stream") {
+      _streamStoppingUntil = 0;
+      applyStreamButtons("running");
+    }
     alert(e.message || e);
   }
 }
@@ -4867,6 +7826,15 @@ async function restartJointTrain(label) {
     return;
   }
   if (!confirm("Перезапуск joint train: стоп → чистка → resume той же папки?" + (label ? "\n\n" + label : ""))) return;
+  const snap = {
+    init_jack: j.init_jack,
+    init_lily: j.init_lily,
+    init_george: j.init_george,
+    run_id: j.run_id,
+  };
+  await persistJointLocked(snap);
+  _jointLockGraceUntil = Date.now() + 60000;
+  applyJointTrainLock(true);
   await saveCfg();
   flash("hdrMeta", "перезапуск train…");
   try {
@@ -4892,6 +7860,10 @@ async function restartJointStream(label) {
   document.getElementById("streamRunId").value = run_id;
   await saveCfg();
   flash("hdrMeta", "перезапуск стрима…");
+  _streamStoppingUntil = 0;
+  _streamStartingUntil = Date.now() + 120000;
+  applyStreamButtons("starting");
+  schedulePresWorldPoll(true);
   try {
     const resp = await api("/api/action", {
       method:"POST", headers:{"Content-Type":"application/json"},
@@ -4902,6 +7874,8 @@ async function restartJointStream(label) {
     setTimeout(pollServer, 2500);
     setTimeout(pollServer, 8000);
   } catch (e) {
+    _streamStartingUntil = 0;
+    applyStreamButtons("stopped");
     alert(e.message || e);
   }
 }
@@ -4946,29 +7920,41 @@ function renderHeroes() {
     document.getElementById(`tb2-${hero}`).onchange = loadCharts;
   }
   fillJointCard();
-  document.getElementById("btnJointTrain").onclick = () => trainJoint(false);
-  document.getElementById("btnJointResume").onclick = () => trainJoint(true);
+  document.getElementById("btnJointTrain").onclick = () => trainJoint();
   document.getElementById("btnJointStream").onclick = () => startJointStream();
   document.getElementById("btnKillStream").onclick = () => killStreamOnly();
+  const btnRepairSpawn = document.getElementById("btnRepairSpawn");
+  if (btnRepairSpawn) btnRepairSpawn.onclick = () => repairStreamSpawn();
+  const btnObsStart = document.getElementById("btnObsStartStream");
+  if (btnObsStart) btnObsStart.onclick = () => startObsStream();
+  const btnObsStop = document.getElementById("btnObsStopStream");
+  if (btnObsStop) btnObsStop.onclick = () => stopObsStream();
   const btnKillJoint = document.getElementById("btnKillJointTrain");
   if (btnKillJoint) btnKillJoint.onclick = () => killTrainOnly();
-  const btnRj = document.getElementById("btnRestartJointTrain");
-  if (btnRj) btnRj.onclick = () => restartJointTrain();
-  const btnRs = document.getElementById("btnRestartJointStream");
-  if (btnRs) btnRs.onclick = () => restartJointStream();
   document.getElementById("btnJointTbTrio").onclick = () => selectJointTbTrio();
+  document.getElementById("btnJointTbDraw").onclick = () => drawJointTb();
   document.getElementById("btnJointTbClear").onclick = () => clearJointTb();
-  document.getElementById("jointTb").onchange = () => { loadJointChart(); saveCfg(); };
+  document.getElementById("jointTb").onchange = () => { saveCfg(); };
   document.getElementById("jointRunId").onchange = () => {
     const v = document.getElementById("jointRunId").value;
     const s = document.getElementById("streamRunId");
     if (s) s.value = v;
-    fillJointCard();
-    loadJointChart();
+    // Только выбрать тройку из новой папки — график по кнопке «Нарисовать TB»
+    selectJointTbTrio();
+    refreshJointWeightStatus();
   };
+  document.getElementById("jointRunId").oninput = scheduleJointWeightStatus;
+  for (const id of ["jointInitJack", "jointInitLily", "jointInitGeorge"]) {
+    const inp = document.getElementById(id);
+    if (inp) {
+      inp.oninput = scheduleJointWeightStatus;
+      inp.onchange = () => { saveCfg(); refreshJointWeightStatus(); };
+    }
+  }
   document.getElementById("streamRunId").onchange = () => {
     document.getElementById("jointRunId").value = document.getElementById("streamRunId").value;
     saveCfg();
+    refreshJointWeightStatus();
   };
   document.getElementById("tab-joint-train").onclick = () => switchJointTab("panel-joint-train");
   document.getElementById("tab-joint-stream").onclick = () => switchJointTab("panel-joint-stream");
@@ -4979,8 +7965,10 @@ function renderHeroes() {
 function bindModeTabs() {
   const t = document.getElementById("tab-mode-training");
   const s = document.getElementById("tab-mode-streaming");
+  const o = document.getElementById("tab-mode-obs");
   if (t) t.onclick = () => switchModeTab("training");
   if (s) s.onclick = () => switchModeTab("streaming");
+  if (o) o.onclick = () => switchModeTab("obs");
   const bStart = document.getElementById("btnSsStart");
   const bStop = document.getElementById("btnSsStop");
   if (bStart) bStart.onclick = () => startStreamingSurvival();
@@ -4991,6 +7979,7 @@ function bindModeTabs() {
 
 let _ssPreviewTimer = null;
 let _ssPreviewRunning = false;
+let _ssPreviewWantFrame = false; // показывать кадр только после «Показать» / «1 кадр»
 
 function bindSsPreview() {
   const startBtn = document.getElementById("btnSsPreviewStart");
@@ -4999,20 +7988,47 @@ function bindSsPreview() {
   if (startBtn) startBtn.onclick = () => ssPreviewStart();
   if (stopBtn) stopBtn.onclick = () => ssPreviewStop();
   if (onceBtn) onceBtn.onclick = () => ssPreviewOnce();
-  ssPreviewPollStatus();
+  // статус без показа старого frame.jpg
+  ssPreviewPollStatus({ silent: true });
 }
 
-function ssPreviewApplyStatus(st) {
+function ssPreviewHideFrame() {
+  const img = document.getElementById("ssPreviewImg");
+  const ph = document.getElementById("ssPreviewPlaceholder");
+  if (img) {
+    img.style.display = "none";
+    img.removeAttribute("src");
+  }
+  if (ph) ph.style.display = "";
+}
+
+function ssPreviewShowFrame() {
+  const img = document.getElementById("ssPreviewImg");
+  const ph = document.getElementById("ssPreviewPlaceholder");
+  if (!img) return;
+  img.style.display = "block";
+  if (ph) ph.style.display = "none";
+  img.src = "/api/ss_preview/frame.jpg?t=" + Date.now();
+}
+
+function ssPreviewApplyStatus(st, opts) {
+  opts = opts || {};
   _ssPreviewRunning = !!(st && st.running);
+  if (opts.wantFrame === true) _ssPreviewWantFrame = true;
+  if (opts.wantFrame === false) _ssPreviewWantFrame = false;
+  // если live-поток выключен и это не явный once — не тащим старый кадр
+  if (!_ssPreviewRunning && opts.silent) _ssPreviewWantFrame = false;
+
   setCardState("card-ss-preview", _ssPreviewRunning, false);
   const pill = document.getElementById("ssPreviewPill");
   const meta = document.getElementById("ssPreviewMeta");
-  const img = document.getElementById("ssPreviewImg");
-  const ph = document.getElementById("ssPreviewPlaceholder");
   if (pill) {
     if (_ssPreviewRunning) {
       pill.textContent = "LIVE";
       pill.className = "pill live";
+    } else if (_ssPreviewWantFrame) {
+      pill.textContent = "1 кадр";
+      pill.className = "pill live-stream";
     } else {
       pill.textContent = "off";
       pill.className = "pill";
@@ -5021,23 +8037,24 @@ function ssPreviewApplyStatus(st) {
   const modeSs = document.getElementById("tab-mode-streaming");
   if (modeSs) {
     const ssLive = !!(document.getElementById("card-ss") && document.getElementById("card-ss").classList.contains("running"));
-    const botLive = !!(document.getElementById("card-llm-bot") && document.getElementById("card-llm-bot").classList.contains("running"));
-    modeSs.classList.toggle("has-live", ssLive || botLive || _ssPreviewRunning);
+    modeSs.classList.toggle("has-live", ssLive || _ssPreviewRunning);
   }
   if (meta) {
     const err = (st && st.last_error) ? (" · err: " + st.last_error) : "";
     const age = st && st.last_ok_at
       ? (" · last " + Math.max(0, Math.round(Date.now()/1000 - st.last_ok_at)) + "s ago")
       : "";
-    meta.textContent = (_ssPreviewRunning ? "live " + (st.display || ":1") : "preview off")
-      + " · frames=" + ((st && st.frames) || 0)
-      + age + err;
+    if (_ssPreviewRunning) {
+      meta.textContent = "live " + (st.display || ":1") + " · frames=" + ((st && st.frames) || 0) + age + err;
+    } else if (_ssPreviewWantFrame) {
+      meta.textContent = "показан 1 кадр · frames=" + ((st && st.frames) || 0) + age + err;
+    } else {
+      meta.textContent = "preview off — кадр скрыт · frames=" + ((st && st.frames) || 0) + err;
+    }
   }
-  if (st && st.has_frame && img) {
-    img.style.display = "block";
-    if (ph) ph.style.display = "none";
-    img.src = "/api/ss_preview/frame.jpg?t=" + Date.now();
-  }
+  if (_ssPreviewWantFrame && st && st.has_frame) ssPreviewShowFrame();
+  else ssPreviewHideFrame();
+
   if (_ssPreviewRunning && !_ssPreviewTimer) {
     _ssPreviewTimer = setInterval(ssPreviewTick, 1600);
   }
@@ -5047,17 +8064,30 @@ function ssPreviewApplyStatus(st) {
   }
 }
 
-async function ssPreviewPollStatus() {
+async function ssPreviewPollStatus(opts) {
+  opts = opts || { silent: true };
   try {
-    const st = await api("/api/ss_preview/status");
-    ssPreviewApplyStatus(st);
+    let st = await api("/api/ss_preview/status");
+    // После F5 не продолжаем live сами — иначе снова крутит SSH/кадр.
+    if (opts.silent && st && st.running) {
+      try {
+        st = await api("/api/ss_preview/stop", {
+          method: "POST",
+          headers: {"Content-Type":"application/json"},
+          body: "{}",
+        });
+      } catch (_) {}
+      ssPreviewApplyStatus(st, { wantFrame: false, silent: true });
+      return;
+    }
+    ssPreviewApplyStatus(st, opts);
   } catch (_) {}
 }
 
 async function ssPreviewTick() {
   try {
     const st = await api("/api/ss_preview/status");
-    ssPreviewApplyStatus(st);
+    ssPreviewApplyStatus(st, { wantFrame: true });
   } catch (e) {
     const meta = document.getElementById("ssPreviewMeta");
     if (meta) meta.textContent = "preview poll: " + (e.message || e);
@@ -5066,12 +8096,13 @@ async function ssPreviewTick() {
 
 async function ssPreviewStart() {
   try {
+    _ssPreviewWantFrame = true;
     const st = await api("/api/ss_preview/start", {
       method: "POST",
       headers: {"Content-Type":"application/json"},
       body: "{}",
     });
-    ssPreviewApplyStatus(st);
+    ssPreviewApplyStatus(st, { wantFrame: true });
   } catch (e) { alert(e.message || e); }
 }
 
@@ -5082,7 +8113,7 @@ async function ssPreviewStop() {
       headers: {"Content-Type":"application/json"},
       body: "{}",
     });
-    ssPreviewApplyStatus(st);
+    ssPreviewApplyStatus(st, { wantFrame: false });
   } catch (e) { alert(e.message || e); }
 }
 
@@ -5093,7 +8124,7 @@ async function ssPreviewOnce() {
       headers: {"Content-Type":"application/json"},
       body: "{}",
     });
-    ssPreviewApplyStatus(st);
+    ssPreviewApplyStatus(st, { wantFrame: true });
   } catch (e) { alert(e.message || e); }
 }
 
@@ -5655,6 +8686,7 @@ async function boot() {
   flash("hdrMeta", "UI ready");
   pollServer();
   pollJobs();
+  schedulePresWorldPoll(false);
   setInterval(pollServer, 5000);
   setInterval(pollJobs, 8000);
 
@@ -5793,7 +8825,36 @@ class Handler(BaseHTTPRequestHandler):
                 stats["note"] = "stats via ssh only; not local PC"
                 stats["tried"] = ssh_candidates(cfg.get("ssh_host") or "lab_comp")
             stats["ssh_cache"] = _ssh_host_cache or ""
+            try:
+                stats["ssh_sessions"] = ssh_sessions_snapshot(stats.get("activity") or {})
+            except Exception as e:
+                stats["ssh_sessions"] = {
+                    "local": 0,
+                    "ui": 0,
+                    "remote": None,
+                    "total": 0,
+                    "warn_at": _SSH_WARN_COUNT,
+                    "bad_at": _SSH_BAD_COUNT,
+                    "level": "ok",
+                    "error": str(e),
+                }
             self._json(200, stats)
+            return
+
+        if path == "/api/presentation_world":
+            cfg = load_cfg()
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            rid = (qs.get("run_id") or [""])[0].strip()
+            if not rid:
+                rid = str(((cfg.get("joint") or {}).get("run_id") or "")).strip()
+            try:
+                if rid:
+                    rid = sanitize_run_id(rid)
+                host = _ssh_host_cache or resolve_ssh_host_fast() or (cfg.get("ssh_host") or "lab_comp")
+                data = fetch_presentation_world(host, rid)
+                self._json(200, data)
+            except Exception as e:
+                self._json(200, {"ok": False, "error": str(e), "run_id": rid})
             return
 
         if path == "/api/tb/runs":
@@ -5808,6 +8869,29 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     results = []
             self._json(200, {"runs": runs, "ssh_host": host, "results": results})
+            return
+
+        if path == "/api/joint/run_weights":
+            cfg = load_cfg()
+            # Не блокировать HTTP на полном resolve — берём кэш / fast probe.
+            host = _ssh_host_cache or resolve_ssh_host_fast() or (cfg.get("ssh_host") or "lab_comp")
+            if not host:
+                self._json(200, {"ok": False, "error": "lab_comp offline", "items": {}})
+                return
+            try:
+                payload = probe_joint_run_weights(
+                    host,
+                    {
+                        "jack": (qs.get("jack") or [""])[0],
+                        "lily": (qs.get("lily") or [""])[0],
+                        "george": (qs.get("george") or [""])[0],
+                        "run": (qs.get("run_id") or [""])[0],
+                    },
+                )
+            except Exception as e:
+                payload = {"ok": False, "error": str(e), "items": {}}
+            # Всегда 200: UI рисует label/error, не общий catch «не удалось проверить»
+            self._json(200, payload)
             return
 
         if path == "/api/tb/run_tags":
@@ -6090,6 +9174,9 @@ class Handler(BaseHTTPRequestHandler):
                 if path == "/api/llm_bot/clear_chat":
                     self._json(200, LLM_BOT.clear_chat())
                     return
+                if path == "/api/llm_bot/resync_roster":
+                    self._json(200, LLM_BOT.resync_roster())
+                    return
                 self._json(404, {"error": f"unknown llm_bot path {path}"})
                 return
             except Exception as e:
@@ -6119,6 +9206,19 @@ class Handler(BaseHTTPRequestHandler):
                     jid = action_kill_validate(cfg)
                 elif action == "kill_stream":
                     jid = action_kill_stream(cfg)
+                elif action == "restart_obs":
+                    jid = action_restart_obs(cfg)
+                elif action == "start_obs_stream":
+                    jid = action_start_obs_stream(cfg, str(body.get("run_id") or ""))
+                elif action == "stop_obs_stream":
+                    jid = action_stop_obs_stream(cfg)
+                elif action == "repair_spawn":
+                    force = body.get("force", True)
+                    if isinstance(force, str):
+                        force = force.strip().lower() not in ("0", "false", "no")
+                    jid = action_repair_spawn(
+                        cfg, str(body.get("run_id") or ""), force=bool(force)
+                    )
                 elif action == "kill_mode_training":
                     jid = action_kill_mode_training(cfg)
                 elif action == "kill_mode_streaming":
@@ -6197,6 +9297,14 @@ def main() -> None:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     if not CFG_PATH.is_file():
         save_cfg(DEFAULT_CFG)
+    # подчистить зомби ssh.exe от прошлого UI до приёма запросов
+    try:
+        n = cleanup_orphan_batch_ssh(max_age=0.0)
+        if n:
+            print(f"[train_lab_ui] pruned {n} orphan BatchMode ssh → lab", flush=True)
+    except Exception as e:
+        print(f"[train_lab_ui] ssh prune: {e}", flush=True)
+    _ensure_ssh_reaper()
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"[train_lab_ui] http://127.0.0.1:{PORT}", flush=True)
     print(f"[train_lab_ui] bind={HOST}:{PORT}", flush=True)

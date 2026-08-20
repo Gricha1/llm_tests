@@ -45,7 +45,7 @@ public static class StreamingSurvivalResourceGuard
             case "go_home":
             case "go_to_base":
             case "go_to_campfire":
-            case "build_campfire": return 2.8f;
+            case "build_campfire": return 1.25f;
             case "collect_stone": return 0f; // disabled
             default: return 2f;
         }

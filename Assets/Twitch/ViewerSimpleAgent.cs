@@ -66,7 +66,9 @@ public sealed class ViewerSimpleAgent : MonoBehaviour
         if (root != null)
             go.transform.SetParent(root, true);
 
-        Vector3 pos = PickSpawnNearSheep(root);
+        Vector3 pos = PickSpawnNearJackOrSheep(root);
+        if (Physics.Raycast(pos + Vector3.up * 25f, Vector3.down, out RaycastHit hit, 80f))
+            pos.y = hit.point.y + 0.15f;
         go.transform.position = pos;
         go.transform.rotation = Quaternion.Euler(0f, Random.Range(0f, 360f), 0f);
         go.transform.localScale = Vector3.one * SpawnScale;
@@ -175,6 +177,19 @@ public sealed class ViewerSimpleAgent : MonoBehaviour
             if (c != null)
                 SetLayerRecursively(c.gameObject, layer);
         }
+    }
+
+    static Vector3 PickSpawnNearJackOrSheep(Transform root)
+    {
+        var jack = TrainingEnvSpace.FindPresentationJack();
+        if (jack != null && jack.gameObject.activeInHierarchy)
+        {
+            Vector3 p = jack.transform.position;
+            p.x += 2.2f;
+            p.z += 1.4f;
+            return p;
+        }
+        return PickSpawnNearSheep(root);
     }
 
     static Vector3 PickSpawnNearSheep(Transform root)

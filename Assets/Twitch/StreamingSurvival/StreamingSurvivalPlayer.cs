@@ -479,9 +479,14 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
 
         if (_queue.Count > 0)
         {
-            // Multi-step #do (or counted chain): stop after the last step — no infinite water farm.
-            _startedWithQueue = true;
+            bool multiStep = _queue.Count > 1;
             var first = _queue.Dequeue();
+            // Bot always sends a 1-step queue ("collect_wood:1"). That is a bare
+            // #do, not a plan — keep farming until the next chat command.
+            bool keepFarm = !multiStep
+                && first.Amount <= 1
+                && IsKeepFarmingAction(first.Action);
+            _startedWithQueue = !keepFarm;
             ApplyStep(first.Action, first.ActionName, first.Amount);
             return;
         }
@@ -519,6 +524,21 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
             case "idle": return "Ждёт у базы";
             case "attack_user": return "Атакует игрока";
             default: return action;
+        }
+    }
+
+    static bool IsKeepFarmingAction(string action)
+    {
+        switch ((action ?? "").ToLowerInvariant())
+        {
+            case "collect_water":
+            case "collect_wood":
+            case "collect_food":
+            case "kill_sheep":
+            case "build_campfire":
+                return true;
+            default:
+                return false;
         }
     }
 
@@ -598,6 +618,8 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
     int _homeStuckTries;
     float _woodStuckSince = -1f;
     Vector3 _woodStuckPos;
+    float _steerSign = 1f;
+    float _steerUntil;
 
     // move demos
     string _demoKind;
@@ -829,9 +851,23 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
                 break;
 
             case Phase.GoTarget:
-                if (!_hasLockedWorkTarget)
+                // Sheep wander — keep chasing the nearest live one, never a frozen rock/spawner stand.
+                if (Action == "collect_food" || Action == "kill_sheep" || Action == "go_to_sheep")
                 {
-                    _lockedWorkTarget = IsMovementOnlyAction(Action) && (Action == "go_to_tree" || Action == "go_to_sheep")
+                    if (!_hasLockedWorkTarget)
+                    {
+                        _phaseEnteredAt = Time.time;
+                        if (StreamingSurvivalResourceGuard.IsResourceAction(Action))
+                            CollectState = StreamingSurvivalResourceGuard.CollectState.MovingToResource;
+                    }
+                    _lockedWorkTarget = Action == "go_to_sheep"
+                        ? ResolveMovementTarget()
+                        : ResolveWorkTarget();
+                    _hasLockedWorkTarget = true;
+                }
+                else if (!_hasLockedWorkTarget)
+                {
+                    _lockedWorkTarget = IsMovementOnlyAction(Action) && Action == "go_to_tree"
                         ? ResolveMovementTarget()
                         : ResolveWorkTarget();
                     _hasLockedWorkTarget = true;
@@ -905,13 +941,24 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
                     }
                     if (Time.time - _woodStuckSince > 1.35f)
                     {
-                        // Prefer nearest trunk (not locked stand) — stand-dir often
-                        // points away after circling and blocks retarget forever.
                         Vector3 prefer = _treeVictim != null
                             ? (_treeVictim.transform.position - pWood)
                             : (_target - pWood);
                         StreamingSurvivalTrajectoryRecorder.Instance?.EmitEvent(
                             Username, "stuck_detected", this);
+                        // Pressed into the mid-yard fence — walk south to the gap, not through planks.
+                        if (pWood.x > 13.8f && pWood.x < 15.5f && pWood.z > 16.2f)
+                        {
+                            Vector3 south = WaterGapSouth(pWood.y);
+                            _hasLockedWorkTarget = false;
+                            _woodStuckSince = Time.time;
+                            _target = south;
+                            Debug.Log(
+                                $"[SSPos] wood_fence_south user={Username} " +
+                                $"pos=({pWood.x:F2},{pWood.z:F2}) via=({south.x:F2},{south.z:F2})");
+                            MoveToward(south);
+                            break;
+                        }
                         // Не удаляем ствол «мимо счёта» — переключаемся на ближайшее
                         // дерево и рубим обычным collect_wood (work + wood в инвентарь).
                         if (TryRetargetWoodToNearestTree(prefer))
@@ -1074,7 +1121,7 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
                     MarkStuckAndIdle(toFire ? "campfire_no_progress" : "go_home_no_progress");
                     break;
                 }
-                if (Arrived(house, toFire ? 1.55f : 2.8f))
+                if (Arrived(house, toFire ? 1.15f : 2.8f))
                 {
                     Debug.Log(
                         $"[SSPos] action_done user={Username} action={Action} ok=1 " +
@@ -1147,6 +1194,14 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
         // Water credit only at the pond approach (not forest/gate z≈19–21).
         if (Action == "collect_water" && transform.position.z < 24.5f)
             return false;
+        // Food: punch only next to a live sheep, never a rock/ghost stand.
+        if (Action == "collect_food" || Action == "kill_sheep")
+        {
+            if (FindSheep() == null || !IsLiveHarvestSheep(_sheepVictim))
+                return false;
+            if (Horiz(transform.position, _sheepVictim.position) > arrive + 0.6f)
+                return false;
+        }
 
         ReachedResourceFlag = true;
         WorkStartedNearTarget = true;
@@ -1289,31 +1344,27 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
 
     void TryBuildCampfire(StreamingSurvivalController ctrl)
     {
-        Vector3 baseP = HousePos(ctrl);
-        if (Horiz(transform.position, baseP) > 3.2f)
+        Vector3 firePos = CampfirePos(ctrl);
+        if (Horiz(transform.position, firePos) > 1.6f)
         {
             _phase = Phase.GoHouse;
-            _target = baseP;
+            _target = firePos;
             return;
         }
 
-        var fire = GameObject.Find("SS_Campfire");
-        if (fire == null)
+        if (!StreamingSurvivalCampfireVfx.IsLit())
         {
-            // ждём пока команда накопит дерево
-            if (ctrl.Wood < 3) return;
-            var go = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
-            go.name = "SS_Campfire";
-            // у двери южнее дома — рядом с каменной плитой
-            go.transform.position = baseP + new Vector3(-0.9f, 0.25f, -0.15f);
-            go.transform.localScale = new Vector3(0.8f, 0.25f, 0.8f);
-            var r = go.GetComponent<Renderer>();
-            if (r != null) r.material.color = new Color(1f, 0.35f, 0.1f);
+            if (!StreamingSurvivalCampfireVfx.TryLight(out _))
+            {
+                Debug.LogWarning($"[SSPos] campfire_vfx_missing user={Username} pos=({firePos.x:F2},{firePos.z:F2})");
+                return;
+            }
             ctrl.AddResource("heat", 2);
+            StreamingSurvivalStatsReporter.Report(Username, "campfire");
             ActionName = "Поддерживает костёр";
             RefreshLabel();
             _nextHeatPulseAt = Time.time + 1.5f;
-            Debug.Log($"[SSPos] campfire_built user={Username} pos=({go.transform.position.x:F2},{go.transform.position.z:F2})");
+            Debug.Log($"[SSPos] campfire_built user={Username} pos=({firePos.x:F2},{firePos.z:F2})");
             return;
         }
 
@@ -1376,15 +1427,31 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
         }
         if (Action == "kill_sheep" || Action == "collect_food")
         {
-            if (_sheepVictim != null)
+            if (_sheepVictim == null)
+                FindSheep();
+            if (!IsLiveHarvestSheep(_sheepVictim))
             {
-                Destroy(_sheepVictim.gameObject);
-                _sheepVictim = null;
+                FindSheep();
             }
+            if (!IsLiveHarvestSheep(_sheepVictim))
+            {
+                CollectState = StreamingSurvivalResourceGuard.CollectState.Denied;
+                Debug.LogWarning(
+                    $"[ResourceGuard] DENIED user={Username} action={Action} reason=no_live_sheep " +
+                    $"pos=({transform.position.x:F2},{transform.position.z:F2})");
+                RefreshLabel();
+                return;
+            }
+            Destroy(_sheepVictim.gameObject);
+            _sheepVictim = null;
+            var sheepSpawner = TrainingEnvSpace.FindInPresentation<SheepSpawner>()
+                ?? Object.FindFirstObjectByType<SheepSpawner>();
+            sheepSpawner?.NotifySheepEaten();
         }
         Deliver(ctrl);
         CollectState = StreamingSurvivalResourceGuard.CollectState.ResourceAdded;
         StreamingSurvivalTrajectoryRecorder.Instance?.EmitEvent(Username, "resource_added", this);
+        ReportWorkStat();
         RefreshLabel();
     }
 
@@ -1555,6 +1622,24 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
         }
     }
 
+    void ReportWorkStat()
+    {
+        switch (Action)
+        {
+            case "collect_water":
+                StreamingSurvivalStatsReporter.Report(Username, "water");
+                break;
+            case "collect_wood":
+                StreamingSurvivalStatsReporter.Report(Username, "wood");
+                break;
+            case "collect_food":
+            case "kill_sheep":
+                // Еда = мясо с овцы; в #stats одна метрика — овцы (не дублировать food+sheep).
+                StreamingSurvivalStatsReporter.Report(Username, "sheep");
+                break;
+        }
+    }
+
     Vector3 ResolveWorkTarget()
     {
         var reg = StreamingSurvivalWorldRegistry.Instance;
@@ -1606,21 +1691,16 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
             case "collect_food":
             case "kill_sheep":
             {
-                var sh = reg != null ? reg.GetNearestSheep(transform.position) : null;
-                if (sh != null)
+                var live = FindSheep();
+                if (live.HasValue)
                 {
-                    Vector3 stand = ApproachStand(transform.position, sh.Position, 1.35f);
-                    SetTargetMeta("sheep", sh.Id, stand, sh.Position);
+                    Vector3 stand = ApproachStand(transform.position, live.Value, 1.35f);
+                    SetTargetMeta("sheep", "sheep_live", stand, live.Value);
                     return stand;
                 }
-                var sheep = FindSheep();
-                if (sheep.HasValue)
-                {
-                    Vector3 stand = ApproachStand(transform.position, sheep.Value, 1.35f);
-                    SetTargetMeta("sheep", "sheep_fallback", stand, sheep.Value);
-                    return stand;
-                }
-                return _home;
+                Vector3 meadow = SheepMeadowStand();
+                SetTargetMeta("sheep", "sheep_meadow", meadow);
+                return meadow;
             }
             default:
                 return _home;
@@ -1695,8 +1775,8 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
         if (slots != null && slots.Count > 0 && slots[0] != null)
             return slots[0].Position;
         if (ctrl != null)
-            return ctrl.HouseWorld + new Vector3(-0.2f, 0f, -1.7f);
-        return _home + new Vector3(-0.2f, 0f, -1.7f);
+            return ctrl.HouseWorld + new Vector3(-0.2f, 0f, -0.65f);
+        return _home + new Vector3(-0.2f, 0f, -0.65f);
     }
 
     Vector3 HousePos(StreamingSurvivalController ctrl)
@@ -1714,7 +1794,7 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
                     return ip;
             }
             // Fallback porch: south of cabin, slightly east of campfire offset.
-            return h + new Vector3(0.7f, 0f, -1.65f);
+            return h + new Vector3(0.5f, 0f, -0.6f);
         }
         return _home;
     }
@@ -1832,8 +1912,8 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
     static bool StillEastOfFenceGap(Vector3 p)
     {
         if (p.x >= 15.15f) return true;
-        // West of planks but still in the sealed corridor north of the gap.
-        return p.x > 14.0f && p.z > 16.5f && p.z < 32.0f;
+        // Glued to the west face of the planks, north of the sheep→pond gap.
+        return p.x > 14.55f && p.z > 16.8f && p.z < 32.0f;
     }
 
     /// <summary>
@@ -1845,10 +1925,12 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
         if (destinationWest.x >= 14.5f) return false;
         Vector3 spawn = SpawnPos(StreamingSurvivalController.Instance);
         spawn.y = p.y;
-        // Hub reached: west of gap and near spawn → free to walk to tree/fire/home.
         if (p.x < 15.15f && Horiz(p, spawn) <= 2.2f)
             return false;
-        return StillEastOfFenceGap(p) || (p.x > 12.0f && p.z > 16.5f);
+        // Already in the west yard — walk to the tree/house, do not aim the gap.
+        if (p.x <= 14.4f)
+            return false;
+        return StillEastOfFenceGap(p);
     }
 
     Vector3 ResolveGoalWaterPoint(string[] names, Vector3 fallback)
@@ -1880,9 +1962,15 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
         // East at gap latitude → mouth, then spawn hub
         if (p.x >= 15.15f)
             return Horiz(p, mouth) <= 1.4f ? spawn : mouth;
-        // Sealed west-face pocket north of gap → back to mouth
-        if (p.z > 16.5f)
+        // West face of the fence north of the gap — SOUTH along the yard, never
+        // cut through the planks toward the mouth (stuck ~14.3,16.5).
+        if (p.z > 16.2f)
+        {
+            Vector3 south = WaterGapSouth(y);
+            if (Horiz(p, south) > 1.35f)
+                return south;
             return mouth;
+        }
         // Through gap → spawn hub
         return spawn;
     }
@@ -2439,8 +2527,29 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
         return null;
     }
 
+    static bool IsLiveHarvestSheep(Transform t)
+    {
+        if (t == null || t.gameObject == null || !t.gameObject.activeInHierarchy)
+            return false;
+        if (t.GetComponent<SheepSpawner>() != null)
+            return false;
+        if (t.GetComponent<ViewerSimpleAgent>() != null)
+            return false;
+        return t.GetComponentInChildren<SheepWander>(true) != null;
+    }
+
     Vector3? FindSheep()
     {
+        var spawner = TrainingEnvSpace.FindInPresentation<SheepSpawner>()
+            ?? Object.FindFirstObjectByType<SheepSpawner>();
+        if (spawner != null
+            && spawner.TryGetNearestAliveSheep(transform.position, out GameObject go, out Vector3 pos)
+            && go != null
+            && IsLiveHarvestSheep(go.transform))
+        {
+            _sheepVictim = go.transform;
+            return pos;
+        }
         var root = TrainingEnvSpace.PresentationRoot;
         var sheep = root != null
             ? root.GetComponentsInChildren<SheepWander>(true)
@@ -2452,8 +2561,7 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
             for (int i = 0; i < sheep.Length; i++)
             {
                 var s = sheep[i];
-                if (s == null || !s.gameObject.activeInHierarchy) continue;
-                if (s.GetComponent<ViewerSimpleAgent>() != null) continue;
+                if (!IsLiveHarvestSheep(s != null ? s.transform : null)) continue;
                 float d = Horiz(transform.position, s.transform.position);
                 if (d < bestD)
                 {
@@ -2464,6 +2572,15 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
         }
         _sheepVictim = best;
         return best != null ? best.position : (Vector3?)null;
+    }
+
+    Vector3 SheepMeadowStand()
+    {
+        var spawner = TrainingEnvSpace.FindInPresentation<SheepSpawner>()
+            ?? Object.FindFirstObjectByType<SheepSpawner>();
+        if (spawner != null)
+            return spawner.SpawnCenterWorld;
+        return transform.position;
     }
 
     Vector3? FindByName(string needle)
@@ -2524,20 +2641,67 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
             SetAnimSpeed(0f);
             return;
         }
-        Vector3 dir = flat.normalized;
+        Vector3 dir = SteerAroundObstacles(flat.normalized);
         Vector3 move = dir * (_speed * Time.deltaTime);
         if (_cc != null && _cc.enabled)
             _cc.Move(move + Vector3.down * 9.81f * Time.deltaTime);
         else
             transform.position += move;
-        // Always snap if fallen below sampled ground or far below target Y.
         StreamingSurvivalTrajectoryRecorder.SampleGround(
             this, out float gy, out float bottom, out float clr, out bool below, out _, out _);
         if (below || transform.position.y < -8f || (world.y - transform.position.y > 2.5f && clr < -0.05f))
             SnapToGround();
-        transform.rotation = Quaternion.Slerp(
-            transform.rotation, Quaternion.LookRotation(dir), 8f * Time.deltaTime);
+        if (dir.sqrMagnitude > 0.0001f)
+        {
+            transform.rotation = Quaternion.Slerp(
+                transform.rotation, Quaternion.LookRotation(dir), 8f * Time.deltaTime);
+        }
         SetAnimSpeed(1f);
+    }
+
+    Vector3 SteerAroundObstacles(Vector3 want)
+    {
+        want.y = 0f;
+        if (want.sqrMagnitude < 1e-8f) return want;
+        want.Normalize();
+        // Already at the stand — do not orbit the destination collider.
+        if (Horiz(transform.position, _target) <= 1.55f)
+            return want;
+        Vector3 origin = transform.position + Vector3.up * 0.55f;
+        const float radius = 0.38f;
+        const float look = 1.4f;
+        if (!ObstacleAhead(origin, want, radius, look, out RaycastHit hit))
+            return want;
+        Vector3 left = new Vector3(-want.z, 0f, want.x);
+        if (Time.time >= _steerUntil)
+        {
+            bool lClear = !ObstacleAhead(origin, (want + left).normalized, radius, look, out _);
+            bool rClear = !ObstacleAhead(origin, (want - left).normalized, radius, look, out _);
+            if (lClear && !rClear) _steerSign = 1f;
+            else if (rClear && !lClear) _steerSign = -1f;
+            else _steerSign = Vector3.Dot(hit.normal, left) >= 0f ? 1f : -1f;
+            _steerUntil = Time.time + 0.65f;
+        }
+        Vector3 steered = (want + left * _steerSign * 1.8f);
+        steered.y = 0f;
+        if (steered.sqrMagnitude < 1e-6f) return want;
+        return steered.normalized;
+    }
+
+    bool ObstacleAhead(Vector3 origin, Vector3 dir, float radius, float dist, out RaycastHit hit)
+    {
+        hit = default;
+        if (dir.sqrMagnitude < 1e-8f) return false;
+        if (!Physics.SphereCast(
+            origin, radius, dir.normalized, out hit, dist,
+            Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore))
+            return false;
+        if (hit.collider == null) return false;
+        Transform ht = hit.collider.transform;
+        if (ht == transform || ht.IsChildOf(transform)) return false;
+        if (ht.GetComponentInParent<StreamingSurvivalPlayer>() != null) return false;
+        if (hit.normal.y > 0.65f) return false;
+        return true;
     }
 
     void SetAnimSpeed(float target)

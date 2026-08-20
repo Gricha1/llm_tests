@@ -80,9 +80,10 @@ public sealed class StreamingSurvivalWorldRegistry : MonoBehaviour
             Vector3 house = ctrl.HouseWorld;
             // Scene: door faces south; stone pad + campfire are SOUTH of cabin center.
             // Old +(0.4, +0.6) put the fire north of the house on charts.
-            Vector3 campfire = house + new Vector3(-0.2f, 0f, -1.7f);
-            // Entrance slab ≈ same spot as fire, slightly to the right (east).
-            Vector3 homeInteract = campfire + new Vector3(0.9f, 0f, 0.05f);
+            // South door pad, close to the wall so the agent stands at the door
+            // (old z-1.7 left them south of the rocks, fire never placed).
+            Vector3 campfire = house + new Vector3(-0.2f, 0f, -0.65f);
+            Vector3 homeInteract = campfire + new Vector3(0.7f, 0f, 0.05f);
             homeInteract.y = house.y;
             campfire.y = house.y;
             Register("home_0", ObjType.Home, house, null, homeInteract);
@@ -214,24 +215,19 @@ public sealed class StreamingSurvivalWorldRegistry : MonoBehaviour
     void RegisterSheep()
     {
         int i = 0;
-        var sheep = FindObjectsByType<Transform>(FindObjectsInactive.Exclude, FindObjectsSortMode.None);
-        foreach (var t in sheep)
+        var root = TrainingEnvSpace.PresentationRoot;
+        var wanderers = root != null
+            ? root.GetComponentsInChildren<SheepWander>(true)
+            : FindObjectsByType<SheepWander>(FindObjectsInactive.Exclude, FindObjectsSortMode.None);
+        if (wanderers == null) return;
+        foreach (var w in wanderers)
         {
-            if (t == null) continue;
-            string low = t.name.ToLowerInvariant();
-            if (!(low.Contains("sheep") || low.Contains("viewer_sheep")))
-                continue;
-            if (t.childCount == 0 && t.GetComponent<Renderer>() == null
-                && t.GetComponentInChildren<Renderer>() == null)
-                continue;
-            Register($"sheep_{i}", ObjType.Sheep, t.position, t);
+            if (w == null || !w.gameObject.activeInHierarchy) continue;
+            if (w.GetComponent<ViewerSimpleAgent>() != null) continue;
+            if (w.GetComponent<SheepSpawner>() != null) continue;
+            Register($"sheep_{i}", ObjType.Sheep, w.transform.position, w.transform);
             i++;
             if (i >= 20) break;
-        }
-        if (i == 0 && StreamingSurvivalController.Instance != null)
-        {
-            Vector3 h = StreamingSurvivalController.Instance.HouseWorld;
-            Register("sheep_0", ObjType.Sheep, h + new Vector3(-5f, 0f, 3f), null);
         }
     }
 
@@ -342,7 +338,28 @@ public sealed class StreamingSurvivalWorldRegistry : MonoBehaviour
         return GetNearest(ObjType.Tree, from);
     }
     public WorldObject GetNearestStone(Vector3 from) => GetNearest(ObjType.Stone, from);
-    public WorldObject GetNearestSheep(Vector3 from) => GetNearest(ObjType.Sheep, from);
+    public WorldObject GetNearestSheep(Vector3 from)
+    {
+        var spawner = TrainingEnvSpace.FindInPresentation<SheepSpawner>()
+            ?? FindFirstObjectByType<SheepSpawner>();
+        if (spawner != null
+            && spawner.TryGetNearestAliveSheep(from, out GameObject sheep, out Vector3 pos)
+            && sheep != null
+            && sheep.GetComponent<SheepSpawner>() == null
+            && sheep.GetComponentInChildren<SheepWander>(true) != null)
+        {
+            return new WorldObject
+            {
+                Id = "sheep_live",
+                Type = ObjType.Sheep,
+                Position = pos,
+                InteractionPosition = pos,
+                Transform = sheep.transform,
+                Active = true,
+            };
+        }
+        return null;
+    }
     public WorldObject GetHome() => GetByType(ObjType.Home).Count > 0 ? GetByType(ObjType.Home)[0] : null;
 
     public static string TypeName(ObjType t)

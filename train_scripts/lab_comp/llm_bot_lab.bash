@@ -217,7 +217,6 @@ cmd_start() {
   cmd_stop || true
   PY="$(pick_python)"
   export PYTHONPATH="${ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
-  export LISTEN_STREAM_ON_START=false
   export BOT_HTTP_HOST=127.0.0.1
   export BOT_HTTP_PORT=8765
   export UNITY_HOST=127.0.0.1
@@ -227,7 +226,8 @@ cmd_start() {
   # shellcheck disable=SC1090
   source <(grep -v '^#' "${ENV_FILE}" | grep -E '^[A-Za-z_][A-Za-z0-9_]*=' | sed 's/\r$//' || true)
   set +a
-  export LISTEN_STREAM_ON_START=false
+  # LISTEN_STREAM_ON_START из .env (по умолчанию true для стрима)
+  export LISTEN_STREAM_ON_START="${LISTEN_STREAM_ON_START:-true}"
   export BOT_HTTP_HOST=127.0.0.1
   export BOT_HTTP_PORT=8765
   cd "${ROOT}"
@@ -239,11 +239,17 @@ cmd_start() {
   # wait health
   for i in $(seq 1 40); do
     if curl -s -m 2 "http://127.0.0.1:8765/health" | grep -q '"ok"'; then
-      # force local debug
+      # режим из .env: true = Twitch #join/#do, false = только local_chat
+      want="${LISTEN_STREAM_ON_START:-true}"
+      if [ "${want}" = "1" ] || [ "${want}" = "yes" ] || [ "${want}" = "YES" ] || [ "${want}" = "True" ]; then
+        want=true
+      elif [ "${want}" = "0" ] || [ "${want}" = "no" ] || [ "${want}" = "NO" ] || [ "${want}" = "False" ]; then
+        want=false
+      fi
       curl -s -m 5 -X POST "http://127.0.0.1:8765/mode" \
         -H "Content-Type: application/json" \
-        -d '{"listen_stream":false}' >/dev/null || true
-      echo "[lab_bot] health_ok"
+        -d "{\"listen_stream\":${want}}" >/dev/null || true
+      echo "[lab_bot] health_ok listen_stream=${want}"
       exit 0
     fi
     sleep 0.5

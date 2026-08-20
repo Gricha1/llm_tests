@@ -12,6 +12,7 @@ class ParsedKind(str, Enum):
     JOIN = "join"
     DO = "do"
     EXIT = "exit"
+    STATS = "stats"
     IGNORE = "ignore"
     NEED_JOIN = "need_join"
 
@@ -39,6 +40,8 @@ def parse_message(message: str, *, has_joined: bool = False) -> ParsedMessage:
     arg = (m.group(2) or "").strip()
     if cmd == "join":
         return ParsedMessage(ParsedKind.JOIN, text, text=arg)
+    if cmd == "stats":
+        return ParsedMessage(ParsedKind.STATS, text, text=arg)
     if cmd in _EXIT_ALIASES:
         return ParsedMessage(ParsedKind.EXIT, text, text=arg)
     if cmd in _DO_ALIASES:
@@ -57,10 +60,15 @@ FOLLOWER_ONLY = (
     "Только фолловеры могут добавлять персонажей. Нажми Follow и попробуй ещё раз."
 )
 DO_EMPTY = "Напиши: #do <действие> (например: #do добывай воду)"
-HELP_TEXT = "#join — войти | #do <действие> — поведение | #exit — выйти"
+UNKNOWN_DO_HINT = (
+    "Не понял команду. Попробуй: #do добывай воду · #do руби дерево · "
+    "#do убивай овечек · #do сделай костер"
+)
+HELP_TEXT = "#join — войти | #do <действие> — поведение | #stats — статистика | #exit — выйти"
 CHAT_TIPS = (
     "Пиши #join, чтобы войти в игру",
     "Пиши #do добывай воду / руби дерево / убивай овечек",
+    "Пиши #stats — твоя статистика",
     "Пиши #exit, чтобы выйти из игры",
 )
 

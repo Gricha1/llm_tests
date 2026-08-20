@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import logging
 import os
+import json
 import threading
 import time
 from collections import deque
+from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional
 
 from stream_bot.command_parser import (
@@ -20,6 +22,7 @@ from stream_bot.command_parser import (
     JOIN_ALREADY,
     JOIN_OK,
     JOIN_PROMPT,
+    UNKNOWN_DO_HINT,
     ParsedKind,
     available_actions_text,
     cooldown_reply,
@@ -36,6 +39,7 @@ from stream_bot.unity_client import UnityClient
 from stream_bot.user_store import UserStore
 from stream_bot.validator import (
     CommandValidator,
+    FALLBACK_REPLY,
     fallback_action,
     heuristic_action,
     validate_streaming_survival_action,
@@ -47,6 +51,18 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 log = logging.getLogger("stream_bot.main")
+
+
+def _llm_did_not_understand(raw: Optional[Dict[str, Any]], tag: str) -> bool:
+    if not raw or tag != "llm":
+        return False
+    act = str(raw.get("action") or "").strip().lower()
+    reply = str(raw.get("chat_reply") or "").lower()
+    if act in ("unknown", "неизвестно"):
+        return True
+    if FALLBACK_REPLY.lower() in reply:
+        return True
+    return "не понял" in reply or "не смог разобрать" in reply
 
 
 class StreamBot:
@@ -101,8 +117,99 @@ class StreamBot:
             "Streaming Survival: фолловеры #join, через #do одно действие из whitelist."
         )
         self.do_cooldown_seconds = int(getattr(self.cfg, "do_cooldown_seconds", 10) or 10)
+        self._roster_json = self._roster_json_path()
+
+    @staticmethod
+    def _roster_json_path() -> Path:
+        raw = (os.environ.get("STREAM_ROSTER_JSON") or "").strip()
+        if raw:
+            return Path(raw)
+        root = Path(__file__).resolve().parents[1]
+        return root / "results" / "stream_roster.json"
+
+    def _persist_roster(self) -> None:
+        roster = self.ss.list_roster()
+        payload = {
+            "updated_at": time.time(),
+            "count": len(roster),
+            "users": roster,
+        }
+        path = self._roster_json
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(path)
+        except OSError as exc:
+            log.warning("roster json write failed: %s", exc)
+
+    def resync_roster(self) -> Dict[str, Any]:
+        """Повторно отправить список игроков в Unity (после рестарта стрима)."""
+        self._send_users_sync()
+        # После рестарта Unity тела пустые: SyncUsers не всегда ставит action —
+        # дополнительно шлём текущие #do, чтобы персонажи снова работали.
+        for u in self.ss.list_active():
+            action = (u.get("action") or "idle").strip() or "idle"
+            if action == "idle":
+                continue
+            self.unity.send_payload(
+                {
+                    "type": "streaming_survival_action",
+                    "username": u.get("username") or "",
+                    "action": action,
+                    "action_name": u.get("action_name") or action,
+                    "amount": 1,
+                }
+            )
+        self._persist_roster()
+        roster = self.ss.list_roster()
+        log.info("roster resync → Unity (%s players)", len(roster))
+        return {"ok": True, "roster": roster, "roster_count": len(roster)}
+
+    def list_players(self, *, active_only: bool = False) -> Dict[str, Any]:
+        players = self.ss.list_players(
+            active_only=active_only, chat_only=True, hide_test=not active_only
+        )
+        return {
+            "ok": True,
+            "players": players,
+            "players_count": len(players),
+            "active_count": sum(1 for p in players if p.get("is_active")),
+            "db_path": self.cfg.db_path,
+        }
+
+    def prune_roster(self) -> Dict[str, Any]:
+        """Убрать debug/test из roster и с Unity; остаются только Twitch chat."""
+        removed: List[str] = []
+        n_debug = self.ss.deactivate_local_debug()
+        test_names = [
+            "crash_test99", "jack_model_test", "testjoin_ui", "joincheck99",
+            "twitch_join_test", "debug_user", "viewer", "testjoin",
+        ]
+        for name in test_names:
+            if self.ss.leave(name):
+                removed.append(name)
+                self.unity.send_payload(
+                    {"type": "streaming_survival_user_left", "username": name}
+                )
+        self._send_users_sync()
+        self._persist_roster()
+        roster = self.ss.list_roster()
+        log.info(
+            "roster prune: debug=%s test=%s left on roster=%s",
+            n_debug, removed, [u["username"] for u in roster],
+        )
+        return {
+            "ok": True,
+            "removed_debug": n_debug,
+            "removed_test": removed,
+            "roster": roster,
+            "roster_count": len(roster),
+        }
 
     def status(self) -> Dict[str, Any]:
+        roster = self.ss.list_roster()
+        history = self.ss.list_players(active_only=False, chat_only=True, hide_test=True)
         return {
             "running": self.running,
             "listen_stream": self.listen_stream,
@@ -113,6 +220,12 @@ class StreamBot:
             "last_error": self.last_error,
             "mode": "streaming_survival",
             "active_users": self.ss.list_active(),
+            "roster": roster,
+            "roster_count": len(roster),
+            "players": history,
+            "players_count": len(history),
+            "roster_json": str(self._roster_json),
+            "db_path": self.cfg.db_path,
             "available_actions": [
                 {"action": a, "hint": h} for a, h in AVAILABLE_ACTIONS
             ],
@@ -136,6 +249,7 @@ class StreamBot:
         """
         cleared = self.ss.deactivate_all()
         self._send_users_sync()
+        self._persist_roster()
         log.info("session reset: deactivated %s users", cleared)
         return {
             "ok": True,
@@ -157,11 +271,9 @@ class StreamBot:
         self._tick_thread = threading.Thread(target=self._tick_loop, name="bot-tick", daemon=True)
         self._tick_thread.start()
         self._push_event("start", message="streaming survival bot")
-        # новая сессия: никто не в игре до #join
-        cleared = self.ss.deactivate_all()
-        if cleared:
-            log.info("cleared %s leftover active users", cleared)
+        # Keep whoever already #join'ed (restart must not kick the live stream).
         self._send_users_sync()
+        self._persist_roster()
 
     def stop(self) -> None:
         self._stop.set()
@@ -197,19 +309,22 @@ class StreamBot:
             log.exception("twitch handle failed")
 
     def _twitch_say(self, text: str) -> None:
-        if self.listen_stream:
-            self.twitch.send_chat_message(text)
+        # Stream chat stays silent: #do / #join still go to Unity, never PRIVMSG.
+        if text:
+            log.debug("[chat silenced] %s", text[:200])
 
     def _reply(
-        self, user: str, text: str, source: str, out: Dict[str, Any], *, severity: str = "info"
+        self, user: str, text: str, source: str, out: Dict[str, Any], *, severity: str = "info",
+        to_twitch: bool = False,
     ) -> None:
         text = (text or "").strip()
         if not text:
             return
         out["chat_reply"] = text
-        if source != "local_debug":
+        if source != "local_debug" and to_twitch:
             mention = f"@{user} {text}" if user and not text.startswith("@") else text
-            self._twitch_say(mention)
+            if self.listen_stream:
+                self.twitch.send_chat_message(mention)
         self.unity.send_event(
             text if source == "local_debug" else f"{user}: {text}", severity=severity
         )
@@ -240,12 +355,9 @@ class StreamBot:
             return cached
 
         if not self.twitch_api.configured:
-            msg = "Twitch Helix не настроен"
-            log.warning(msg)
-            self.last_error = msg
-            out["follower_check"] = "api_not_configured"
-            self._reply(user, FOLLOWER_ONLY, source, out)
-            return False
+            log.warning("Twitch Helix не настроен — #join без проверки Follow")
+            out["follower_check"] = "api_not_configured_allow"
+            return True
 
         try:
             uid = self.twitch_api.get_user_id_by_login(user)
@@ -299,15 +411,38 @@ class StreamBot:
                 self._reply(user, JOIN_PROMPT, source, out)
                 return out
             if parsed.kind == ParsedKind.JOIN:
+                if source == "local_debug" and self.listen_stream:
+                    self._reply(
+                        user,
+                        "Debug: в roster и на сцене только Twitch #join. "
+                        "Выключи Listen Twitch для локального теста.",
+                        source,
+                        out,
+                    )
+                    return out
                 if not self._check_follower(user, source, out):
                     out["ok"] = False
                     return out
                 self._handle_join(user, source, out)
                 return out
             if parsed.kind == ParsedKind.EXIT:
+                if source == "local_debug" and self.listen_stream:
+                    self._reply(user, "Debug: #exit не нужен — ты не на сцене.", source, out)
+                    return out
                 self._handle_exit(user, source, out)
                 return out
+            if parsed.kind == ParsedKind.STATS:
+                self._handle_stats(user, source, out)
+                return out
             if parsed.kind == ParsedKind.DO:
+                if source == "local_debug" and self.listen_stream:
+                    self._reply(
+                        user,
+                        "Debug: #do на сцену не уходит при Listen Twitch ON.",
+                        source,
+                        out,
+                    )
+                    return out
                 if not self._check_follower(user, source, out):
                     out["ok"] = False
                     return out
@@ -326,7 +461,8 @@ class StreamBot:
             return out
 
     def _handle_join(self, user: str, source: str, out: Dict[str, Any]) -> None:
-        first = self.ss.join(user)
+        join_src = "chat" if source == "chat" else "local_debug"
+        first = self.ss.join(user, join_source=join_src)
         payload = {"type": "streaming_survival_user_joined", "username": user}
         self.unity.send_payload(payload)
         out["unity_commands"].append(payload)
@@ -364,11 +500,13 @@ class StreamBot:
         self.unity.send_payload(action_payload)
         out["unity_commands"].append(action_payload)
         self._send_users_sync()
+        self._persist_roster()
+        twitch_ack = source == "chat"
         if first:
-            self._reply(user, JOIN_OK, source, out)
+            self._reply(user, JOIN_OK, source, out, to_twitch=twitch_ack)
             self.events.log("ss_join", username=user, message="joined")
         else:
-            self._reply(user, JOIN_ALREADY, source, out)
+            self._reply(user, JOIN_ALREADY, source, out, to_twitch=twitch_ack)
 
     def _handle_exit(self, user: str, source: str, out: Dict[str, Any]) -> None:
         left = self.ss.leave(user)
@@ -380,8 +518,14 @@ class StreamBot:
         out["unity_commands"].append(payload)
         out["sent_to_unity"] = True
         self._send_users_sync()
+        self._persist_roster()
         self._reply(user, EXIT_OK, source, out)
         self.events.log("ss_leave", username=user, message="left")
+
+    def _handle_stats(self, user: str, source: str, out: Dict[str, Any]) -> None:
+        reply = self.ss.format_stats_reply(user)
+        self._reply(user, reply, source, out, to_twitch=(source == "chat"))
+        self.events.log("ss_stats", username=user, message=reply[:120])
 
     def _handle_do(self, user: str, text: str, source: str, out: Dict[str, Any]) -> None:
         if not self.ss.has_joined(user):
@@ -408,19 +552,22 @@ class StreamBot:
                 self.last_error = str(exc)
                 log.warning("LLM failed: %s", exc)
                 raw = None
-        if raw is None:
-            raw = fallback_action(user)
-            tag = "fallback"
+        if raw is None or _llm_did_not_understand(raw, tag):
+            log.info("unrecognized #do user=%s text=%s", user, text[:80])
+            self._reply(user, UNKNOWN_DO_HINT, source, out, to_twitch=True)
+            out["system_summary"] = "unrecognized_do_hint"
+            return
 
         out["parsed_json"] = raw
         vr = validate_streaming_survival_action(raw, username=user)
         out["validator_result"] = {"ok": vr.ok, "reason": vr.reason}
         if not vr.ok or not vr.payload:
-            payload = fallback_action(user)
-            out["validator_result"] = {"ok": False, "reason": vr.reason, "fallback": True}
-        else:
-            payload = vr.payload
+            log.info("invalid #do user=%s reason=%s", user, vr.reason)
+            self._reply(user, UNKNOWN_DO_HINT, source, out, to_twitch=True)
+            out["system_summary"] = "invalid_do_hint"
+            return
 
+        payload = vr.payload
         self.ss.set_action(user, payload["action"], payload["action_name"])
         self.unity.send_payload(payload)
         out["unity_commands"].append(payload)

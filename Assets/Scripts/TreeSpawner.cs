@@ -42,8 +42,9 @@ public class TreeSpawner : MonoBehaviour
     static bool IsUnityNull(GameObject go) => go == null;
 
     /// <summary>
-    /// Живое дерево: есть визуал. Маркер ChoppableTree дописываем, если пропал —
-    /// раньше его отсутствие чистило весь лес Destroy().
+    /// Живое дерево: есть визуал ИЛИ уже помечено ChoppableTree (только что заспавнено).
+    /// Раньше без визуала (LOD ещё не прогрузился) ReconcileTreeList Destroy'ил все
+    /// инстансы сразу после ResetTrees → лес навсегда 0/30.
     /// Не требовать activeInHierarchy: при #reset / Mute родитель Env может быть
     /// выключен на кадр — иначе чекер FAIL 0/30 и спам ошибок.
     /// Не требовать renderer.enabled — MuteEnvPresentation гасит рендереры.
@@ -52,6 +53,10 @@ public class TreeSpawner : MonoBehaviour
     {
         if (IsUnityNull(go) || !go.activeSelf)
             return false;
+
+        // PrepareChoppableTree уже повесил маркер — не убивать из‑за LOD/bounds=0.
+        if (go.GetComponent<ChoppableTree>() != null)
+            return true;
 
         var renderers = go.GetComponentsInChildren<Renderer>(true);
         bool hasVisual = false;
@@ -71,13 +76,13 @@ public class TreeSpawner : MonoBehaviour
             hasVisual = true;
         if (!hasVisual && go.GetComponentInChildren<SkinnedMeshRenderer>(true) != null)
             hasVisual = true;
+        if (!hasVisual && go.GetComponentInChildren<Collider>(true) != null)
+            hasVisual = true;
 
         if (!hasVisual)
             return false;
 
-        if (go.GetComponent<ChoppableTree>() == null)
-            go.AddComponent<ChoppableTree>();
-
+        go.AddComponent<ChoppableTree>();
         return true;
     }
 
@@ -267,7 +272,8 @@ public class TreeSpawner : MonoBehaviour
                 continue;
             }
 
-            // Пустая оболочка без визуала — убрать.
+            // Пустая оболочка без визуала и без ChoppableTree — убрать.
+            // Не трогаем объекты с ChoppableTree (IsAliveTree уже true выше).
             if (!IsUnityNull(child))
                 Destroy(child);
         }
@@ -342,6 +348,32 @@ public class TreeSpawner : MonoBehaviour
             // z>29 — край у верхнего забора/пруда, агент упирается
             if (p.z < 8f || p.z > 28.5f)
                 continue;
+            // Mid-yard fence is x≈14.5–15.2 — do not pick a tree through the wall.
+            if (worldFrom.x < 14.8f && p.x >= 15.15f)
+                continue;
+            if (worldFrom.x >= 15.15f && p.x < 14.5f)
+                continue;
+            float dx = p.x - worldFrom.x;
+            float dz = p.z - worldFrom.z;
+            float d = dx * dx + dz * dz;
+            if (d < best)
+            {
+                best = d;
+                tree = t;
+                worldPos = p;
+            }
+        }
+        if (tree != null)
+            return true;
+        // No same-side tree — any live tree in the chop band.
+        best = float.MaxValue;
+        for (int i = 0; i < trees.Count; i++)
+        {
+            var t = trees[i];
+            if (!IsAliveTree(t)) continue;
+            Vector3 p = t.transform.position;
+            if (p.z < 8f || p.z > 28.5f)
+                continue;
             float dx = p.x - worldFrom.x;
             float dz = p.z - worldFrom.z;
             float d = dx * dx + dz * dz;
@@ -406,9 +438,19 @@ public class TreeSpawner : MonoBehaviour
             ReconcileTreeList();
             if (trees.Count < need)
             {
+                int childN = transform.childCount;
+                int prefabN = 0;
+                if (treePrefabs != null)
+                {
+                    for (int pi = 0; pi < treePrefabs.Length; pi++)
+                    {
+                        if (treePrefabs[pi] != null)
+                            prefabN++;
+                    }
+                }
                 Debug.LogError(
                     $"[TreeSpawner] чекер FAIL: {trees.Count}/{treeCount} " +
-                    $"(prefabs={(treePrefabs == null ? 0 : treePrefabs.Length)})",
+                    $"(prefabs={prefabN}/{ (treePrefabs == null ? 0 : treePrefabs.Length) }, children={childN})",
                     this);
             }
         }

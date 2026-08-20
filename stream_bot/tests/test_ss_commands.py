@@ -44,6 +44,9 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(p.kind, ParsedKind.DO)
         self.assertEqual(p.text, "вода")
 
+    def test_stats(self):
+        self.assertEqual(parse_message("#stats").kind, ParsedKind.STATS)
+
     def test_available_actions_list(self):
         text = available_actions_text()
         self.assertIn("collect_water", text)
@@ -85,6 +88,20 @@ class StoreSessionTests(unittest.TestCase):
         self.assertFalse(self.ss.has_joined("u"))
         self.assertFalse(self.ss.leave("u"))
 
+    def test_stats_and_survival_time(self):
+        self.ss.join("stats_user")
+        self.ss.record_stat("stats_user", "water", 3)
+        self.ss.record_stat("stats_user", "sheep", 2)
+        self.ss.record_stat("stats_user", "campfire", 1)
+        reply = self.ss.format_stats_reply("stats_user")
+        self.assertIn("вода 3", reply)
+        self.assertIn("овцы 2", reply)
+        self.assertIn("костры 1", reply)
+        self.assertIn("в игре", reply.lower())
+        self.assertTrue(self.ss.leave("stats_user"))
+        row = self.ss.get_user("stats_user")
+        self.assertGreater(float(row.get("total_survival_seconds") or 0), 0)
+
 
 class HeuristicDoTests(unittest.TestCase):
     def _act(self, text: str) -> str:
@@ -104,11 +121,14 @@ class HeuristicDoTests(unittest.TestCase):
 
     def test_food_and_sheep(self):
         self.assertEqual(self._act("собирай еду"), "collect_food")
+        self.assertEqual(self._act("добывай еду"), "collect_food")
         self.assertEqual(self._act("убивай овечек"), "kill_sheep")
 
     def test_campfire(self):
         self.assertEqual(self._act("поставь костёр"), "build_campfire")
         self.assertEqual(self._act("разведи огонь"), "build_campfire")
+        self.assertEqual(self._act("добывай тепло"), "build_campfire")
+        self.assertEqual(self._act("зажги котсёр"), "build_campfire")
 
     def test_wander_typos_idle(self):
         cases = (
@@ -152,6 +172,26 @@ class HeuristicDoTests(unittest.TestCase):
         raw = heuristic_action("добудь 5 воды", "debug_user")
         self.assertEqual(raw["action"], "collect_water")
         self.assertEqual(raw["amount"], 5)
+
+    def test_bare_collect_omits_one_step_queue(self):
+        # Unity treats a queue as a finished plan; bare #do must keep farming.
+        for t, act in (
+            ("добывай воду", "collect_water"),
+            ("руби дерево", "collect_wood"),
+            ("добывай дерево", "collect_wood"),
+        ):
+            raw = heuristic_action(t, "debug_user")
+            vr = validate_streaming_survival_action(raw, username="debug_user")
+            self.assertTrue(vr.ok, vr.reason)
+            self.assertEqual(vr.payload["action"], act, t)
+            self.assertEqual(vr.payload["amount"], 1, t)
+            self.assertEqual(vr.payload["action_queue"], "", t)
+
+    def test_counted_collect_keeps_queue(self):
+        raw = heuristic_action("добудь 5 воды", "debug_user")
+        vr = validate_streaming_survival_action(raw, username="debug_user")
+        self.assertTrue(vr.ok, vr.reason)
+        self.assertEqual(vr.payload["action_queue"], "collect_water:5")
 
     def test_unknown_returns_none(self):
         self.assertIsNone(heuristic_action("квантовый портал xyz", "u"))

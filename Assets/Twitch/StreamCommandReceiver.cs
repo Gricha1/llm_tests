@@ -155,7 +155,7 @@ public class StreamCommandReceiver : MonoBehaviour
                     break;
                 case "character_behavior":
                 case "behavior_program": // legacy
-                    if (TrainingEnvSpace.IsStreamingSurvivalMode)
+                    if (TrainingEnvSpace.UseUnifiedFollowers)
                         break;
                     ApplyCharacterBehavior(json);
                     break;
@@ -179,47 +179,61 @@ public class StreamCommandReceiver : MonoBehaviour
 
     void ApplySsJoin(string user)
     {
-        if (!TrainingEnvSpace.IsStreamingSurvivalMode)
-            return;
-        var c = StreamingSurvivalController.Instance;
-        if (c == null) return;
-        var p = c.EnsurePlayer(user);
-        // #join always places at follower spawn — even on re-join when the
-        // body already exists (otherwise leftover pond/home positions stick).
-        if (p != null)
+        if (TryGetFollowerController(out var c))
         {
-            p.TeleportTo(c.FollowerSpawnWorld, "join_spawn");
-            Debug.Log($"[SSJoin] force_spawn_on_join user={user} pos={c.FollowerSpawnWorld}");
+            var p = c.EnsurePlayer(user);
+            if (p != null)
+            {
+                p.TeleportTo(c.FollowerSpawnWorld, "join_spawn");
+                Debug.Log($"[SSJoin] force_spawn_on_join user={user} pos={c.FollowerSpawnWorld}");
+            }
+            c.ApplyAction(user, "idle", "Ждёт у базы", 1, null);
+            NoteEvent($"{user} вошёл" + (c.FollowersOnlyMode ? "" : " в Streaming Survival"), "info");
+            return;
         }
-        // Default after #join is idle until an explicit #do / action packet.
-        c.ApplyAction(user, "idle", "Ждёт у базы", 1, null);
-        NoteEvent($"{user} вошёл в Streaming Survival", "info");
+        ViewerSimpleAgent.FindOrSpawn(user);
+        NoteEvent($"{user} вошёл", "info");
     }
 
     void ApplySsLeave(string user)
     {
-        if (!TrainingEnvSpace.IsStreamingSurvivalMode)
+        if (TryGetFollowerController(out var c))
+        {
+            c.RemovePlayer(user);
+            NoteEvent($"{user} вышел" + (c.FollowersOnlyMode ? "" : " из Streaming Survival"), "info");
             return;
-        var c = StreamingSurvivalController.Instance;
-        if (c == null) return;
-        c.RemovePlayer(user);
-        NoteEvent($"{user} вышел из Streaming Survival", "info");
+        }
+        ViewerSimpleAgent.Despawn(user);
+        NoteEvent($"{user} вышел", "info");
     }
 
     void ApplySsAction(string json)
     {
-        if (!TrainingEnvSpace.IsStreamingSurvivalMode)
+        if (TryGetFollowerController(out var c))
+        {
+            string user = ExtractString(json, "username");
+            string action = ExtractString(json, "action");
+            string name = ExtractString(json, "action_name");
+            string queue = ExtractString(json, "action_queue");
+            int amount = ExtractInt(json, "amount", 1);
+            if (amount < 1) amount = 1;
+            c.ApplyAction(user, action, name, amount, queue);
+            NoteEvent($"{user}: {name}", "info");
             return;
-        var c = StreamingSurvivalController.Instance;
-        if (c == null) return;
-        string user = ExtractString(json, "username");
-        string action = ExtractString(json, "action");
-        string name = ExtractString(json, "action_name");
-        string queue = ExtractString(json, "action_queue");
-        int amount = ExtractInt(json, "amount", 1);
-        if (amount < 1) amount = 1;
-        c.ApplyAction(user, action, name, amount, queue);
-        NoteEvent($"{user}: {name}", "info");
+        }
+        ApplyPresentationFollowerAction(
+            ExtractString(json, "username"),
+            ExtractString(json, "action"),
+            ExtractString(json, "action_name"));
+    }
+
+    static bool TryGetFollowerController(out StreamingSurvivalController ctrl)
+    {
+        ctrl = null;
+        if (!TrainingEnvSpace.UseUnifiedFollowers)
+            return false;
+        ctrl = StreamingSurvivalController.EnsureInstance();
+        return ctrl != null;
     }
 
     void ApplySsTest(string json)
@@ -404,11 +418,73 @@ public class StreamCommandReceiver : MonoBehaviour
         return fallback;
     }
 
+    void ApplyPresentationFollowerAction(string user, string action, string actionName)
+    {
+        var agent = ViewerSimpleAgent.FindOrSpawn(user);
+        if (agent == null)
+            return;
+        string act = (action ?? "idle").ToLowerInvariant();
+        string move = "wander";
+        string target = "spawn_point";
+        if (act == "walk_circle" || act == "spin_in_place")
+            move = "circle";
+        else if (act == "idle")
+            move = "sit_near";
+        else if (act == "go_home")
+        {
+            move = "move_to";
+            target = "safe_zone";
+        }
+        else if (act == "go_to_water" || act == "collect_water")
+        {
+            move = "move_to";
+            target = "nearest_water";
+        }
+        else if (act == "go_to_tree" || act == "collect_wood")
+        {
+            move = "move_to";
+            target = "nearest_tree";
+        }
+        else if (act == "go_to_sheep" || act == "kill_sheep" || act == "collect_food")
+        {
+            move = "follow";
+            target = "nearest_food";
+        }
+        string beh = string.IsNullOrEmpty(actionName) ? act : actionName;
+        string payload =
+            "{\"username\":\"" + user + "\",\"behavior_name\":\"" + beh +
+            "\",\"rules\":[{\"priority\":1,\"condition\":{\"type\":\"always\"}," +
+            "\"action\":{\"type\":\"" + move + "\",\"target\":\"" + target +
+            "\",\"radius\":3,\"speed\":1.2}}]}";
+        agent.ApplyCharacterBehavior(user, "human", beh, 1, payload);
+        NoteEvent($"{user}: {beh}", "info");
+    }
+
     void ApplySsSync(string json)
     {
-        if (!TrainingEnvSpace.IsStreamingSurvivalMode)
+        if (!TrainingEnvSpace.UseUnifiedFollowers)
+        {
+            int pos = 0;
+            while (true)
+            {
+                int uIdx = json.IndexOf("\"username\"", pos, System.StringComparison.Ordinal);
+                if (uIdx < 0) break;
+                int objStart = json.LastIndexOf('{', uIdx);
+                int objEnd = FindBraceEnd(json, objStart);
+                if (objStart < 0 || objEnd < 0)
+                {
+                    pos = uIdx + 10;
+                    continue;
+                }
+                string chunk = json.Substring(objStart, objEnd - objStart + 1);
+                string uname = ExtractString(chunk, "username");
+                if (!string.IsNullOrEmpty(uname))
+                    ViewerSimpleAgent.FindOrSpawn(uname);
+                pos = objEnd + 1;
+            }
             return;
-        var c = StreamingSurvivalController.Instance;
+        }
+        var c = StreamingSurvivalController.EnsureInstance();
         if (c == null) return;
         // простой разбор массива users по username
         var list = new System.Collections.Generic.List<StreamingSurvivalUserDto>();

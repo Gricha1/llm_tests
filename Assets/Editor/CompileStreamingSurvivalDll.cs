@@ -47,7 +47,8 @@ public static class CompileStreamingSurvivalDll
         SessionState.SetBool("CompileSS.pending", true);
 
         CompilationPipeline.compilationFinished += OnFinished;
-        CompilationPipeline.RequestScriptCompilation(RequestScriptCompilationOptions.CleanBuildCache);
+        // CleanBuildCache often hangs IL Post Processor in this project.
+        CompilationPipeline.RequestScriptCompilation();
         EditorApplication.update += PollCopy;
     }
 

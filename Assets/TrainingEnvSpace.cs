@@ -131,6 +131,13 @@ public static class TrainingEnvSpace
     public static bool IsLivePresentationForObs =>
         IsStreamOnlyMode || IsTrainWithPresentationMode || IsPresentationWorkerProcess;
 
+    /// <summary>
+    /// Presentation/stream/train worker 0: #join → Jack-like SS followers (не овечки ViewerSimpleAgent).
+    /// Полный раунд SS (ресурсы, таймер) только при IsStreamingSurvivalMode.
+    /// </summary>
+    public static bool UseUnifiedFollowers =>
+        IsStreamingSurvivalMode || IsLivePresentationForObs;
+
     /// <summary>Twitch, HUD стрима — только presentation worker (не train workers 1–15).</summary>
     public static bool ShouldRunPresentationOnlyServices()
     {

@@ -39,10 +39,50 @@ if [ "${FOREST_STREAM_SUPERVISE:-1}" = "1" ] && [ "${FOREST_STREAM_INNER:-0}" !=
     sleep 1
   }
 
+  spawn_watch_pid=""
+  start_spawn_watch() {
+    # FOREST_SPAWN_WATCH=0 — выкл. По умолчанию: детект пустых trees/sheep → ResetSpawners.
+    if [ "${FOREST_SPAWN_WATCH:-1}" != "1" ]; then
+      return 0
+    fi
+    if [ -n "${spawn_watch_pid}" ] && kill -0 "${spawn_watch_pid}" 2>/dev/null; then
+      return 0
+    fi
+    mkdir -p "${ROOT}/results/${RUN_ID:-_}"
+    echo "[stream_onnx] spawn_repair watch RUN_ID=${RUN_ID:-?}…"
+    set +e
+    (
+      source ~/anaconda3/etc/profile.d/conda.sh 2>/dev/null || true
+      conda activate mlagents 2>/dev/null || true
+      # Рестарт стрима только при FOREST_SPAWN_WATCH_RESTART=1 (иначе цикл рестартов на старом DLL).
+      extra=()
+      if [ "${FOREST_SPAWN_WATCH_RESTART:-0}" != "1" ]; then
+        extra+=(--no-restart)
+      fi
+      exec python3 -u "${ROOT}/train_scripts/lab_comp/watch_stream_spawn_repair.py" \
+        --run-id "${RUN_ID:-}" \
+        --interval "${FOREST_SPAWN_WATCH_INTERVAL:-20}" \
+        --bad-streak "${FOREST_SPAWN_WATCH_STREAK:-3}" \
+        "${extra[@]}"
+    ) >> "${ROOT}/results/${RUN_ID:-_}/spawn_repair_watch.log" 2>&1 &
+    spawn_watch_pid=$!
+    set -e
+    echo "[stream_onnx] spawn_repair pid=${spawn_watch_pid} log=results/${RUN_ID:-_}/spawn_repair_watch.log"
+  }
+  stop_spawn_watch() {
+    if [ -n "${spawn_watch_pid}" ]; then
+      kill -TERM "${spawn_watch_pid}" 2>/dev/null || true
+      wait "${spawn_watch_pid}" 2>/dev/null || true
+      spawn_watch_pid=""
+    fi
+    pkill -f 'watch_stream_spawn_repair\.py' 2>/dev/null || true
+  }
+
   stop_supervisor() {
     stopping=1
     echo "[stream_onnx] STOP (Ctrl+C / SIGTERM) — супервизор не перезапускает"
     rm -f "${FLAG}" "${STOP_FLAG}"
+    stop_spawn_watch
     kill_stream_only
     if [ -n "${child}" ]; then
       kill -TERM "${child}" 2>/dev/null || true
@@ -60,6 +100,7 @@ if [ "${FOREST_STREAM_SUPERVISE:-1}" = "1" ] && [ "${FOREST_STREAM_INNER:-0}" !=
     if [ -f "${STOP_FLAG}" ]; then
       echo "[stream_onnx] найден ${STOP_FLAG} — выход"
       rm -f "${STOP_FLAG}"
+      stop_spawn_watch
       exit 0
     fi
 
@@ -70,12 +111,14 @@ if [ "${FOREST_STREAM_SUPERVISE:-1}" = "1" ] && [ "${FOREST_STREAM_INNER:-0}" !=
       bash "${ROOT}/train_scripts/lab_comp/run_stream_onnx.bash" "$@" &
     child=$!
     set -e
+    start_spawn_watch
 
     restarted=0
     while kill -0 "${child}" 2>/dev/null; do
       if [ -f "${STOP_FLAG}" ]; then
         echo "[stream_onnx] ${STOP_FLAG} — останавливаем"
         rm -f "${STOP_FLAG}"
+        stop_spawn_watch
         kill_stream_only
         wait "${child}" 2>/dev/null || true
         exit 0

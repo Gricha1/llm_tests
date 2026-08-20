@@ -25,6 +25,12 @@ class LocalChatBody(BaseModel):
     message: str = Field(default="")
 
 
+class StatsEventBody(BaseModel):
+    username: str = Field(default="")
+    stat: str = Field(default="")
+    amount: int = Field(default=1, ge=1)
+
+
 def create_app(bot) -> FastAPI:
     app = FastAPI(title="Forest Stream Bot", version="0.2")
 
@@ -44,6 +50,40 @@ def create_app(bot) -> FastAPI:
     def session_reset() -> Dict[str, Any]:
         """QA / live-stress: clear all joined users (empty world until #join)."""
         return bot.reset_session()
+
+    @app.get("/roster")
+    def roster() -> Dict[str, Any]:
+        roster_list = bot.ss.list_roster()
+        return {
+            "ok": True,
+            "roster": roster_list,
+            "roster_count": len(roster_list),
+            "roster_json": str(bot._roster_json),
+        }
+
+    @app.get("/players")
+    def players(active_only: bool = False) -> Dict[str, Any]:
+        """История входов + статистика (вода/еда/дерево/…)."""
+        return bot.list_players(active_only=bool(active_only))
+
+    @app.post("/roster/resync")
+    def roster_resync() -> Dict[str, Any]:
+        """Повторно заспавнить всех из roster в Unity."""
+        return bot.resync_roster()
+
+    @app.post("/roster/prune")
+    def roster_prune() -> Dict[str, Any]:
+        """Убрать debug/test пользователей; на сцене только Twitch chat."""
+        return bot.prune_roster()
+
+    @app.post("/stats/event")
+    def stats_event(body: StatsEventBody) -> Dict[str, Any]:
+        user = (body.username or "").strip()
+        stat = (body.stat or "").strip()
+        if not user or not stat:
+            return {"ok": False, "error": "username and stat required"}
+        bot.ss.record_stat(user, stat, body.amount)
+        return {"ok": True}
 
     @app.post("/local_chat")
     def local_chat(body: LocalChatBody) -> Dict[str, Any]:

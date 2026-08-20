@@ -8,6 +8,7 @@
 """
 
 import argparse
+import json
 import os
 import shutil
 import sys
@@ -34,6 +35,35 @@ RESTART_EXIT_CODE = 75
 
 def _log(msg: str) -> None:
     print(f"[stream_onnx] {msg}", flush=True)
+
+
+def _fps_paths() -> tuple[Path, Path]:
+    raw = (os.environ.get("FOREST_STREAM_FPS_DIR") or "").strip()
+    if not raw:
+        root = Path.cwd() / "results"
+    else:
+        root = Path(raw)
+    root.mkdir(parents=True, exist_ok=True)
+    return root / "stream_fps.json", root / "stream_fps.jsonl"
+
+
+def _write_fps_snapshot(payload: dict) -> None:
+    js, jsonl = _fps_paths()
+    payload = dict(payload)
+    payload["ts"] = time.time()
+    payload["iso"] = time.strftime("%H:%M:%S")
+    raw = json.dumps(payload, ensure_ascii=False)
+    tmp = js.with_suffix(".json.tmp")
+    try:
+        tmp.write_text(raw + "\n", encoding="utf-8")
+        tmp.replace(js)
+    except OSError:
+        pass
+    try:
+        with jsonl.open("a", encoding="utf-8") as f:
+            f.write(raw + "\n")
+    except OSError:
+        pass
 
 
 def behavior_stem(behavior: str) -> str:
@@ -269,15 +299,31 @@ class OnnxPolicy:
         for i, name in enumerate(self.input_names):
             lname = name.lower()
             if "mask" in lname:
+                shape = self.session.get_inputs()[i].shape
+                mask_dim = 1
+                for d in shape[1:]:
+                    if isinstance(d, int) and d > 0:
+                        mask_dim = d
+                        break
                 if action_masks is not None:
-                    feeds[name] = action_masks.astype(np.float32)
+                    arr = action_masks.astype(np.float32)
+                    if arr.ndim == 1:
+                        arr = arr[None, :]
+                    got = int(arr.shape[-1])
+                    if got != mask_dim:
+                        if not getattr(self, "_mask_shape_warned", False):
+                            _log(
+                                f"WARN {self.path.name}: {name} got={got} expected={mask_dim} — "
+                                f"pad/trunc; дождись onnx от текущего train"
+                            )
+                            self._mask_shape_warned = True
+                        if got > mask_dim:
+                            arr = arr[..., :mask_dim].copy()
+                        else:
+                            pad = np.zeros(arr.shape[:-1] + (mask_dim - got,), dtype=np.float32)
+                            arr = np.concatenate([arr, pad], axis=-1)
+                    feeds[name] = arr
                 else:
-                    shape = self.session.get_inputs()[i].shape
-                    mask_dim = 1
-                    for d in shape[1:]:
-                        if isinstance(d, int) and d > 0:
-                            mask_dim = d
-                            break
                     feeds[name] = np.ones((batch, mask_dim), dtype=np.float32)
             elif name.startswith("obs_") or "obs" in lname or i == 0:
                 idx = 0
@@ -482,6 +528,16 @@ def run_loop(
     hitch_count = 0
     hitch_log_cooldown = 0.0
     window_t0 = time.perf_counter()
+    fps_min: float | None = None
+    fps_max: float | None = None
+
+    def _note_fps(v: float) -> tuple[float | None, float | None]:
+        nonlocal fps_min, fps_max
+        if v <= 0:
+            return fps_min, fps_max
+        fps_min = v if fps_min is None else min(fps_min, v)
+        fps_max = v if fps_max is None else max(fps_max, v)
+        return fps_min, fps_max
 
     while True:
         if restart_flag is not None and steps % 30 == 0 and restart_flag.is_file():
@@ -545,16 +601,33 @@ def run_loop(
             now = time.perf_counter()
             if now >= hitch_log_cooldown:
                 hitch_log_cooldown = now + 3.0
+                ema_fps = 1.0 / max(ema_dt, 1e-3)
+                fmin, fmax = _note_fps(ema_fps)
                 _log(
                     f"HITCH step={steps} dt={dt*1000:.0f}ms "
-                    f"(обычный шаг ≈{ema_dt*1000:.0f}ms / {1.0/max(ema_dt,1e-3):.0f} FPS)"
+                    f"(обычный шаг ≈{ema_dt*1000:.0f}ms / {ema_fps:.0f} FPS)"
                 )
+                snap = {
+                    "kind": "hitch",
+                    "steps": steps,
+                    "fps": round(ema_fps, 2),
+                    "step_ms": round(ema_dt * 1000, 1),
+                    "hitch_dt_ms": round(dt * 1000),
+                    "hitches": hitch_count,
+                    "slow": slow_count,
+                }
+                if fmin is not None:
+                    snap["fps_min"] = round(fmin, 2)
+                if fmax is not None:
+                    snap["fps_max"] = round(fmax, 2)
+                _write_fps_snapshot(snap)
         elif dt > 0.05:
             slow_count += 1
 
         if steps % step_log_every == 0:
             wall = time.perf_counter() - window_t0
             fps = step_log_every / max(wall, 1e-3)
+            fmin, fmax = _note_fps(fps)
             parts = []
             for stem, hist in act_hist.items():
                 top = sorted(hist.items(), key=lambda x: -x[1])[:3]
@@ -565,6 +638,19 @@ def run_loop(
                 f"hitches={hitch_count} slow(>{50}ms)={slow_count} "
                 f"act_top {'; '.join(parts)}"
             )
+            snap = {
+                "kind": "window",
+                "steps": steps,
+                "fps": round(fps, 2),
+                "step_ms": round(ema_dt * 1000, 1),
+                "hitches": hitch_count,
+                "slow": slow_count,
+            }
+            if fmin is not None:
+                snap["fps_min"] = round(fmin, 2)
+            if fmax is not None:
+                snap["fps_max"] = round(fmax, 2)
+            _write_fps_snapshot(snap)
             hitch_count = 0
             slow_count = 0
             window_t0 = time.perf_counter()

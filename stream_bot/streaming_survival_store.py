@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import sqlite3
 import threading
 import time
@@ -44,9 +45,35 @@ class StreamingSurvivalStore:
                     )
                     """
                 )
+                self._ensure_columns(conn)
                 conn.commit()
             finally:
                 conn.close()
+
+    @staticmethod
+    def _ensure_columns(conn: sqlite3.Connection) -> None:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(streaming_survival_users)")}
+        if "join_source" not in cols:
+            conn.execute(
+                "ALTER TABLE streaming_survival_users ADD COLUMN join_source TEXT DEFAULT 'chat'"
+            )
+        if "total_survival_seconds" not in cols:
+            conn.execute(
+                "ALTER TABLE streaming_survival_users ADD COLUMN total_survival_seconds REAL DEFAULT 0"
+            )
+        if "session_joined_at" not in cols:
+            conn.execute(
+                "ALTER TABLE streaming_survival_users ADD COLUMN session_joined_at REAL DEFAULT 0"
+            )
+
+    _STAT_FIELDS = {
+        "water": "total_water_collected",
+        "food": "total_food_collected",
+        "sheep": "total_sheep_killed",
+        "campfire": "total_campfires_built",
+        "wood": "total_wood_collected",
+        "round": "total_rounds_participated",
+    }
 
     def get_user(self, username: str) -> Optional[Dict[str, Any]]:
         u = username.lower().strip()
@@ -81,9 +108,10 @@ class StreamingSurvivalStore:
             finally:
                 conn.close()
 
-    def join(self, username: str, twitch_user_id: str = "") -> bool:
+    def join(self, username: str, twitch_user_id: str = "", join_source: str = "chat") -> bool:
         """True если пользователь только что стал активным (новый join)."""
         u = username.lower().strip()
+        src = (join_source or "chat").strip().lower() or "chat"
         now = time.time()
         with self._lock:
             conn = self._connect()
@@ -97,10 +125,11 @@ class StreamingSurvivalStore:
                         """
                         INSERT INTO streaming_survival_users (
                             username, twitch_user_id, joined_at, last_seen_at, is_active,
-                            last_action, last_action_name, last_action_changed_at
-                        ) VALUES (?, ?, ?, ?, 1, 'idle', 'Ждёт у базы', 0)
+                            last_action, last_action_name, last_action_changed_at, join_source,
+                            session_joined_at
+                        ) VALUES (?, ?, ?, ?, 1, 'idle', 'Ждёт у базы', 0, ?, ?)
                         """,
-                        (u, twitch_user_id or None, now, now),
+                        (u, twitch_user_id or None, now, now, src, now),
                     )
                     conn.commit()
                     return True
@@ -112,22 +141,23 @@ class StreamingSurvivalStore:
                         """
                         UPDATE streaming_survival_users
                         SET is_active=1, last_seen_at=?,
-                            twitch_user_id=COALESCE(?, twitch_user_id)
+                            twitch_user_id=COALESCE(?, twitch_user_id),
+                            join_source=?
                         WHERE username=?
                         """,
-                        (now, twitch_user_id or None, u),
+                        (now, twitch_user_id or None, src, u),
                     )
                 else:
                     conn.execute(
                         """
                         UPDATE streaming_survival_users
-                        SET is_active=1, last_seen_at=?,
+                        SET is_active=1, last_seen_at=?, session_joined_at=?,
                             twitch_user_id=COALESCE(?, twitch_user_id),
                             last_action='idle', last_action_name='Ждёт у базы',
-                            last_action_changed_at=0
+                            last_action_changed_at=0, join_source=?
                         WHERE username=?
                         """,
-                        (now, twitch_user_id or None, u),
+                        (now, now, twitch_user_id or None, src, u),
                     )
                 conn.commit()
                 # уже был активен → «уже в игре»; иначе свежий вход
@@ -143,19 +173,25 @@ class StreamingSurvivalStore:
             conn = self._connect()
             try:
                 row = conn.execute(
-                    "SELECT is_active FROM streaming_survival_users WHERE username=?",
+                    "SELECT is_active, session_joined_at, total_survival_seconds FROM streaming_survival_users WHERE username=?",
                     (u,),
                 ).fetchone()
                 if row is None or not int(row["is_active"] or 0):
                     return False
+                session_start = float(row["session_joined_at"] or 0)
+                if session_start <= 0:
+                    session_start = now
+                lived = max(0.0, now - session_start)
+                total = float(row["total_survival_seconds"] or 0) + lived
                 conn.execute(
                     """
                     UPDATE streaming_survival_users
                     SET is_active=0, last_seen_at=?, last_action='idle',
-                        last_action_name='Ждёт у базы'
+                        last_action_name='Ждёт у базы',
+                        total_survival_seconds=?, session_joined_at=0
                     WHERE username=?
                     """,
-                    (now, u),
+                    (now, total, u),
                 )
                 conn.commit()
                 return True
@@ -172,7 +208,9 @@ class StreamingSurvivalStore:
     ) -> Dict[str, Any]:
         u = username.lower().strip()
         now = time.time()
-        self.join(u)
+        existing = self.get_user(u)
+        src = (existing or {}).get("join_source") or "chat"
+        self.join(u, join_source=str(src))
         with self._lock:
             conn = self._connect()
             try:
@@ -201,19 +239,112 @@ class StreamingSurvivalStore:
             return 1e9
         return max(0.0, time.time() - float(row.get("last_action_changed_at") or 0))
 
+    _CHAT_ROSTER_WHERE = "is_active=1 AND (join_source='chat' OR join_source IS NULL)"
+
     def list_active(self) -> List[Dict[str, Any]]:
         with self._lock:
             conn = self._connect()
             try:
                 rows = conn.execute(
-                    """
+                    f"""
                     SELECT username, last_action AS action, last_action_name AS action_name
                     FROM streaming_survival_users
-                    WHERE is_active=1
+                    WHERE {self._CHAT_ROSTER_WHERE}
                     ORDER BY joined_at ASC
                     """
                 ).fetchall()
                 return [dict(r) for r in rows]
+            finally:
+                conn.close()
+
+    def list_roster(self) -> List[Dict[str, Any]]:
+        """Активные игроки из Twitch-чата (#join, не #exit)."""
+        return self.list_players(active_only=True, chat_only=True)
+
+    _TEST_NAME_RE = re.compile(
+        r"^(debug_user|viewer(_\d+)?|ui_smoke|testjoin|joincheck|twitch_join_test|"
+        r"crash_test|jack_model_test|"
+        r"(stress_user|u|t|ck|ep|coord|pond|e2e|wfix)\w*)$",
+        re.I,
+    )
+
+    def list_players(
+        self,
+        *,
+        active_only: bool = False,
+        chat_only: bool = True,
+        hide_test: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Игроки с датами и статистикой (для UI / #stats history)."""
+        where = ["1=1"]
+        if active_only:
+            where.append("is_active=1")
+        if chat_only:
+            where.append("(join_source='chat' OR join_source IS NULL)")
+        sql = f"""
+            SELECT username, twitch_user_id, joined_at, last_seen_at,
+                   session_joined_at, last_action AS action, last_action_name AS action_name,
+                   is_active, join_source,
+                   total_water_collected, total_wood_collected, total_food_collected,
+                   total_sheep_killed, total_campfires_built, total_rounds_participated,
+                   total_survival_seconds
+            FROM streaming_survival_users
+            WHERE {' AND '.join(where)}
+            ORDER BY is_active DESC, joined_at ASC
+        """
+        with self._lock:
+            conn = self._connect()
+            try:
+                rows = conn.execute(sql).fetchall()
+                out: List[Dict[str, Any]] = []
+                for row in rows:
+                    d = dict(row)
+                    name = str(d.get("username") or "")
+                    if hide_test and self._TEST_NAME_RE.match(name):
+                        continue
+                    d["is_active"] = bool(int(d.get("is_active") or 0))
+                    d["survival_seconds"] = self.survival_seconds(d)
+                    out.append(d)
+                return out
+            finally:
+                conn.close()
+
+    def deactivate_local_debug(self) -> int:
+        with self._lock:
+            conn = self._connect()
+            try:
+                cur = conn.execute(
+                    """
+                    UPDATE streaming_survival_users
+                    SET is_active=0, last_action='idle', last_action_name='Ждёт у базы'
+                    WHERE is_active=1 AND join_source='local_debug'
+                    """
+                )
+                conn.commit()
+                return int(cur.rowcount or 0)
+            finally:
+                conn.close()
+
+    def deactivate_usernames(self, usernames: List[str]) -> int:
+        names = [u.lower().strip() for u in usernames if (u or "").strip()]
+        if not names:
+            return 0
+        with self._lock:
+            conn = self._connect()
+            try:
+                n = 0
+                for u in names:
+                    cur = conn.execute(
+                        """
+                        UPDATE streaming_survival_users
+                        SET is_active=0, last_action='idle', last_action_name='Ждёт у базы'
+                        WHERE username=? AND is_active=1
+                        """,
+                        (u,),
+                    )
+                    n += int(cur.rowcount or 0)
+                conn.commit()
+                return n
             finally:
                 conn.close()
 
@@ -239,3 +370,54 @@ class StreamingSurvivalStore:
                 conn.commit()
             finally:
                 conn.close()
+
+    def record_stat(self, username: str, stat: str, amount: int = 1) -> None:
+        field = self._STAT_FIELDS.get((stat or "").strip().lower())
+        if not field:
+            return
+        u = username.lower().strip()
+        if not u or not self.get_user(u):
+            return
+        self.bump_stat(u, field, max(1, int(amount)))
+
+    def survival_seconds(self, row: Dict[str, Any]) -> float:
+        total = float(row.get("total_survival_seconds") or 0)
+        if int(row.get("is_active") or 0) != 1:
+            return total
+        session_start = float(row.get("session_joined_at") or 0)
+        if session_start <= 0:
+            session_start = float(row.get("joined_at") or 0)
+        if session_start <= 0:
+            return total
+        return total + max(0.0, time.time() - session_start)
+
+    @staticmethod
+    def format_duration(seconds: float) -> str:
+        s = max(0, int(seconds))
+        if s < 60:
+            return f"{s} сек"
+        if s < 3600:
+            m = s // 60
+            return f"{m} мин"
+        h = s // 3600
+        m = (s % 3600) // 60
+        if m:
+            return f"{h} ч {m} мин"
+        return f"{h} ч"
+
+    def format_stats_reply(self, username: str) -> str:
+        row = self.get_user(username)
+        if not row:
+            return "Ты ещё не играл. Пиши #join, чтобы войти."
+        name = row.get("username") or username
+        alive = self.format_duration(self.survival_seconds(row))
+        water = int(row.get("total_water_collected") or 0)
+        wood = int(row.get("total_wood_collected") or 0)
+        food = int(row.get("total_food_collected") or 0)
+        sheep = int(row.get("total_sheep_killed") or 0)
+        fires = int(row.get("total_campfires_built") or 0)
+        in_game = " (в игре)" if int(row.get("is_active") or 0) == 1 else ""
+        return (
+            f"@{name}{in_game}: в игре {alive} · вода {water} · дерево {wood} · еда {food} · "
+            f"овцы {sheep} · костры {fires}"
+        )

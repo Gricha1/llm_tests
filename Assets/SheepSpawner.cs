@@ -179,7 +179,35 @@ public class SheepSpawner : MonoBehaviour
         }
     }
 
-    public int TargetCount => sheepCount;
+    public Vector3 SpawnCenterWorld => ToWorld(SpawnCenterLocal);
+
+    /// <summary>Ближайшая живая овца (не фантом registry и не зритель-овечка).</summary>
+    public bool TryGetNearestAliveSheep(Vector3 worldFrom, out GameObject sheep, out Vector3 worldPos)
+    {
+        RemoveDestroyedSheep();
+        sheep = null;
+        worldPos = default;
+        float best = float.MaxValue;
+        for (int i = 0; i < sheeps.Count; i++)
+        {
+            var go = sheeps[i];
+            if (!IsAlive(go) || !go.activeInHierarchy) continue;
+            if (go.GetComponent<ViewerSimpleAgent>() != null) continue;
+            if (go.GetComponent<SheepSpawner>() != null) continue;
+            if (go.GetComponent<SheepWander>() == null) continue;
+            Vector3 p = go.transform.position;
+            float dx = p.x - worldFrom.x;
+            float dz = p.z - worldFrom.z;
+            float d = dx * dx + dz * dz;
+            if (d < best)
+            {
+                best = d;
+                sheep = go;
+                worldPos = p;
+            }
+        }
+        return sheep != null;
+    }
 
     public int AliveCount
     {
@@ -189,6 +217,8 @@ public class SheepSpawner : MonoBehaviour
             return sheeps.Count;
         }
     }
+
+    public int TargetCount => sheepCount;
 
     public void ResetSheep()
     {

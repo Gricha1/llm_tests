@@ -63,7 +63,11 @@ action ONLY:
 «набери 2 воды и иди ставь костёр» → collect_water:2;build_campfire:1 (НЕ campfire×2)
 «иди к воде» → go_to_water (НЕ collect_water)
 «добудь воду» → collect_water
+«добывай еду» / «собирай еду» → collect_food (бежать к ближайшей овце)
 «вперёд потом назад» → patrol
+
+Если команда непонятна — НЕ угадывай idle/камень/дерево.
+Верни action="unknown" (остальные поля можно пустыми).
 """
 
 

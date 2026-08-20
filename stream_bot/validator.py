@@ -42,6 +42,18 @@ ACTION_ALIASES = {
     "respawn": "manual_respawn",
 }
 
+# Bare #do (no count, one step): Unity farms until the next chat command.
+# A 1-step queue like "collect_wood:1" would stop after one chop.
+KEEP_FARM_ACTIONS = frozenset(
+    {
+        "collect_water",
+        "collect_wood",
+        "collect_food",
+        "kill_sheep",
+        "build_campfire",
+    }
+)
+
 ACTION_NAMES_RU = {
     "collect_water": "Добывает воду",
     "collect_wood": "Рубит дерево",
@@ -122,7 +134,7 @@ _APPROACH = re.compile(
     re.IGNORECASE,
 )
 _BUILD_CAMP = re.compile(
-    r"поставь|ставь|развед|построить|сделай|build",
+    r"поставь|ставь|развед|построить|сделай|зажг|зажеч|зажиг|build",
     re.IGNORECASE,
 )
 
@@ -209,8 +221,14 @@ def fallback_action(username: str) -> Dict[str, Any]:
 
 
 def _has_campfire(t: str) -> bool:
-    # костёр / костер / костру / костра / campfire / огонь
-    return bool(re.search(r"костр[ауеыо]?|кост[её]р|campfire|огонь", t, re.IGNORECASE))
+    # костёр / костер / котсёр (typo) / campfire / огонь / тепло
+    return bool(
+        re.search(
+            r"костр[ауеыо]?|кост[её]р|котс[её]р|каст[её]р|campfire|огонь|тепл|heat",
+            t,
+            re.IGNORECASE,
+        )
+    )
 
 
 def _has_water(t: str) -> bool:
@@ -357,6 +375,23 @@ def _detect_action(t: str) -> Optional[str]:
             return normalize_action(a)
 
     return None
+
+
+def _omit_single_farm_queue(queue: str) -> str:
+    parts = [p for p in (queue or "").split(";") if p.strip()]
+    if len(parts) != 1:
+        return queue or ""
+    bits = parts[0].split(":")
+    a = normalize_action(bits[0].strip().lower())
+    n = 1
+    if len(bits) > 1:
+        try:
+            n = int(bits[1])
+        except ValueError:
+            n = 1
+    if a in KEEP_FARM_ACTIONS and n <= 1:
+        return ""
+    return queue or ""
 
 
 def _amount_in(t: str, default: int = 1) -> int:
@@ -511,6 +546,7 @@ def validate_streaming_survival_action(
             action = first[0]
             amount = int(first[1]) if len(first) > 1 else 1
             name = str(data.get("action_name") or ACTION_NAMES_RU.get(action, action))[:80]
+    queue = _omit_single_farm_queue(queue)
     reply = str(
         data.get("chat_reply") or f"{user} теперь: {name.lower()}"
     ).strip()[:250]

@@ -113,6 +113,7 @@ class ProcessMessageScenarios(unittest.TestCase):
             ("#do добывай воду", "collect_water"),
             ("#do руби лес пж", "collect_wood"),
             ("#do еды пожалуйста", "collect_food"),
+            ("#do добывай еду", "collect_food"),
             ("#do убивай овечек!!!", "kill_sheep"),
             ("#do костер у базы", "build_campfire"),
             ("#do стой на месте", "idle"),
@@ -127,6 +128,20 @@ class ProcessMessageScenarios(unittest.TestCase):
                 if p.get("type") == "streaming_survival_action"
             ]
             self.assertEqual(acts[-1]["action"], expect, msg)
+
+    def test_unknown_do_hints_in_chat(self):
+        self._chat("#join")
+        self.bot.listen_stream = True
+        out = self.bot.process_message("debug_user", "#do квантовый портал xyz", source="chat")
+        self.assertIn("не понял", (out.get("chat_reply") or "").lower())
+        self.assertIn("добывай воду", (out.get("chat_reply") or "").lower())
+        self.bot.twitch.send_chat_message.assert_called()
+        acts = [
+            p
+            for p in self.bot.unity.sent
+            if p.get("type") == "streaming_survival_action"
+        ]
+        self.assertFalse(acts)
 
     def test_delete_alias_still_exits(self):
         self._chat("#join")
