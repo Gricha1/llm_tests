@@ -35,9 +35,12 @@ public class TreeSpawner : MonoBehaviour
     private readonly List<GameObject> trees = new List<GameObject>();
     private float nextRespawnTime;
     private float nextWatchdogTime;
+    private float nextEmptyResetTime;
     private int failedRefillTicks;
     private bool _resetInProgress;
     private Transform _envRoot;
+    private GameObject[] _resourceTreePrefabs;
+    private bool _resourcePrefabsTried;
 
     static bool IsUnityNull(GameObject go) => go == null;
 
@@ -51,12 +54,31 @@ public class TreeSpawner : MonoBehaviour
     /// </summary>
     static bool IsAliveTree(GameObject go)
     {
-        if (IsUnityNull(go) || !go.activeSelf)
+        if (IsUnityNull(go))
             return false;
+
+        // Клон с inactive template мог остаться выключенным — поднимем.
+        if (!go.activeSelf)
+        {
+            go.SetActive(true);
+            if (!go.activeSelf)
+                return false;
+        }
 
         // PrepareChoppableTree уже повесил маркер — не убивать из‑за LOD/bounds=0.
         if (go.GetComponent<ChoppableTree>() != null)
             return true;
+
+        // Tag Tree / имя — scene/resource инстансы без маркера.
+        bool taggedTree = false;
+        try { taggedTree = go.CompareTag("Tree"); }
+        catch (UnityException) { /* tag missing in build */ }
+        if (taggedTree || go.name.StartsWith("tree_", System.StringComparison.OrdinalIgnoreCase))
+        {
+            if (go.GetComponent<ChoppableTree>() == null)
+                go.AddComponent<ChoppableTree>();
+            return true;
+        }
 
         var renderers = go.GetComponentsInChildren<Renderer>(true);
         bool hasVisual = false;
@@ -143,12 +165,16 @@ public class TreeSpawner : MonoBehaviour
 
         float now = Time.unscaledTime;
 
-        // Критично: пустой лес → сразу полный сброс, не ждём watchdog.
+        // Критично: пустой лес → полный сброс, но с кулдауном (иначе spam 0/30 каждый кадр).
         int quickCount = CountAliveChildren();
         if (quickCount == 0)
         {
-            Debug.LogWarning("[TreeSpawner] лес пуст — немедленный ResetTrees", this);
-            ResetTrees();
+            if (now >= nextEmptyResetTime)
+            {
+                nextEmptyResetTime = now + 2.5f;
+                Debug.LogWarning("[TreeSpawner] лес пуст — ResetTrees", this);
+                ResetTrees();
+            }
             return;
         }
 
@@ -266,16 +292,28 @@ public class TreeSpawner : MonoBehaviour
         for (int i = transform.childCount - 1; i >= 0; i--)
         {
             var child = transform.GetChild(i).gameObject;
+            if (IsTreePrefabTemplate(child))
+                continue;
+
             if (IsAliveTree(child))
             {
                 trees.Add(child);
                 continue;
             }
 
-            // Пустая оболочка без визуала и без ChoppableTree — убрать.
-            // Не трогаем объекты с ChoppableTree (IsAliveTree уже true выше).
+            // Rescue once: activate + ChoppableTree вместо мгновенного Destroy.
             if (!IsUnityNull(child))
+            {
+                child.SetActive(true);
+                if (child.GetComponent<ChoppableTree>() == null)
+                    child.AddComponent<ChoppableTree>();
+                if (IsAliveTree(child))
+                {
+                    trees.Add(child);
+                    continue;
+                }
                 Destroy(child);
+            }
         }
 
         TrimOverCap();
@@ -390,7 +428,19 @@ public class TreeSpawner : MonoBehaviour
     /// <summary>Полный сброс + чекер: пока мало живых — генерируем снова.</summary>
     public void ResetTrees()
     {
-        if (_resetInProgress)
+        ResetTreesInternal(allowReentrant: false);
+    }
+
+    /// <summary>Для repair-watcher: сбросить залипший _resetInProgress и форсировать спавн.</summary>
+    public void ForceResetTrees()
+    {
+        _resetInProgress = false;
+        ResetTreesInternal(allowReentrant: true);
+    }
+
+    void ResetTreesInternal(bool allowReentrant)
+    {
+        if (_resetInProgress && !allowReentrant)
             return;
 
         _resetInProgress = true;
@@ -399,13 +449,20 @@ public class TreeSpawner : MonoBehaviour
             failedRefillTicks = 0;
             nextRespawnTime = Time.unscaledTime + 0.05f;
             nextWatchdogTime = Time.unscaledTime + Mathf.Max(2f, watchdogInterval);
+            nextEmptyResetTime = Time.unscaledTime + 2.5f;
 
-            int need = Mathf.Max(1, minAliveTrees);
+            // Полный сброс → цель treeCount (30), не minAliveTrees (12): иначе лес застревает на 12/30.
+            int need = Mathf.Max(1, treeCount);
             int attempts = Mathf.Max(1, postSpawnVerifyRetries);
+            RebindScenePrefabTemplatesIfEmpty();
+            EnsurePrefabTemplatesUsable();
             for (int attempt = 0; attempt < attempts; attempt++)
             {
                 ClearTreesImmediate();
                 SpawnTrees();
+                PresentationWorldSnapshotLogger.Note(
+                    "tree_reset_spawn",
+                    $"pre_reconcile children={transform.childCount} list={trees.Count} {DescribePrefabHealth()}");
                 ReconcileTreeList();
 
                 int alive = trees.Count;
@@ -438,26 +495,45 @@ public class TreeSpawner : MonoBehaviour
             ReconcileTreeList();
             if (trees.Count < need)
             {
-                int childN = transform.childCount;
-                int prefabN = 0;
-                if (treePrefabs != null)
-                {
-                    for (int pi = 0; pi < treePrefabs.Length; pi++)
-                    {
-                        if (treePrefabs[pi] != null)
-                            prefabN++;
-                    }
-                }
                 Debug.LogError(
-                    $"[TreeSpawner] чекер FAIL: {trees.Count}/{treeCount} " +
-                    $"(prefabs={prefabN}/{ (treePrefabs == null ? 0 : treePrefabs.Length) }, children={childN})",
+                    $"[TreeSpawner] чекер FAIL: {trees.Count}/{treeCount} ({DescribePrefabHealth()}) — emergency placeholders",
                     this);
+                SpawnEmergencyPlaceholders(need - trees.Count);
+                // Не Reconcile сразу: IsAliveTree уже true через ChoppableTree.
             }
+            else if (trees.Count == 0 && treeCount > 0)
+                SpawnEmergencyPlaceholders(treeCount);
         }
         finally
         {
             _resetInProgress = false;
         }
+    }
+
+    /// <summary>
+    /// Prefab Instantiate = 0 — форс-спавн реальных деревьев (Resources/scene), без CreatePrimitive
+    /// (в URP build даёт фиолетовые «сваи»).
+    /// </summary>
+    void SpawnEmergencyPlaceholders(int count)
+    {
+        int target = Mathf.Clamp(Mathf.Max(count, treeCount - trees.Count), 1, treeCount);
+        RebindScenePrefabTemplatesIfEmpty();
+        EnsureResourceTreePrefabs();
+
+        int guard = target * 6;
+        while (trees.Count < treeCount && guard-- > 0)
+        {
+            if (TryPlaceTree(Mathf.Max(0.35f, minDistance * 0.45f))
+                || TryPlaceTreeOnGrid(0.35f)
+                || TryPlaceTreeForceAnywhere())
+                continue;
+            break;
+        }
+
+        ReconcileTreeList();
+        PresentationWorldSnapshotLogger.Note(
+            "tree_emergency",
+            $"force_spawned={trees.Count}/{treeCount} {DescribePrefabHealth()}");
     }
 
     void EnsureMinTreesOrReset(string reason)
@@ -479,14 +555,270 @@ public class TreeSpawner : MonoBehaviour
     {
         trees.Clear();
         for (int i = transform.childCount - 1; i >= 0; i--)
-            DestroyImmediate(transform.GetChild(i).gameObject);
+        {
+            var child = transform.GetChild(i).gameObject;
+            // Старые emergency-цилиндры (фиолетовые сваи) — всегда сносить.
+            if (child.name.StartsWith("tree_emergency_", System.StringComparison.OrdinalIgnoreCase))
+            {
+                DestroyImmediate(child);
+                continue;
+            }
+            // treePrefabs / именованные шаблоны — никогда не сносить (иначе scenePrefabs=0/3 навсегда).
+            if (IsTreePrefabTemplate(child) || LooksLikeTreePrefabTemplate(child))
+                continue;
+            DestroyImmediate(child);
+        }
+    }
+
+    bool IsTreePrefabTemplate(GameObject go)
+    {
+        if (IsUnityNull(go) || treePrefabs == null)
+            return false;
+        for (int i = 0; i < treePrefabs.Length; i++)
+        {
+            var prefab = treePrefabs[i];
+            if (IsUnityNull(prefab))
+                continue;
+            if (go == prefab
+                || go.transform == prefab.transform
+                || go.transform.IsChildOf(prefab.transform)
+                || prefab.transform.IsChildOf(go.transform))
+                return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Ровно те префабы, что в ForestScene у TreeSpawner: tree_2a / tree_2b / tree_2c.
+    /// Не подмешивать tree_1*/3*/6* из декора сцены.
+    /// </summary>
+    static readonly string[] CanonicalTreePrefabNames = { "tree_2a", "tree_2b", "tree_2c" };
+
+    static string NormalizeTreePrefabName(string n)
+    {
+        if (string.IsNullOrEmpty(n)) return "";
+        int paren = n.IndexOf('(');
+        if (paren > 0)
+            n = n.Substring(0, paren).Trim();
+        return n;
+    }
+
+    static bool IsCanonicalTreeTemplateName(string n)
+    {
+        n = NormalizeTreePrefabName(n);
+        for (int i = 0; i < CanonicalTreePrefabNames.Length; i++)
+        {
+            if (string.Equals(n, CanonicalTreePrefabNames[i], System.StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Именованные шаблоны tree_2a/2b/2c (не клоны). Декор tree_1*/6* не шаблон спавна.
+    /// </summary>
+    static bool LooksLikeTreePrefabTemplate(GameObject go)
+    {
+        if (IsUnityNull(go))
+            return false;
+        string n = go.name;
+        if (n.IndexOf("(Clone)", System.StringComparison.OrdinalIgnoreCase) >= 0)
+            return false;
+        if (!IsCanonicalTreeTemplateName(n))
+            return false;
+        return go.GetComponentsInChildren<Renderer>(true).Length > 0;
+    }
+
+    /// <summary>
+    /// Scene-templates уничтожены рубкой — восстановить только канонические tree_2a/2b/2c
+    /// (или Resources). Не собирать чужие деревья со всей карты.
+    /// </summary>
+    void RebindScenePrefabTemplatesIfEmpty()
+    {
+        int aliveRefs = 0;
+        int canonicalAlive = 0;
+        if (treePrefabs != null)
+        {
+            for (int i = 0; i < treePrefabs.Length; i++)
+            {
+                var p = treePrefabs[i];
+                if (IsUnityNull(p))
+                    continue;
+                aliveRefs++;
+                if (IsCanonicalTreeTemplateName(p.name))
+                    canonicalAlive++;
+            }
+        }
+        // Уже есть нормальные 2a/2b/2c — не трогаем.
+        if (canonicalAlive >= 1 && aliveRefs == canonicalAlive)
+            return;
+
+        var found = new List<GameObject>(3);
+        CollectTreePrefabCandidates(transform, found);
+        if (found.Count < 3)
+        {
+            var root = TrainingEnvSpace.PresentationRoot;
+            if (root == null)
+                root = TrainingEnvSpace.FindRoot(transform);
+            if (root != null)
+                CollectTreePrefabCandidates(root, found);
+        }
+
+        if (found.Count > 0)
+        {
+            treePrefabs = found.ToArray();
+            Debug.LogWarning(
+                $"[TreeSpawner] rebind canonical treePrefabs ({found.Count}) on {name}",
+                this);
+            return;
+        }
+
+        // Сцена пуста — только Resources/TreePrefabs (tree_2a/2b/2c).
+        _resourcePrefabsTried = false;
+        EnsureResourceTreePrefabs();
+        if (_resourceTreePrefabs != null && _resourceTreePrefabs.Length > 0)
+        {
+            treePrefabs = _resourceTreePrefabs;
+            Debug.LogWarning(
+                $"[TreeSpawner] treePrefabs ← Resources ({_resourceTreePrefabs.Length})",
+                this);
+        }
+    }
+
+    static void CollectTreePrefabCandidates(Transform root, List<GameObject> found)
+    {
+        if (root == null || found == null)
+            return;
+        var trs = root.GetComponentsInChildren<Transform>(true);
+        for (int i = 0; i < trs.Length; i++)
+        {
+            var child = trs[i] != null ? trs[i].gameObject : null;
+            if (IsUnityNull(child) || !LooksLikeTreePrefabTemplate(child))
+                continue;
+            // Один шаблон на имя (2a/2b/2c).
+            string key = NormalizeTreePrefabName(child.name);
+            bool dup = false;
+            for (int j = 0; j < found.Count; j++)
+            {
+                if (string.Equals(
+                    NormalizeTreePrefabName(found[j].name), key,
+                    System.StringComparison.OrdinalIgnoreCase))
+                {
+                    dup = true;
+                    break;
+                }
+            }
+            if (dup)
+                continue;
+            found.Add(child);
+            if (found.Count >= CanonicalTreePrefabNames.Length)
+                break;
+        }
+    }
+
+    void EnsurePrefabTemplatesUsable()
+    {
+        RebindScenePrefabTemplatesIfEmpty();
+        if (treePrefabs == null)
+            return;
+        for (int i = 0; i < treePrefabs.Length; i++)
+        {
+            var prefab = treePrefabs[i];
+            if (IsUnityNull(prefab))
+                continue;
+            if (!prefab.activeSelf)
+                prefab.SetActive(true);
+        }
+    }
+
+    GameObject PickTreePrefab()
+    {
+        if (treePrefabs != null && treePrefabs.Length > 0)
+        {
+            for (int attempt = 0; attempt < treePrefabs.Length * 2; attempt++)
+            {
+                var prefab = treePrefabs[Random.Range(0, treePrefabs.Length)];
+                if (!IsUnityNull(prefab) && IsCanonicalTreeTemplateName(prefab.name))
+                    return prefab;
+            }
+            for (int i = 0; i < treePrefabs.Length; i++)
+            {
+                if (!IsUnityNull(treePrefabs[i]) && IsCanonicalTreeTemplateName(treePrefabs[i].name))
+                    return treePrefabs[i];
+            }
+        }
+
+        // Scene-templates срубили/уничтожили → fallback из Resources/TreePrefabs.
+        EnsureResourceTreePrefabs();
+        if (_resourceTreePrefabs == null || _resourceTreePrefabs.Length == 0)
+            return null;
+        for (int attempt = 0; attempt < _resourceTreePrefabs.Length * 2; attempt++)
+        {
+            var prefab = _resourceTreePrefabs[Random.Range(0, _resourceTreePrefabs.Length)];
+            if (!IsUnityNull(prefab))
+                return prefab;
+        }
+        return null;
+    }
+
+    void EnsureResourceTreePrefabs()
+    {
+        if (_resourcePrefabsTried && _resourceTreePrefabs != null && _resourceTreePrefabs.Length > 0)
+            return;
+        _resourcePrefabsTried = true;
+        var named = new List<GameObject>(CanonicalTreePrefabNames.Length);
+        for (int i = 0; i < CanonicalTreePrefabNames.Length; i++)
+        {
+            string key = "TreePrefabs/" + CanonicalTreePrefabNames[i];
+            var go = Resources.Load<GameObject>(key);
+            if (!IsUnityNull(go))
+                named.Add(go);
+        }
+        if (named.Count == 0)
+        {
+            // Fallback LoadAll, но отфильтровать только канонические имена.
+            var all = Resources.LoadAll<GameObject>("TreePrefabs");
+            if (all != null)
+            {
+                for (int i = 0; i < all.Length; i++)
+                {
+                    if (!IsUnityNull(all[i]) && IsCanonicalTreeTemplateName(all[i].name))
+                        named.Add(all[i]);
+                }
+            }
+        }
+        _resourceTreePrefabs = named.Count > 0 ? named.ToArray() : null;
+        if (_resourceTreePrefabs != null && _resourceTreePrefabs.Length > 0)
+        {
+            Debug.LogWarning(
+                $"[TreeSpawner] Resources/TreePrefabs canonical ({_resourceTreePrefabs.Length})",
+                this);
+        }
+    }
+
+    public string DescribePrefabHealth()
+    {
+        int sceneN = 0;
+        int sceneLen = treePrefabs == null ? 0 : treePrefabs.Length;
+        if (treePrefabs != null)
+        {
+            for (int i = 0; i < treePrefabs.Length; i++)
+            {
+                if (!IsUnityNull(treePrefabs[i]))
+                    sceneN++;
+            }
+        }
+        EnsureResourceTreePrefabs();
+        int resN = _resourceTreePrefabs == null ? 0 : _resourceTreePrefabs.Length;
+        return $"scenePrefabs={sceneN}/{sceneLen} resources={resN} children={transform.childCount}";
     }
 
     private void SpawnTrees()
     {
-        if (treePrefabs == null || treePrefabs.Length == 0)
+        EnsurePrefabTemplatesUsable();
+        if (PickTreePrefab() == null)
         {
-            Debug.LogWarning($"TreeSpawner на {name}: treePrefabs пустой", this);
+            Debug.LogWarning($"TreeSpawner на {name}: treePrefabs пустой/null", this);
             return;
         }
 
@@ -520,14 +852,11 @@ public class TreeSpawner : MonoBehaviour
 
     bool TryPlaceTree(float spacing)
     {
-        if (treePrefabs == null || treePrefabs.Length == 0)
-            return false;
-
         for (int attempt = 0; attempt < 120; attempt++)
         {
-            GameObject prefab = treePrefabs[Random.Range(0, treePrefabs.Length)];
+            GameObject prefab = PickTreePrefab();
             if (prefab == null)
-                continue;
+                return false;
 
             Vector3 pos = ToWorld(RandomLocalSpawn());
             if (IsTooClose(pos, spacing))
@@ -542,7 +871,7 @@ public class TreeSpawner : MonoBehaviour
 
     bool TryPlaceTreeOnGrid(float spacing)
     {
-        if (treePrefabs == null || treePrefabs.Length == 0)
+        if (PickTreePrefab() == null)
             return false;
 
         float step = Mathf.Max(0.45f, spacing);
@@ -562,9 +891,9 @@ public class TreeSpawner : MonoBehaviour
                     if (IsTooClose(pos, spacing))
                         continue;
 
-                    GameObject prefab = treePrefabs[Random.Range(0, treePrefabs.Length)];
+                    GameObject prefab = PickTreePrefab();
                     if (prefab == null)
-                        continue;
+                        return false;
 
                     SpawnTreeAt(pos, prefab);
                     return true;
@@ -578,10 +907,7 @@ public class TreeSpawner : MonoBehaviour
     /// <summary>Без проверки расстояния — только чтобы лес не оставался пустым.</summary>
     bool TryPlaceTreeForceAnywhere()
     {
-        if (treePrefabs == null || treePrefabs.Length == 0)
-            return false;
-
-        GameObject prefab = treePrefabs[Random.Range(0, treePrefabs.Length)];
+        GameObject prefab = PickTreePrefab();
         if (prefab == null)
             return false;
 
@@ -607,7 +933,19 @@ public class TreeSpawner : MonoBehaviour
 
     void SpawnTreeAt(Vector3 pos, GameObject prefab)
     {
+        // Source template мог быть inactive (срубили scene-prefab) — клон тоже inactive.
+        bool wasActive = prefab.activeSelf;
+        if (!wasActive)
+            prefab.SetActive(true);
+
         GameObject spawned = Instantiate(prefab, pos, Quaternion.identity, transform);
+        if (!wasActive)
+            prefab.SetActive(false);
+
+        if (spawned == null)
+            return;
+
+        spawned.SetActive(true);
         PrepareChoppableTree(spawned);
         trees.Add(spawned);
     }
@@ -744,7 +1082,7 @@ public class TreeSpawner : MonoBehaviour
                 if (IsTooClose(pos, minDistance))
                     continue;
 
-                GameObject prefab = treePrefabs[Random.Range(0, treePrefabs.Length)];
+                GameObject prefab = PickTreePrefab();
                 if (prefab == null)
                     continue;
 
@@ -758,7 +1096,7 @@ public class TreeSpawner : MonoBehaviour
             {
                 Vector2 ring = Random.insideUnitCircle * radius;
                 Vector3 pos = new Vector3(worldPos.x + ring.x, groundY, worldPos.z + ring.y);
-                GameObject prefab = treePrefabs[Random.Range(0, treePrefabs.Length)];
+                GameObject prefab = PickTreePrefab();
                 if (prefab != null)
                 {
                     SpawnTreeAt(pos, prefab);

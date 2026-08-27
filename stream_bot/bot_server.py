@@ -76,6 +76,11 @@ def create_app(bot) -> FastAPI:
         """Убрать debug/test пользователей; на сцене только Twitch chat."""
         return bot.prune_roster()
 
+    @app.post("/roster/prune_inactive")
+    def roster_prune_inactive() -> Dict[str, Any]:
+        """Скрыть из мира неактивных 48ч (в БД остаются)."""
+        return bot.prune_inactive_players(force=True)
+
     @app.post("/stats/event")
     def stats_event(body: StatsEventBody) -> Dict[str, Any]:
         user = (body.username or "").strip()

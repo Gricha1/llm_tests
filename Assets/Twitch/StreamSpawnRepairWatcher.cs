@@ -3,30 +3,60 @@ using System.IO;
 using UnityEngine;
 
 /// <summary>
-/// Внешний watchdog (watch_stream_spawn_repair.py) пишет флаг → Unity
-/// форсирует ResetTrees/ResetSheep без полного #reset эпизода.
+/// Внешний watchdog (watch_stream_spawn_repair.py) / UI «Починить спавн»
+/// пишет флаг → Unity форсирует ResetTrees/ResetSheep без полного #reset эпизода.
 /// </summary>
 public sealed class StreamSpawnRepairWatcher : MonoBehaviour
 {
+    public const string RepairBuildId = "repair_v2_20260821_force";
     const string FlagFileName = ".forest_repair_spawners";
     const string ResultFileName = ".forest_repair_spawners_result";
-    const float PollSeconds = 2f;
-    const float CooldownSeconds = 20f;
+    const float PollSeconds = 1f;
+    const float CooldownSeconds = 8f;
 
     static StreamSpawnRepairWatcher _instance;
     float _nextPollUnscaled;
     float _lastRepairUnscaled = -999f;
+    float _nextHeartbeatUnscaled;
 
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
     static void Bootstrap()
     {
-        if (!TrainingEnvSpace.ShouldRunPresentationOnlyServices())
+        if (!ShouldEnable())
             return;
+        EnsureInstance();
+    }
+
+    static bool ShouldEnable()
+    {
+        if (TrainingEnvSpace.IsStreamOnlyMode)
+            return true;
+        if (TrainingEnvSpace.IsPresentationFullTrainWorker
+            && TrainingEnvSpace.IsTrainAllHeadlessRequested())
+            return false;
+        if (TrainingEnvSpace.IsPresentationFullTrainWorker)
+            return true;
+        if (TrainingEnvSpace.IsHeadlessTrainWorkerProcess)
+            return false;
+        return TrainingEnvSpace.ShouldRunPresentationOnlyServices()
+            || TrainingEnvSpace.IsValidateOrInferenceMode;
+    }
+
+    static void EnsureInstance()
+    {
         if (_instance != null)
             return;
         var go = new GameObject(nameof(StreamSpawnRepairWatcher));
         DontDestroyOnLoad(go);
-        go.AddComponent<StreamSpawnRepairWatcher>();
+        _instance = go.AddComponent<StreamSpawnRepairWatcher>();
+    }
+
+    /// <summary>Вызывается из snapshot-logger, если Bootstrap не сработал.</summary>
+    public static void EnsureAlive()
+    {
+        if (!ShouldEnable())
+            return;
+        EnsureInstance();
     }
 
     void Awake()
@@ -38,26 +68,44 @@ public sealed class StreamSpawnRepairWatcher : MonoBehaviour
         }
         _instance = this;
         DontDestroyOnLoad(gameObject);
-        _nextPollUnscaled = Time.unscaledTime + 1f;
+        _nextPollUnscaled = Time.unscaledTime + 0.5f;
+        _nextHeartbeatUnscaled = Time.unscaledTime + 5f;
+        Debug.Log($"[SpawnRepair] watcher online flag={ResolveFlagPath()}");
+        PresentationWorldSnapshotLogger.Note("spawn_repair_watcher", $"online flag={ResolveFlagPath()}");
     }
 
     void Update()
     {
-        if (Time.unscaledTime < _nextPollUnscaled)
+        if (_instance != this)
             return;
-        _nextPollUnscaled = Time.unscaledTime + PollSeconds;
+
+        float now = Time.unscaledTime;
+        if (now >= _nextHeartbeatUnscaled)
+        {
+            _nextHeartbeatUnscaled = now + 60f;
+            PresentationWorldSnapshotLogger.Note(
+                "spawn_repair_hb",
+                $"flag_exists={File.Exists(ResolveFlagPath())} path={ResolveFlagPath()}");
+        }
+
+        if (now < _nextPollUnscaled)
+            return;
+        _nextPollUnscaled = now + PollSeconds;
         TryConsumeFlag();
     }
 
     void TryConsumeFlag()
     {
-        string flag = ResolveFlagPath();
-        if (string.IsNullOrEmpty(flag) || !File.Exists(flag))
+        string flag = FindExistingFlagPath();
+        if (string.IsNullOrEmpty(flag))
             return;
 
         float now = Time.unscaledTime;
         if (now - _lastRepairUnscaled < CooldownSeconds)
+        {
+            WriteResult($"cooldown remaining={CooldownSeconds - (now - _lastRepairUnscaled):0.0}s flag={flag}");
             return;
+        }
 
         string reason = "flag";
         try
@@ -71,14 +119,18 @@ public sealed class StreamSpawnRepairWatcher : MonoBehaviour
             // ignore
         }
 
-        try
+        // Снести все копии флага (repo root / cwd / results).
+        foreach (var p in CandidateFlagPaths())
         {
-            File.Delete(flag);
-        }
-        catch (Exception e)
-        {
-            Debug.LogWarning($"[SpawnRepair] cannot delete flag: {e.Message}");
-            return;
+            try
+            {
+                if (!string.IsNullOrEmpty(p) && File.Exists(p))
+                    File.Delete(p);
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning($"[SpawnRepair] cannot delete {p}: {e.Message}");
+            }
         }
 
         _lastRepairUnscaled = now;
@@ -97,28 +149,33 @@ public sealed class StreamSpawnRepairWatcher : MonoBehaviour
         if (!envRoot.gameObject.activeSelf)
             envRoot.gameObject.SetActive(true);
 
-        // Только спавнеры — без ForceFullEpisodeRestart (стрим не дёргаем целиком).
         PresentationWorldReset.ResetSpawners(envRoot, force: true);
 
-        // Доп. попытки, если лес/овцы всё ещё пустые.
         var trees = envRoot.GetComponentInChildren<TreeSpawner>(true);
         var sheep = envRoot.GetComponentInChildren<SheepSpawner>(true);
-        for (int i = 0; i < 2; i++)
+        // Если ResetTrees ушёл в early-return из‑за _resetInProgress — форсим ещё раз.
+        if (trees != null && trees.TargetCount > 0 && trees.AliveCount == 0)
+            trees.ForceResetTrees();
+        for (int i = 0; i < 4; i++)
         {
             bool needTrees = trees != null && trees.TargetCount > 0
-                && trees.AliveCount < Mathf.Max(1, trees.TargetCount / 3);
+                && trees.AliveCount < Mathf.Max(1, Mathf.RoundToInt(trees.TargetCount * 0.55f));
             bool needSheep = sheep != null && sheep.TargetCount > 0
                 && sheep.AliveCount < Mathf.Max(1, sheep.TargetCount / 3);
             if (!needTrees && !needSheep)
                 break;
             if (needTrees)
-                trees.ResetTrees();
+                trees.ForceResetTrees();
             if (needSheep)
                 sheep.ResetSheep();
         }
 
         string after = PresentationWorldReset.DescribeState(envRoot);
-        return $"ok reason={Sanitize(reason)} {after}";
+        string health = trees != null ? trees.DescribePrefabHealth() : "no_trees";
+        int alive = trees != null ? trees.AliveCount : -1;
+        if (trees != null && trees.TargetCount > 0 && alive == 0)
+            return $"FAILTREE build={RepairBuildId} alive={alive} reason={Sanitize(reason)} {after} | {health}";
+        return $"OKTREE build={RepairBuildId} alive={alive} reason={Sanitize(reason)} {after} | {health}";
     }
 
     static string Sanitize(string s)
@@ -144,31 +201,88 @@ public sealed class StreamSpawnRepairWatcher : MonoBehaviour
         }
     }
 
-    public static string ResolveFlagPath()
+    static string FindExistingFlagPath()
     {
-        string results = TryResolveResultsDir();
-        if (!string.IsNullOrEmpty(results))
+        foreach (var p in CandidateFlagPaths())
         {
             try
             {
-                // results/run_X → repo root
-                string root = Path.GetFullPath(Path.Combine(results, "..", ".."));
-                return Path.Combine(root, FlagFileName);
+                if (!string.IsNullOrEmpty(p) && File.Exists(p))
+                    return p;
             }
             catch
             {
-                // fall through
+                // ignore
             }
+        }
+        return null;
+    }
+
+    static string[] CandidateFlagPaths()
+    {
+        var list = new System.Collections.Generic.List<string>(8);
+        void Add(string p)
+        {
+            if (string.IsNullOrEmpty(p))
+                return;
+            try
+            {
+                p = Path.GetFullPath(p);
+            }
+            catch
+            {
+                return;
+            }
+            if (!list.Contains(p))
+                list.Add(p);
+        }
+
+        string results = TryResolveResultsDir();
+        if (!string.IsNullOrEmpty(results))
+        {
+            // results/run_X → repo root
+            Add(Path.Combine(results, "..", "..", FlagFileName));
+            // на всякий случай рядом с run
+            Add(Path.Combine(results, FlagFileName));
+            Add(Path.Combine(results, "..", FlagFileName));
         }
 
         try
         {
-            return Path.GetFullPath(Path.Combine(Application.dataPath, "..", "..", FlagFileName));
+            Add(Path.Combine(Directory.GetCurrentDirectory(), FlagFileName));
         }
         catch
         {
-            return Path.Combine(Application.persistentDataPath, FlagFileName);
+            // ignore
         }
+
+        try
+        {
+            // build_versions/<name>_Data → repo root
+            Add(Path.Combine(Application.dataPath, "..", "..", FlagFileName));
+            Add(Path.Combine(Application.dataPath, "..", FlagFileName));
+        }
+        catch
+        {
+            // ignore
+        }
+
+        try
+        {
+            Add(Path.Combine(Application.persistentDataPath, FlagFileName));
+        }
+        catch
+        {
+            // ignore
+        }
+
+        return list.ToArray();
+    }
+
+    public static string ResolveFlagPath()
+    {
+        var all = CandidateFlagPaths();
+        return all.Length > 0 ? all[0] : FlagFileName;
     }
 
     static string ResolveResultPath()

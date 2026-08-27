@@ -30,7 +30,10 @@ public static class PresentationWorldReset
         var sheepSpawner = envRoot.GetComponentInChildren<SheepSpawner>(true);
         var flowerSpawner = envRoot.GetComponentInChildren<FlowerSpawner>(true);
 
-        treeSpawner?.ResetTrees();
+        if (force)
+            treeSpawner?.ForceResetTrees();
+        else
+            treeSpawner?.ResetTrees();
         sheepSpawner?.ResetSheep();
         flowerSpawner?.ResetFlowers();
 
@@ -55,6 +58,8 @@ public static class PresentationWorldReset
         PresentationWorldSnapshotLogger.LogEvent(
             "reset_spawners",
             $"force={force} {DescribeState(envRoot)}");
+
+        StreamingSurvivalController.Instance?.RespawnDeadFollowersAtEpisodeEnd();
     }
 
     static void VerifyAndRetry(TreeSpawner trees, SheepSpawner sheep)
@@ -72,7 +77,7 @@ public static class PresentationWorldReset
                 Debug.LogWarning(
                     $"[PresentationWorldReset] деревьев мало ({alive}/{target}), " +
                     $"повторный спавн {attempt + 1}/3");
-                trees.ResetTrees();
+                trees.ForceResetTrees();
             }
 
             if (trees.AliveCount < need)
@@ -112,7 +117,8 @@ public static class PresentationWorldReset
         string jackState = jack != null
             ? $"hp={jack.hp} wood={jack.wood} satiety={jack.satiety} heat={jack.heat}"
             : "нет";
+        string treeHealth = trees != null ? trees.DescribePrefabHealth() : "no_trees";
 
-        return $"env={envRoot.name} trees={treeN}/{treeT} sheep={sheepN}/{sheepT} jack={jackState}";
+        return $"env={envRoot.name} trees={treeN}/{treeT} sheep={sheepN}/{sheepT} jack={jackState} {treeHealth}";
     }
 }

@@ -14,7 +14,7 @@ public sealed class PresentationWorldSnapshotLogger : MonoBehaviour
 {
     const string FileName = "stream_world_snapshot.log";
     const string LiveJsonName = "stream_world_live.json";
-    const float IntervalSeconds = 10f;
+    const float IntervalSeconds = 5f;
     const float CountDropWarnFraction = 0.5f;
 
     static PresentationWorldSnapshotLogger _instance;
@@ -45,6 +45,9 @@ public sealed class PresentationWorldSnapshotLogger : MonoBehaviour
     static string _lastRoundAt = "";
     static int _episodeIndex; // 1-based текущий эпизод с момента старта процесса
     static int _lastRoundEpisode;
+
+    /// <summary>Текущий номер эпизода (1-based) для журналов фолловеров.</summary>
+    public static int CurrentEpisodeIndex => Mathf.Max(1, _episodeIndex);
 
     // Статичные ориентиры карты (дом / озеро / забор / камни) — кэш на процесс.
     static Landmarks _landmarksCache;
@@ -83,10 +86,17 @@ public sealed class PresentationWorldSnapshotLogger : MonoBehaviour
 
     static bool ShouldEnable()
     {
+        if (TrainingEnvSpace.IsStreamOnlyMode)
+            return true;
+        // Joint all-headless: train worker 0 не пишет snapshots (stream — отдельный процесс).
+        if (TrainingEnvSpace.IsPresentationFullTrainWorker
+            && TrainingEnvSpace.IsTrainAllHeadlessRequested())
+            return false;
+        if (TrainingEnvSpace.IsPresentationFullTrainWorker)
+            return true;
         if (TrainingEnvSpace.IsHeadlessTrainWorkerProcess)
             return false;
         return TrainingEnvSpace.ShouldRunPresentationOnlyServices()
-            || TrainingEnvSpace.IsStreamOnlyMode
             || TrainingEnvSpace.IsValidateOrInferenceMode;
     }
 
@@ -102,6 +112,8 @@ public sealed class PresentationWorldSnapshotLogger : MonoBehaviour
         DontDestroyOnLoad(gameObject);
         _nextSnapshotUnscaled = Time.unscaledTime + 2f;
         LogEvent("logger_start", $"path={ResolveLogPath()}");
+        // Гарантируем SpawnRepair watcher (тот же gate, что и logger).
+        StreamSpawnRepairWatcher.EnsureAlive();
     }
 
     void OnDestroy()
@@ -237,20 +249,34 @@ public sealed class PresentationWorldSnapshotLogger : MonoBehaviour
         var sheep = env.GetComponentsInChildren<SheepWander>(true);
         var sheepPts = new List<Vector2>(16);
         int sheepN = 0;
+        // Отсекаем сирот далеко от поляны (карта/SNAP не раздуваются точкой на x≈-200).
+        Vector3 sheepCenter = sheepSpawner != null ? sheepSpawner.SpawnCenterWorld : default;
+        float sheepMaxR = 28f;
+        float sheepMaxR2 = sheepMaxR * sheepMaxR;
         sb.Append("\n  sheep=");
         if (sheep != null)
         {
             for (int i = 0; i < sheep.Length; i++)
             {
                 var s = sheep[i];
-                if (s == null || !s.gameObject.activeSelf)
+                if (s == null || !s.gameObject.activeSelf || !s.enabled)
                     continue;
+                if (s.GetComponentInParent<ViewerSimpleAgent>() != null)
+                    continue;
+                Vector3 sp = s.transform.position;
+                if (sheepSpawner != null)
+                {
+                    float dx = sp.x - sheepCenter.x;
+                    float dz = sp.z - sheepCenter.z;
+                    if (dx * dx + dz * dz > sheepMaxR2)
+                        continue;
+                }
                 if (sheepN == 0)
                     sb.Append('[');
                 else
                     sb.Append(' ');
-                AppendXz(sb, s.transform.position);
-                sheepPts.Add(new Vector2(s.transform.position.x, s.transform.position.z));
+                AppendXz(sb, sp);
+                sheepPts.Add(new Vector2(sp.x, sp.z));
                 sheepN++;
             }
         }
@@ -266,6 +292,8 @@ public sealed class PresentationWorldSnapshotLogger : MonoBehaviour
 
         var zombies = env.GetComponentsInChildren<ZombieHealth>(true);
         var zombiePts = new List<Vector2>(16);
+        var zombieChases = new List<LiveZombieChase>(16);
+        var zombiePool = new List<LiveChaseCandidate>(32);
         int zN = 0;
         sb.Append("\n  zombies=");
         if (zombies != null)
@@ -291,6 +319,8 @@ public sealed class PresentationWorldSnapshotLogger : MonoBehaviour
             sb.Append(']');
         sb.Append(" n=").Append(zN);
 
+        CollectZombieChaseDiagnostics(env, sb, zombieChases, zombiePool);
+
         string hud = RewardDisplay.DescribeHudHealth();
         sb.Append("\n  hud_reward ").Append(hud);
         if (CountHudRole(hud, "jack") > 1 || CountHudRole(hud, "lily") > 1
@@ -302,8 +332,10 @@ public sealed class PresentationWorldSnapshotLogger : MonoBehaviour
 
         var landmarks = EnsureLandmarks(env);
         AppendLandmarks(sb, landmarks);
+        AppendFollowerWolfDiagnostics(sb);
 
         AppendLine(sb.ToString());
+        FollowerEpisodeJournal.SnapshotAll(epForHeader);
 
         int jackWater = jack != null ? jack.water : -1;
         int jackWood = jack != null ? jack.wood : -1;
@@ -317,7 +349,10 @@ public sealed class PresentationWorldSnapshotLogger : MonoBehaviour
             _instance.MaybeWarnCountDrop("sheep", ref _instance._prevSheep, sheepN);
             _instance.MaybeWarnCountDrop("zombies", ref _instance._prevZombies, zN);
             if (isReset)
+            {
+                StreamingSurvivalController.Instance?.ResetAllWolfEpisodeDiagnostics();
                 _instance.BeginEpisodeRound(jackWater, jackWood, lilyWater, georgeWater, georgeWood, treeN, sheepN);
+            }
             else
                 _instance.AccumulateEpisode(jackWater, jackWood, lilyWater, georgeWater, georgeWood, treeN, sheepN);
         }
@@ -336,6 +371,8 @@ public sealed class PresentationWorldSnapshotLogger : MonoBehaviour
             trees = treePts,
             sheep = sheepPts,
             zombies = zombiePts,
+            zombie_chases = zombieChases,
+            zombie_pool = zombiePool,
             landmarks = landmarks,
             jack = MakeAgentLive("Jack", jack != null ? jack.transform : null, jackWater, jackWood, jack != null ? jack.hp : -1, jack != null && jack.IsInDeathState),
             lily = MakeAgentLive("Lily", lily != null ? lily.transform : null, lilyWater, -1, lily != null ? lily.Hp : -1, lily != null && lily.IsInDeathState),
@@ -353,12 +390,29 @@ public sealed class PresentationWorldSnapshotLogger : MonoBehaviour
         public bool dead;
     }
 
+    struct LiveChaseCandidate
+    {
+        public string kind, name, status;
+        public float x, z, dist;
+    }
+
+    struct LiveZombieChase
+    {
+        public float x, z;
+        public string target_kind, target_name;
+        public float target_x, target_z, target_dist;
+        public bool has_target;
+        public List<LiveChaseCandidate> pool;
+    }
+
     struct LiveSnapshot
     {
         public string reason, env;
         public float t, ut;
         public int trees_n, trees_target, sheep_n, sheep_target, zombies_n;
         public List<Vector2> trees, sheep, zombies;
+        public List<LiveZombieChase> zombie_chases;
+        public List<LiveChaseCandidate> zombie_pool;
         public Landmarks landmarks;
         public LiveAgent jack, lily, george;
     }
@@ -386,12 +440,14 @@ public sealed class PresentationWorldSnapshotLogger : MonoBehaviour
         _lastRoundAt = Stamp();
         _lastRoundEpisode = Mathf.Max(1, _episodeIndex);
         _epActive = false;
+        FollowerEpisodeJournal.OnEpisodeEnd(_lastRoundEpisode);
     }
 
     void BeginEpisodeRound(int jW, int jWood, int lW, int gW, int gWood, int trees, int sheep)
     {
         _episodeIndex = Mathf.Max(0, _episodeIndex) + 1;
         _epActive = true;
+        FollowerEpisodeJournal.OnEpisodeBegin(_episodeIndex);
         _epWaterGained = 0;
         _epWoodGained = 0;
         _epSheepKilled = 0;
@@ -480,10 +536,13 @@ public sealed class PresentationWorldSnapshotLogger : MonoBehaviour
                 AppendPtsJson(sb, "trees", s.trees);
                 AppendPtsJson(sb, "sheep", s.sheep);
                 AppendPtsJson(sb, "zombies", s.zombies);
+                AppendZombieChasesJson(sb, s.zombie_chases);
+                AppendZombiePoolJson(sb, s.zombie_pool);
                 AppendLandmarksJson(sb, s.landmarks);
                 AppendAgentJson(sb, "jack", s.jack);
                 AppendAgentJson(sb, "lily", s.lily);
                 AppendAgentJson(sb, "george", s.george);
+                AppendFollowersJson(sb);
             }
             sb.Append('}');
 
@@ -589,7 +648,7 @@ public sealed class PresentationWorldSnapshotLogger : MonoBehaviour
                     sx = Mathf.Max(2f, b.size.x);
                     sz = Mathf.Max(2f, b.size.z);
                 }
-                lm.lakes.Add(new RectXZ(p.x, p.z, sx, sz));
+                AddLakeDeduped(lm.lakes, p.x, p.z, sx, sz);
             }
         }
         if (lm.lakes.Count == 0)
@@ -607,7 +666,7 @@ public sealed class PresentationWorldSnapshotLogger : MonoBehaviour
                     sx = Mathf.Max(4f, b.size.x);
                     sz = Mathf.Max(4f, b.size.z);
                 }
-                lm.lakes.Add(new RectXZ(p.x, p.z, sx, sz));
+                AddLakeDeduped(lm.lakes, p.x, p.z, sx, sz);
             }
         }
 
@@ -688,6 +747,33 @@ public sealed class PresentationWorldSnapshotLogger : MonoBehaviour
         }
 
         return lm;
+    }
+
+    /// <summary>
+    /// Несколько WaterSource могут сидеть на одном северном озере (GoalWater3 + marker).
+    /// На карте UI это выглядит как два «озера» почти в одной точке.
+    /// </summary>
+    static void AddLakeDeduped(List<RectXZ> lakes, float x, float z, float sx, float sz)
+    {
+        if (lakes == null) return;
+        const float mergeDist = 8f;
+        for (int i = 0; i < lakes.Count; i++)
+        {
+            var cur = lakes[i];
+            float dx = cur.x - x;
+            float dz = cur.z - z;
+            if (dx * dx + dz * dz > mergeDist * mergeDist) continue;
+            // оставляем больший bounds, центр — средневзвешенный
+            float a = Mathf.Max(0.01f, cur.sx * cur.sz);
+            float b = Mathf.Max(0.01f, sx * sz);
+            float nx = (cur.x * a + x * b) / (a + b);
+            float nz = (cur.z * a + z * b) / (a + b);
+            float nsx = Mathf.Max(cur.sx, sx);
+            float nsz = Mathf.Max(cur.sz, sz);
+            lakes[i] = new RectXZ(nx, nz, nsx, nsz);
+            return;
+        }
+        lakes.Add(new RectXZ(x, z, sx, sz));
     }
 
     static void AppendLandmarks(StringBuilder sb, Landmarks lm)
@@ -830,6 +916,275 @@ public sealed class PresentationWorldSnapshotLogger : MonoBehaviour
         prev = now;
     }
 
+    static void AppendFollowerWolfDiagnostics(StringBuilder sb)
+    {
+        var ctrl = StreamingSurvivalController.Instance;
+        if (ctrl == null || ctrl.PlayerCount <= 0)
+        {
+            sb.Append("\n  followers_wolf=[]");
+            return;
+        }
+
+        sb.Append("\n  followers_wolf=[");
+        bool first = true;
+        ctrl.ForEachPlayer(p =>
+        {
+            if (p == null || !p.IsWolfSkin) return;
+            if (!first) sb.Append(' ');
+            first = false;
+            sb.Append(p.Username ?? "?");
+            sb.Append("{hits=").Append(p.WolfHitsThisEpisode);
+            sb.Append(" cd_stuck=").Append(p.WolfCdStuckThisEpisode ? 1 : 0);
+            sb.Append(" stuck_n=").Append(p.WolfCdStuckCount);
+            sb.Append(" cd_left=").Append(p.WolfCdLeftPublic.ToString("0.0"));
+            sb.Append(" action=").Append(p.Action ?? "");
+            sb.Append('}');
+        });
+        if (first)
+            sb.Append(']');
+        else
+            sb.Append(']');
+    }
+
+    static void CollectZombieChaseDiagnostics(
+        Transform env,
+        StringBuilder sb,
+        List<LiveZombieChase> chasesOut,
+        List<LiveChaseCandidate> poolOut)
+    {
+        var chaseList = new List<ZombieChase.ChaseCandidate>(32);
+        ZombieChase.CollectChaseCandidatesFrom(
+            env != null ? env.position : Vector3.zero,
+            env,
+            chaseList);
+
+        sb.Append("\n  zombie_pool=[");
+        for (int i = 0; i < chaseList.Count; i++)
+        {
+            var c = chaseList[i];
+            if (i > 0) sb.Append(' ');
+            sb.Append(c.kind).Append(':').Append(c.name ?? "?");
+            sb.Append('{').Append(c.status ?? "?");
+            sb.Append(" d=").Append(c.dist.ToString("0.0"));
+            sb.Append(" @");
+            AppendXz(sb, new Vector3(c.x, 0f, c.z));
+            sb.Append('}');
+            poolOut.Add(new LiveChaseCandidate
+            {
+                kind = c.kind,
+                name = c.name,
+                status = c.status,
+                x = c.x,
+                z = c.z,
+                dist = c.dist,
+            });
+        }
+        sb.Append(']');
+        sb.Append(" n=").Append(chaseList.Count);
+
+        int followersOk = 0;
+        int followersSkip = 0;
+        for (int i = 0; i < chaseList.Count; i++)
+        {
+            if (chaseList[i].kind != "follower") continue;
+            if (chaseList[i].status == "ok") followersOk++;
+            else followersSkip++;
+        }
+        sb.Append(" followers_ok=").Append(followersOk)
+            .Append(" followers_skip=").Append(followersSkip);
+
+        var chases = env != null
+            ? env.GetComponentsInChildren<ZombieChase>(true)
+            : UnityEngine.Object.FindObjectsByType<ZombieChase>(FindObjectsInactive.Exclude, FindObjectsSortMode.None);
+
+        sb.Append("\n  zombie_chases=[");
+        int n = 0;
+        if (chases != null)
+        {
+            for (int i = 0; i < chases.Length; i++)
+            {
+                var zc = chases[i];
+                if (zc == null || !zc.gameObject.activeInHierarchy)
+                    continue;
+
+                // Принудительно обновить цель прямо перед SNAP (не ждать Update).
+                var picked = zc.PickClosestTargetPublic();
+                zc.RememberChaseTarget(picked);
+
+                var per = new List<ZombieChase.ChaseCandidate>(16);
+                zc.CollectChaseCandidates(per);
+
+                if (n > 0) sb.Append(' ');
+                sb.Append('z');
+                AppendXz(sb, zc.transform.position);
+                sb.Append("->");
+                if (picked == null)
+                {
+                    sb.Append("NONE");
+                }
+                else
+                {
+                    sb.Append(zc.LastChaseTargetKind).Append(':').Append(zc.LastChaseTargetName);
+                    sb.Append(" d=").Append(zc.LastChaseTargetDist.ToString("0.0"));
+                }
+                sb.Append(" pool=");
+                for (int j = 0; j < per.Count; j++)
+                {
+                    if (j > 0) sb.Append(',');
+                    var c = per[j];
+                    sb.Append(c.kind).Append(':').Append(c.name ?? "?")
+                        .Append('=').Append(c.status ?? "?")
+                        .Append('@').Append(c.dist.ToString("0.0"));
+                }
+
+                var live = new LiveZombieChase
+                {
+                    x = zc.transform.position.x,
+                    z = zc.transform.position.z,
+                    has_target = picked != null,
+                    target_kind = zc.LastChaseTargetKind ?? "",
+                    target_name = zc.LastChaseTargetName ?? "",
+                    target_dist = zc.LastChaseTargetDist,
+                    pool = new List<LiveChaseCandidate>(per.Count),
+                };
+                if (picked != null)
+                {
+                    live.target_x = picked.position.x;
+                    live.target_z = picked.position.z;
+                }
+                for (int j = 0; j < per.Count; j++)
+                {
+                    var c = per[j];
+                    live.pool.Add(new LiveChaseCandidate
+                    {
+                        kind = c.kind,
+                        name = c.name,
+                        status = c.status,
+                        x = c.x,
+                        z = c.z,
+                        dist = c.dist,
+                    });
+                }
+                chasesOut.Add(live);
+                n++;
+            }
+        }
+        sb.Append(']');
+        sb.Append(" n=").Append(n);
+
+        Debug.Log(
+            $"[SNAP] zombie_targets pool={chaseList.Count} followers_ok={followersOk} " +
+            $"followers_skip={followersSkip} chases={n}");
+    }
+
+    static void AppendZombieChasesJson(StringBuilder sb, List<LiveZombieChase> chases)
+    {
+        sb.Append(",\"zombie_chases\":[");
+        if (chases != null)
+        {
+            for (int i = 0; i < chases.Count; i++)
+            {
+                if (i > 0) sb.Append(',');
+                var z = chases[i];
+                sb.Append('{');
+                sb.Append("\"x\":").Append(z.x.ToString("0.##", CultureInfo.InvariantCulture));
+                sb.Append(",\"z\":").Append(z.z.ToString("0.##", CultureInfo.InvariantCulture));
+                sb.Append(",\"has_target\":").Append(z.has_target ? "true" : "false");
+                sb.Append(",\"target_kind\":\"").Append(EscapeJson(z.target_kind)).Append('"');
+                sb.Append(",\"target_name\":\"").Append(EscapeJson(z.target_name)).Append('"');
+                sb.Append(",\"target_dist\":").Append(z.target_dist.ToString("0.##", CultureInfo.InvariantCulture));
+                if (z.has_target)
+                {
+                    sb.Append(",\"target_x\":").Append(z.target_x.ToString("0.##", CultureInfo.InvariantCulture));
+                    sb.Append(",\"target_z\":").Append(z.target_z.ToString("0.##", CultureInfo.InvariantCulture));
+                }
+                sb.Append(",\"pool\":[");
+                if (z.pool != null)
+                {
+                    for (int j = 0; j < z.pool.Count; j++)
+                    {
+                        if (j > 0) sb.Append(',');
+                        AppendChaseCandidateJson(sb, z.pool[j]);
+                    }
+                }
+                sb.Append("]}");
+            }
+        }
+        sb.Append(']');
+    }
+
+    static void AppendZombiePoolJson(StringBuilder sb, List<LiveChaseCandidate> pool)
+    {
+        sb.Append(",\"zombie_pool\":[");
+        if (pool != null)
+        {
+            for (int i = 0; i < pool.Count; i++)
+            {
+                if (i > 0) sb.Append(',');
+                AppendChaseCandidateJson(sb, pool[i]);
+            }
+        }
+        sb.Append(']');
+    }
+
+    static void AppendChaseCandidateJson(StringBuilder sb, LiveChaseCandidate c)
+    {
+        sb.Append('{');
+        sb.Append("\"kind\":\"").Append(EscapeJson(c.kind)).Append('"');
+        sb.Append(",\"name\":\"").Append(EscapeJson(c.name)).Append('"');
+        sb.Append(",\"status\":\"").Append(EscapeJson(c.status)).Append('"');
+        sb.Append(",\"x\":").Append(c.x.ToString("0.##", CultureInfo.InvariantCulture));
+        sb.Append(",\"z\":").Append(c.z.ToString("0.##", CultureInfo.InvariantCulture));
+        sb.Append(",\"dist\":").Append(c.dist.ToString("0.##", CultureInfo.InvariantCulture));
+        sb.Append('}');
+    }
+
+    static void AppendFollowersJson(StringBuilder sb)
+    {
+        sb.Append(",\"followers\":[");
+        var ctrl = StreamingSurvivalController.Instance;
+        var found = ZombieChase.GetCachedFollowers();
+        bool first = true;
+
+        void WriteOne(StreamingSurvivalPlayer p)
+        {
+            if (p == null) return;
+            if (!first) sb.Append(',');
+            first = false;
+            var envRoot = TrainingEnvSpace.FindRoot(p.transform)
+                ?? TrainingEnvSpace.PresentationRoot;
+            string chaseStatus = ZombieChase.FollowerChaseStatus(p, envRoot);
+            sb.Append('{');
+            sb.Append("\"user\":\"").Append(EscapeJson(p.Username ?? "")).Append('"');
+            sb.Append(",\"skin\":\"").Append(p.IsWolfSkin ? "wolf" : "human").Append('"');
+            sb.Append(",\"action\":\"").Append(EscapeJson(p.Action ?? "")).Append('"');
+            sb.Append(",\"x\":").Append(p.transform.position.x.ToString("0.##", CultureInfo.InvariantCulture));
+            sb.Append(",\"z\":").Append(p.transform.position.z.ToString("0.##", CultureInfo.InvariantCulture));
+            sb.Append(",\"hp\":").Append(p.Hp);
+            sb.Append(",\"max_hp\":").Append(p.MaxHp);
+            sb.Append(",\"zombie_hits\":").Append(p.ZombieHitsTaken);
+            sb.Append(",\"dead\":").Append(p.IsDeadToZombies ? "true" : "false");
+            sb.Append(",\"chase_status\":\"").Append(EscapeJson(chaseStatus)).Append('"');
+            sb.Append(",\"wolf_hits\":").Append(p.WolfHitsThisEpisode);
+            sb.Append(",\"wolf_cd_stuck\":").Append(p.WolfCdStuckThisEpisode ? "true" : "false");
+            sb.Append(",\"wolf_cd_stuck_n\":").Append(p.WolfCdStuckCount);
+            sb.Append(",\"wolf_cd_left\":").Append(p.WolfCdLeftPublic.ToString("0.##", CultureInfo.InvariantCulture));
+            sb.Append('}');
+        }
+
+        if (found != null && found.Length > 0)
+        {
+            for (int i = 0; i < found.Length; i++)
+                WriteOne(found[i]);
+        }
+        else if (ctrl != null)
+        {
+            ctrl.ForEachPlayer(WriteOne);
+        }
+
+        sb.Append(']');
+    }
+
     static int CountHudRole(string hud, string role)
     {
         string key = role + "=";
@@ -962,6 +1317,22 @@ public sealed class PresentationWorldSnapshotLogger : MonoBehaviour
         string dir = Path.GetDirectoryName(log);
         _liveJsonPath = Path.Combine(dir ?? "", LiveJsonName);
         return _liveJsonPath;
+    }
+
+    /// <summary>Папка results (FOREST_RESULTS_DIR / -forestResultsDir) для других журналов.</summary>
+    public static string GetResultsDirectory()
+    {
+        string dir = ResolveResultsDir();
+        if (!string.IsNullOrEmpty(dir))
+            return dir;
+        try
+        {
+            return Path.GetFullPath(Path.Combine(Application.dataPath, "..", "results"));
+        }
+        catch
+        {
+            return Application.persistentDataPath;
+        }
     }
 
     static string ResolveResultsDir()

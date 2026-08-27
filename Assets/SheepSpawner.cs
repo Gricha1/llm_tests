@@ -13,7 +13,8 @@ public class SheepSpawner : MonoBehaviour
     [SerializeField] private float y = -5.515023f;
     [SerializeField] private float minDistance = 1.5f;
     [SerializeField] private float respawnInterval = 2f; // секунд между попытками доп. спавна
-    [SerializeField] private float maxDistanceFromSpawn = 12f; // овца возвращается в зону, если ушла дальше
+    // 9 м: видно бродят по поляне; 12 м уводило за западный забор.
+    [SerializeField] private float maxDistanceFromSpawn = 9f;
 
     // Область спавна (local Env, поляна у домика)
     private readonly float minX = 1.43f;
@@ -45,6 +46,7 @@ public class SheepSpawner : MonoBehaviour
     {
         nextRespawnTime = Time.time + respawnInterval;
         RemoveDestroyedSheep();
+        DestroyOrphanSheepInEnv();
         if (sheeps.Count == 0)
             SpawnSheep();
     }
@@ -67,6 +69,7 @@ public class SheepSpawner : MonoBehaviour
 
     private void TryFillSpawnSlots()
     {
+        DestroyOrphanSheepInEnv();
         int guard = sheepCount * 2;
         while (sheeps.Count < sheepCount && guard-- > 0)
         {
@@ -78,6 +81,86 @@ public class SheepSpawner : MonoBehaviour
     private void RemoveDestroyedSheep()
     {
         sheeps.RemoveAll(s => !IsAlive(s));
+    }
+
+    /// <summary>
+    /// Овцы с SheepWander под Env, но не в <see cref="sheeps"/> (после сдвига Env /
+    /// неудачного Clear). Их ResetSheep раньше не трогал — кочевали на x≈-200.
+    /// Зрителей-овечек (ViewerSimpleAgent) и scene-template prefab не трогаем.
+    /// </summary>
+    private void DestroyOrphanSheepInEnv()
+    {
+        if (_envRoot == null)
+            _envRoot = TrainingEnvSpace.FindRoot(transform);
+
+        SheepWander[] wanders = _envRoot != null
+            ? _envRoot.GetComponentsInChildren<SheepWander>(true)
+            : GetComponentsInChildren<SheepWander>(true);
+        if (wanders == null || wanders.Length == 0)
+            return;
+
+        Vector3 center = SpawnCenterWorld;
+        float maxR = Mathf.Max(24f, maxDistanceFromSpawn * 2f);
+        float maxR2 = maxR * maxR;
+
+        int killed = 0;
+        for (int i = 0; i < wanders.Length; i++)
+        {
+            var w = wanders[i];
+            if (w == null)
+                continue;
+            GameObject go = w.gameObject;
+            if (!IsAlive(go))
+                continue;
+            if (go.GetComponentInParent<ViewerSimpleAgent>() != null)
+                continue;
+            // Никогда не сносить scene-object, на который ссылается sheepPrefab.
+            if (sheepPrefab != null
+                && (go == sheepPrefab
+                    || go.transform == sheepPrefab.transform
+                    || go.transform.IsChildOf(sheepPrefab.transform)))
+                continue;
+            if (IsTrackedSheep(go))
+                continue;
+
+            // Сирота: не в списке. Убиваем далёких (призрак x≈-200) или вне этого спавнера.
+            bool underSpawner = go.transform.IsChildOf(transform);
+            Vector3 p = go.transform.position;
+            float dx = p.x - center.x;
+            float dz = p.z - center.z;
+            bool far = dx * dx + dz * dz > maxR2;
+            if (!far && underSpawner)
+                continue;
+
+            Destroy(go);
+            killed++;
+        }
+
+        if (killed > 0)
+        {
+            PresentationWorldSnapshotLogger.Note(
+                "sheep_orphan_cleanup",
+                $"killed={killed} tracked={sheeps.Count} env={(_envRoot != null ? _envRoot.name : "?")}");
+        }
+    }
+
+    bool IsTrackedSheep(GameObject go)
+    {
+        if (go == null)
+            return false;
+        for (int i = 0; i < sheeps.Count; i++)
+        {
+            var s = sheeps[i];
+            if (!IsAlive(s))
+                continue;
+            if (s == go)
+                return true;
+            if (go.transform == s.transform || go.transform.IsChildOf(s.transform))
+                return true;
+            if (s.transform.IsChildOf(go.transform))
+                return true;
+        }
+        return false;
     }
 
     GameObject ResolveSheepPrefab()
@@ -98,6 +181,8 @@ public class SheepSpawner : MonoBehaviour
         }
 
         var fromResources = Resources.Load<GameObject>("Sheep_1");
+        if (fromResources == null)
+            fromResources = Resources.Load<GameObject>("ViewerSheep");
         if (fromResources != null)
         {
             sheepPrefab = fromResources;
@@ -249,20 +334,23 @@ public class SheepSpawner : MonoBehaviour
         }
         sheeps.Clear();
 
-        // Сироты после Instantiate(Env): только овцы (SheepWander), не весь child-иерархию
-        // (иначе можно снести scene-template и обнулить sheepPrefab).
+        // Только дети этого спавнера с SheepWander (не весь Env — иначе можно
+        // Destroy'ить scene-template и обнулить sheepPrefab).
         for (int i = transform.childCount - 1; i >= 0; i--)
         {
             var child = transform.GetChild(i).gameObject;
-            if (IsUnityNull(child))
+            if (!IsAlive(child))
+                continue;
+            if (sheepPrefab != null && child == sheepPrefab)
                 continue;
             if (child.GetComponent<SheepWander>() == null)
                 continue;
             Destroy(child);
         }
-    }
 
-    static bool IsUnityNull(GameObject go) => go == null;
+        // Далёкие сироты под Env (x≈-200), не трогая template/prefab.
+        DestroyOrphanSheepInEnv();
+    }
 
     /// <summary>Спавн count овец вокруг worldPos (Twitch). Не удаляет существующих.</summary>
     public int SpawnSheepNear(Vector3 worldPos, int count, float radius = 7f)

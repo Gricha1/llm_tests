@@ -35,11 +35,16 @@ tail -30 "${LOG}"
 
 # Unity после рестарта пустой — подтянуть roster из SQLite (бот :8765).
 echo "[restart_stream] roster resync → Unity…"
-for i in 1 2 3 4 5 6 7 8; do
+for i in $(seq 1 15); do
   if curl -sf -X POST "http://127.0.0.1:8765/roster/resync" >/tmp/roster_resync.json 2>/dev/null; then
     echo "[restart_stream] resync ok ($(python3 -c 'import json;print(json.load(open("/tmp/roster_resync.json")).get("roster_count","?"))' 2>/dev/null || echo '?') players)"
     break
   fi
-  echo "[restart_stream] resync wait ${i}/8 (bot/Unity ещё не готовы)"
+  echo "[restart_stream] resync wait ${i}/15 (bot/Unity ещё не готовы)"
   sleep 8
 done
+# Повтор через 30с — Unity иногда поднимается позже UDP.
+sleep 30
+curl -sf -X POST "http://127.0.0.1:8765/roster/resync" >/tmp/roster_resync2.json 2>/dev/null \
+  && echo "[restart_stream] resync2 ok ($(python3 -c 'import json;print(json.load(open("/tmp/roster_resync2.json")).get("roster_count","?"))' 2>/dev/null || echo '?') players)" \
+  || echo "[restart_stream] resync2 skipped"

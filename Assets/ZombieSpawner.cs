@@ -1,7 +1,11 @@
+using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Reflection;
 using UnityEngine;
 using UnityEngine.SceneManagement;
+using Object = UnityEngine.Object;
+using Random = UnityEngine.Random;
 
 /// <summary>
 /// Спавнит зомби. Высота в лесу — только local Y=0 у спавнера (без SerializeField на Y —
@@ -32,12 +36,29 @@ public class ZombieSpawner : MonoBehaviour
     [SerializeField] private float idleSpawnGridSpacing = 0.8f;
     [SerializeField] private int idleSpawnCount = 10;
 
+    const string ShirtlessResourceName = "ShirtlessZombie";
+    const string ShirtlessBundleName = "zombie_skins";
+    const string ShirtlessBundleAssetName = "ShirtlessZombie";
+    const string FatPrefabEditorPath = "Assets/Prefabs/FatZombie.prefab";
+    const string ShirtlessPrefabEditorPath = "Assets/Prefabs/ShirtlessZombie.prefab";
+    /// <summary>DLL marker — apocalypse mixes Fat + Shirtless skins.</summary>
+    public const string ShirtlessSpawnMarker = "SHIRTLESS_ZOMBIE_SPAWN";
+
     readonly List<GameObject> zombies = new List<GameObject>();
     float nextRespawnTime;
     GameObject _resolvedZombiePrefab;
     Vector3 _prefabRootScale = Vector3.one;
+    GameObject _fatPrefab;
+    GameObject _shirtlessPrefab;
+    Vector3 _fatPrefabScale = Vector3.one;
+    Vector3 _shirtlessPrefabScale = Vector3.one;
+    bool _skinCatalogResolved;
+    static AssetBundle _zombieSkinsBundle;
     float _spawnMoveSpeedMultiplier = 1f;
     bool _bootstrapDone;
+    /// <summary>Presentation apocalypse: runtime cap/interval override (−1 = use SerializeField).</summary>
+    int _pressureMax = -1;
+    float _pressureInterval = -1f;
     RuntimeAnimatorController _cachedZombieAnimator;
     /// <summary>После Twitch #add zombie — не досыпать в Update до maxZombies.</summary>
     bool _periodicSpawnSuppressed;
@@ -142,15 +163,36 @@ public class ZombieSpawner : MonoBehaviour
 
         float interval = TrainingEnvSpace.IsDebugEnvFocusActive
             ? 2f
-            : (zombie_from_hills ? 2f : spawnInterval);
+            : (zombie_from_hills ? 2f : EffectiveSpawnInterval);
 
         if (Time.time < nextRespawnTime)
             return;
 
         nextRespawnTime = Time.time + interval;
         RemoveDestroyed();
-        if (zombie_from_hills || zombies.Count < maxZombies)
+        if (zombie_from_hills || zombies.Count < EffectiveMaxZombies)
             SpawnOne();
+    }
+
+    int EffectiveMaxZombies => _pressureMax > 0 ? _pressureMax : maxZombies;
+    float EffectiveSpawnInterval => _pressureInterval > 0f ? _pressureInterval : spawnInterval;
+
+    /// <summary>
+    /// Presentation этап 2: со временем поднимать лимит живых зомби и ускорять спавн.
+    /// </summary>
+    public void SetApocalypsePressure(int maxAlive, float intervalSeconds)
+    {
+        _pressureMax = Mathf.Clamp(maxAlive, 1, 60);
+        _pressureInterval = Mathf.Clamp(intervalSeconds, 0.8f, 12f);
+        // Если уже ниже нового капа — не ждать полный старый interval.
+        if (zombies.Count < EffectiveMaxZombies && nextRespawnTime > Time.time + _pressureInterval)
+            nextRespawnTime = Time.time + Mathf.Min(1.5f, _pressureInterval);
+    }
+
+    public void ClearApocalypsePressure()
+    {
+        _pressureMax = -1;
+        _pressureInterval = -1f;
     }
 
     void RemoveDestroyed() => zombies.RemoveAll(z => !IsAlive(z));
@@ -206,7 +248,7 @@ public class ZombieSpawner : MonoBehaviour
     void SpawnOneAt(Vector3 _)
     {
         RemoveDestroyed();
-        if (zombies.Count >= maxZombies)
+        if (zombies.Count >= EffectiveMaxZombies)
             return;
         if (ResolveZombiePrefab() == null)
             return;
@@ -219,22 +261,35 @@ public class ZombieSpawner : MonoBehaviour
 
     void SpawnOneForestLocal(float localX, float localZ)
     {
-        GameObject zombie = Instantiate(ResolveZombiePrefab());
-        zombie.name = "FatZombie";
+        if (!TryInstantiateZombie(out GameObject zombie))
+            return;
         FinalizeForestZombie(zombie, localX, localZ, 1f);
         zombies.Add(zombie);
     }
 
     void SpawnOneCity()
     {
-        GameObject zombie = Instantiate(ResolveZombiePrefab());
-        zombie.name = "FatZombie";
+        if (!TryInstantiateZombie(out GameObject zombie))
+            return;
         Vector3 worldPos = transform.position;
         worldPos.x += Random.Range(-1.2f, 1.2f);
         worldPos.z += Random.Range(-1.2f, 1.2f);
         worldPos.y = CityFixedSpawnWorldY;
         FinalizeCityZombie(zombie, worldPos, 1f);
         zombies.Add(zombie);
+    }
+
+    bool TryInstantiateZombie(out GameObject zombie)
+    {
+        zombie = null;
+        GameObject prefab = PickSpawnPrefab(out Vector3 rootScale, out string spawnName);
+        if (prefab == null)
+            return false;
+
+        _prefabRootScale = rootScale;
+        zombie = Instantiate(prefab);
+        zombie.name = spawnName;
+        return true;
     }
 
     void ApplySpawnScale(GameObject zombie, float extraMultiplier)
@@ -468,8 +523,8 @@ public class ZombieSpawner : MonoBehaviour
             return null;
 
         RemoveDestroyed();
-        GameObject zombie = Instantiate(ResolveZombiePrefab());
-        zombie.name = "FatZombie";
+        if (!TryInstantiateZombie(out GameObject zombie))
+            return null;
         FinalizeSpawnedZombie(zombie, transform.position, scaleMultiplier);
         zombies.Add(zombie);
 
@@ -541,23 +596,104 @@ public class ZombieSpawner : MonoBehaviour
 
     GameObject ResolveZombiePrefab()
     {
+        EnsureSkinCatalog();
         if (_resolvedZombiePrefab != null)
             return _resolvedZombiePrefab;
 
-        var gameFat = EditorLoadAsset<GameObject>("Assets/Prefabs/FatZombie.prefab");
-        if (gameFat != null)
+        if (_fatPrefab != null)
         {
-            _resolvedZombiePrefab = gameFat;
-            _prefabRootScale = gameFat.transform.localScale;
+            _resolvedZombiePrefab = _fatPrefab;
+            _prefabRootScale = _fatPrefabScale;
             return _resolvedZombiePrefab;
         }
 
-        if (zombiePrefab != null && !zombiePrefab.scene.IsValid())
+        if (_shirtlessPrefab != null)
         {
-            _resolvedZombiePrefab = zombiePrefab;
-            _prefabRootScale = _resolvedZombiePrefab.transform.localScale;
+            _resolvedZombiePrefab = _shirtlessPrefab;
+            _prefabRootScale = _shirtlessPrefabScale;
             return _resolvedZombiePrefab;
         }
+
+        return null;
+    }
+
+    void EnsureSkinCatalog()
+    {
+        if (_skinCatalogResolved)
+            return;
+        _skinCatalogResolved = true;
+
+        // Keep marker string in the player DLL for deploy verification.
+        _ = ShirtlessSpawnMarker;
+
+        _fatPrefab = ResolveFatPrefab();
+        if (_fatPrefab != null)
+            _fatPrefabScale = _fatPrefab.transform.localScale;
+
+        _shirtlessPrefab = ResolveShirtlessPrefab();
+        if (_shirtlessPrefab != null)
+            _shirtlessPrefabScale = _shirtlessPrefab.transform.localScale;
+
+        if (_fatPrefab != null)
+        {
+            _resolvedZombiePrefab = _fatPrefab;
+            _prefabRootScale = _fatPrefabScale;
+        }
+        else if (_shirtlessPrefab != null)
+        {
+            _resolvedZombiePrefab = _shirtlessPrefab;
+            _prefabRootScale = _shirtlessPrefabScale;
+        }
+    }
+
+    GameObject PickSpawnPrefab(out Vector3 rootScale, out string spawnName)
+    {
+        EnsureSkinCatalog();
+
+        bool hasFat = _fatPrefab != null;
+        bool hasShirtless = _shirtlessPrefab != null;
+        if (hasFat && hasShirtless)
+        {
+            // Apocalypse mix: ~half Fat, ~half Shirtless.
+            if (Random.value < 0.5f)
+            {
+                rootScale = _fatPrefabScale;
+                spawnName = "FatZombie";
+                return _fatPrefab;
+            }
+
+            rootScale = _shirtlessPrefabScale;
+            spawnName = "ShirtlessZombie";
+            return _shirtlessPrefab;
+        }
+
+        if (hasShirtless)
+        {
+            rootScale = _shirtlessPrefabScale;
+            spawnName = "ShirtlessZombie";
+            return _shirtlessPrefab;
+        }
+
+        if (hasFat)
+        {
+            rootScale = _fatPrefabScale;
+            spawnName = "FatZombie";
+            return _fatPrefab;
+        }
+
+        rootScale = Vector3.one;
+        spawnName = "FatZombie";
+        return null;
+    }
+
+    GameObject ResolveFatPrefab()
+    {
+        var gameFat = EditorLoadAsset<GameObject>(FatPrefabEditorPath);
+        if (gameFat != null)
+            return gameFat;
+
+        if (zombiePrefab != null && !zombiePrefab.scene.IsValid())
+            return zombiePrefab;
 
         if (zombiePrefab != null)
         {
@@ -565,17 +701,46 @@ public class ZombieSpawner : MonoBehaviour
             if (source != null
                 && source.GetComponentInChildren<ZombieChase>(true) != null
                 && HasAnimatorController(source))
-            {
-                _resolvedZombiePrefab = source;
-                _prefabRootScale = source.transform.localScale;
-                return _resolvedZombiePrefab;
-            }
+                return source;
         }
 
-        _resolvedZombiePrefab = zombiePrefab;
-        if (_resolvedZombiePrefab != null)
-            _prefabRootScale = _resolvedZombiePrefab.transform.localScale;
-        return _resolvedZombiePrefab;
+        return zombiePrefab;
+    }
+
+    GameObject ResolveShirtlessPrefab()
+    {
+        var fromResources = Resources.Load<GameObject>(ShirtlessResourceName);
+        if (fromResources != null)
+            return fromResources;
+
+        var fromBundle = LoadShirtlessFromAssetBundle();
+        if (fromBundle != null)
+            return fromBundle;
+
+        return EditorLoadAsset<GameObject>(ShirtlessPrefabEditorPath);
+    }
+
+    static GameObject LoadShirtlessFromAssetBundle()
+    {
+        try
+        {
+            if (_zombieSkinsBundle == null)
+            {
+                string path = Path.Combine(Application.streamingAssetsPath, ShirtlessBundleName);
+                if (!File.Exists(path))
+                    return null;
+                _zombieSkinsBundle = AssetBundle.LoadFromFile(path);
+                if (_zombieSkinsBundle == null)
+                    return null;
+            }
+
+            return _zombieSkinsBundle.LoadAsset<GameObject>(ShirtlessBundleAssetName);
+        }
+        catch (Exception e)
+        {
+            Debug.LogWarning($"[ZombieSpawner] shirtless bundle load failed: {e.Message}");
+            return null;
+        }
     }
 
     static bool HasAnimatorController(GameObject go)
@@ -703,13 +868,14 @@ public class ZombieSpawner : MonoBehaviour
         }
         zombies.Clear();
         _spawnMoveSpeedMultiplier = 1f;
+        ClearApocalypsePressure();
 
         // Полный FindObjectsOfType по сцене — дорого; при ClearZombiesInAllEnvs делаем один раз.
         if (scanOrphanRoots)
-            DestroyOrphanFatZombieRoots();
+            DestroyOrphanZombieRoots();
     }
 
-    static void DestroyOrphanFatZombieRoots()
+    static void DestroyOrphanZombieRoots()
     {
         // Только корни сцены — не FindObjectsOfType<Transform> по всей иерархии (хитч при #env_N).
         var scene = UnityEngine.SceneManagement.SceneManager.GetActiveScene();
@@ -723,7 +889,8 @@ public class ZombieSpawner : MonoBehaviour
             if (go == null)
                 continue;
             string n = go.name;
-            if (n.IndexOf("FatZombie", System.StringComparison.OrdinalIgnoreCase) < 0)
+            if (n.IndexOf("FatZombie", System.StringComparison.OrdinalIgnoreCase) < 0
+                && n.IndexOf("ShirtlessZombie", System.StringComparison.OrdinalIgnoreCase) < 0)
                 continue;
             Object.Destroy(go);
         }
@@ -745,7 +912,7 @@ public class ZombieSpawner : MonoBehaviour
                 spawners[i].gameObject.SetActive(false);
         }
 
-        DestroyOrphanFatZombieRoots();
+        DestroyOrphanZombieRoots();
     }
 
     public int SpawnZombiesNear(Vector3 worldPos, int count, float radius = 7f)
@@ -767,8 +934,8 @@ public class ZombieSpawner : MonoBehaviour
             if (IsCityScene())
             {
                 Vector3 pos = new Vector3(worldPos.x + ring.x, CityFixedSpawnWorldY, worldPos.z + ring.y);
-                GameObject zombie = Instantiate(ResolveZombiePrefab());
-                zombie.name = "FatZombie";
+                if (!TryInstantiateZombie(out GameObject zombie))
+                    break;
                 FinalizeCityZombie(zombie, pos, 1f);
                 zombies.Add(zombie);
             }
@@ -812,7 +979,7 @@ public class ZombieSpawner : MonoBehaviour
         if (TrainingEnvSpace.IsDebugEnvFocusActive)
             immediateCount = 1;
         else
-            immediateCount = Mathf.Clamp(immediateCount, 1, maxZombies);
+            immediateCount = Mathf.Clamp(immediateCount, 1, EffectiveMaxZombies);
 
         if (!gameObject.activeSelf)
             gameObject.SetActive(true);
@@ -822,7 +989,7 @@ public class ZombieSpawner : MonoBehaviour
 
         nextRespawnTime = Time.time + (TrainingEnvSpace.IsDebugEnvFocusActive
             ? 2f
-            : Mathf.Max(0.5f, spawnInterval));
+            : Mathf.Max(0.5f, EffectiveSpawnInterval));
         _lastTrainingEpisodeStartTime = Time.unscaledTime;
         return zombies.Count;
     }

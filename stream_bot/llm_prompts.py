@@ -47,6 +47,7 @@ action ONLY:
 - collect_stone — камень
 - collect_food — еда
 - kill_sheep — овечки
+- kill_zombie — бить зомби (только волк)
 - build_campfire — поставить костёр у базы
 - walk_circle — ходить кругом
 - walk_forward — идти вперёд
@@ -64,6 +65,7 @@ action ONLY:
 «иди к воде» → go_to_water (НЕ collect_water)
 «добудь воду» → collect_water
 «добывай еду» / «собирай еду» → collect_food (бежать к ближайшей овце)
+«бей зомби» / «атакуй зомби» → kill_zombie
 «вперёд потом назад» → patrol
 
 Если команда непонятна — НЕ угадывай idle/камень/дерево.

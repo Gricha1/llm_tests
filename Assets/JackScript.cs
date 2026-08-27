@@ -362,6 +362,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     int _episodeWaterCollected;
     public int EpisodeWaterCollected => _episodeWaterCollected;
     private int _survivalPhase = 1;
+    private float _phase2EnteredAt = -1f;
     private float _nextNightmareBossSpawnTime = float.PositiveInfinity;
 
     EnvTrainingConfig _trainingConfig;
@@ -1078,6 +1079,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         ProcessTwitchJump();
         UpdateNightmareBossSpawns();
         UpdatePresentationCampfireWarmth();
+        UpdatePresentationZombiePressure();
     }
 
     void ApplyRandomEpisodeStartNeeds()
@@ -1135,6 +1137,36 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         if (TrainingEnvSpace.UsesStreamPresentationSurvivalPace(transform))
             gain = TrainingEnvSpace.StreamPresentationJackWarmthPerTick;
         heat = Mathf.Min(maxHeat, heat + gain);
+    }
+
+    void UpdatePresentationZombiePressure()
+    {
+        if (_deathSequenceStarted)
+            return;
+        if (!TrainingEnvSpace.IsPresentationTransform(transform))
+            return;
+        if (TwitchEphemeralEffects.IsTwitchClone(this))
+            return;
+        if (TrainingEnvSpace.IsStreamingSurvivalMode)
+            return;
+        if (TrainingEnvSpace.IsGeorgeAgent(this))
+            return;
+        if (_survivalPhase < 2)
+            return;
+
+        EnsureZombieSpawners();
+        if (zombieSpawner == null)
+            return;
+
+        if (_phase2EnteredAt < 0f)
+            _phase2EnteredAt = Time.unscaledTime;
+
+        float elapsed = Mathf.Max(0f, Time.unscaledTime - _phase2EnteredAt);
+        // Старт: ~5 живых / спавн раз в 5с. Каждые 12с: +3 к лимиту, быстрее спавн.
+        int tiers = Mathf.FloorToInt(elapsed / 12f);
+        int cap = Mathf.Min(30, 5 + tiers * 3);
+        float interval = Mathf.Max(1.1f, 5f - tiers * 0.4f);
+        zombieSpawner.SetApocalypsePressure(cap, interval);
     }
 
     void UpdateNightmareBossSpawns()
@@ -1355,6 +1387,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
     public override void OnEpisodeBegin()
     {
         _deathSequenceStarted = false;
+        HeroDeathVisual.Clear(this);
         SetTwitchReachMultiplier(1f);
         ResetTwitchMoveSpeed();
         bool isTwitchClone = TwitchEphemeralEffects.IsTwitchClone(this);
@@ -1411,6 +1444,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         prevPosition = transform.position;
         stepCount = 0;
         _survivalPhase = 1;
+        _phase2EnteredAt = -1f;
         if (TrainingEnvSpace.IsPresentationTransform(transform))
             BackgroundMusic.SetSurvivalPhase(1);
         _nextNightmareBossSpawnTime = float.PositiveInfinity;
@@ -1534,7 +1568,15 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
             }
             else
             {
-                int randomOption = Random.Range(0, 2);
+                // Full: дерево / еда / вода. WoodFoodSwitch: только дерево / еда.
+                int randomOption = IsWoodFoodSwitchMode
+                    ? Random.Range(0, 2)
+                    : (Random.Range(0, 3) switch
+                    {
+                        0 => OptionWood,
+                        1 => OptionFood,
+                        _ => OptionWater
+                    });
                 currentOptionTrain = randomOption;
                 currentOption = randomOption;
             }
@@ -1565,6 +1607,17 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
 
         // После корректного EndEpisode это 0; после «голого» OnEpisodeBegin — база для дельты в TB.
         _episodeRewardAnchor = GetCumulativeReward();
+
+        // OBS / stream presentation: каждый эпизод сразу этап 2 (зомби уже идут).
+        if (!isTwitchClone
+            && TrainingEnvSpace.IsPresentationTransform(transform)
+            && !TrainingEnvSpace.IsStreamingSurvivalMode
+            && IsFullTrainingMode
+            && survivalGoalSeconds > 0f)
+        {
+            _episodeStartTime = Time.unscaledTime - survivalGoalSeconds;
+            EnterSurvivalPhase2();
+        }
     }
 
     void EnsureSpawners()
@@ -1750,7 +1803,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
 
         int prevOption = currentOptionTrain;
         
-        if (option == OptionWood || option == OptionFood)
+        if (option == OptionWood || option == OptionFood || option == OptionWater)
             _lastNonZombieOption = option;
 
         if (option == OptionWater && prevOption != OptionWater)
@@ -2018,7 +2071,9 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
         {
             if (currentOptionTrain != OptionZombie)
             {
-                if (currentOptionTrain == OptionWood || currentOptionTrain == OptionFood)
+                if (currentOptionTrain == OptionWood
+                    || currentOptionTrain == OptionFood
+                    || currentOptionTrain == OptionWater)
                     _lastNonZombieOption = currentOptionTrain;
                 currentOptionTrain = OptionZombie;
                 currentOption = OptionZombie;
@@ -2037,6 +2092,21 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
 
         if (!IsOptionSwitchTrainingMode)
             return;
+
+        // Критическая жажда важнее сдачи дров.
+        if (IsFullTrainingMode && water <= 0)
+        {
+            if (currentOptionTrain != OptionWater || currentOption != OptionWater)
+            {
+                int prev = currentOptionTrain;
+                currentOptionTrain = OptionWater;
+                currentOption = OptionWater;
+                _lastNonZombieOption = OptionWater;
+                ResetWaterGoalIfEntered(prev, OptionWater);
+                UpdateOptionIconVisual();
+            }
+            return;
+        }
 
         if (IsWoodGatherGoalReached)
         {
@@ -2381,7 +2451,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
                 ResetWaterGoalIfEntered(prevOption, sampled);
                 currentOptionTrain = sampled;
                 currentOption = sampled;
-                if (sampled == OptionWood || sampled == OptionFood)
+                if (sampled == OptionWood || sampled == OptionFood || sampled == OptionWater)
                     _lastNonZombieOption = sampled;
                 UpdateOptionIconVisual();
             }
@@ -3332,6 +3402,7 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
             return;
 
         _survivalPhase = 2;
+        _phase2EnteredAt = Time.unscaledTime;
 
         if (phase1CompleteReward != 0f)
         {
@@ -3532,27 +3603,59 @@ public class AgentGoToHouseDiscrete : Agent, IHasHp
 
     private int SampleOptionUtilitySoftmax(int currentOpt)
     {
+        // Критические нули — как у Lily: сразу нужная опция, без softmax.
+        if (!IsWoodFoodSwitchMode)
+        {
+            if (water <= 0)
+                return OptionWater;
+            if (satiety <= 0)
+                return OptionFood;
+        }
+
         float heatRatio = maxHeat > 0 ? (float)heat / maxHeat : 0f;
         float satietyRatio = maxSatiety > 0 ? Mathf.Clamp01((float)satiety / maxSatiety) : 1f;
+        float waterRatio = Mathf.Clamp01(water / 12f);
 
         float needHeat = Mathf.Clamp01(1f - heatRatio);
         float needFood = Mathf.Clamp01(1f - satietyRatio);
+        float needWater = Mathf.Clamp01(1f - waterRatio);
 
         float accessWood = DistanceToAccess(GetDistanceToNearestTree());
         float accessFood = DistanceToAccess(GetDistanceToNearestSheep());
+        float accessWater = DistanceToAccess(GetNearestWaterDistanceForOption());
 
-        float stickWood = currentOpt == 0 ? 1f : 0f;
-        float stickFood = currentOpt == 1 ? 1f : 0f;
+        float stickWood = currentOpt == OptionWood ? 1f : 0f;
+        float stickFood = currentOpt == OptionFood ? 1f : 0f;
+        float stickWater = currentOpt == OptionWater && needWater > 0.15f ? 1f : 0f;
 
         float epsWood = Random.Range(-noise, noise);
         float epsFood = Random.Range(-noise, noise);
+        float epsWater = Random.Range(-noise, noise);
 
-        // 0 = дерево (лес): основной драйвер — потребность в тепле.
-        // 1 = еда: основной драйвер — потребность в еде (сытости).
+        // Дерево ← тепло, еда ← сытость, вода ← запас воды.
         float uWood = 2.5f * needHeat + 1.0f * accessWood + stickinessBonus * stickWood + epsWood;
         float uFood = 2.5f * needFood + 1.0f * accessFood + stickinessBonus * stickFood + epsFood;
 
-        return SoftmaxSample2(uWood, uFood, Mathf.Max(0.0001f, tau));
+        // WoodFoodSwitch — учебный режим только дерево/еда.
+        if (IsWoodFoodSwitchMode)
+            return SoftmaxSample2(uWood, uFood, Mathf.Max(0.0001f, tau));
+
+        float uWater = 2.5f * needWater + 1.0f * accessWater * needWater
+            + stickinessBonus * stickWater + epsWater;
+        return SoftmaxSample3(
+            uWood, uFood, uWater,
+            OptionWood, OptionFood, OptionWater,
+            Mathf.Max(0.0001f, tau));
+    }
+
+    float GetNearestWaterDistanceForOption()
+    {
+        if (prevWaterDist > 0f)
+            return prevWaterDist;
+        var envRoot = TrainingEnvSpace.FindRoot(transform);
+        if (WaterSource.TryFindNearestDistance(transform, envRoot, out float dist))
+            return dist;
+        return 999f;
     }
 
     int SampleGeorgeOptionUtilitySoftmax(int currentOpt)

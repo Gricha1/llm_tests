@@ -219,7 +219,7 @@ public sealed class StreamingSurvivalHud : MonoBehaviour
         hrt.anchorMax = new Vector2(1f, 0f);
         hrt.pivot = new Vector2(1f, 0f);
         hrt.anchoredPosition = new Vector2(-24f, 56f);
-        hrt.sizeDelta = new Vector2(420f, 86f);
+        hrt.sizeDelta = new Vector2(460f, 108f);
         var hbg = helpGo.AddComponent<Image>();
         hbg.color = new Color(0.05f, 0.08f, 0.12f, 0.82f);
         var ht = new GameObject("T");
@@ -236,7 +236,8 @@ public sealed class StreamingSurvivalHud : MonoBehaviour
         helpText.text =
             "<b>FOLLOWER CHARACTERS</b>\n" +
             "пиши в чат:  <color=#9ecbff>#join</color>  ·  <color=#9fe7b8>#do действие</color>  ·  <color=#ffb4b4>#exit</color>\n" +
-            "<color=#ffd699>#stats</color> — твоя статистика";
+            "<color=#c9a0ff>#skins</color> — показывает доступные скины\n" +
+            "<color=#ffd699>#stats</color> — статистика";
         helpText.richText = true;
         ApplyFont(helpText);
     }

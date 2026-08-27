@@ -8,9 +8,9 @@ using TMPro;
 /// </summary>
 public sealed class SurvivalPhaseAnnouncement : MonoBehaviour
 {
-    [SerializeField] private float displaySeconds = 4f;
+    [SerializeField] private float displaySeconds = 3.2f;
     [SerializeField] private Color textColor = new Color(1f, 0.45f, 0.35f, 1f);
-    [SerializeField] private int fontSize = 58;
+    [SerializeField] private int fontSize = 28;
 
     static SurvivalPhaseAnnouncement _instance;
     Canvas _canvas;
@@ -84,14 +84,14 @@ public sealed class SurvivalPhaseAnnouncement : MonoBehaviour
         panelRt.offsetMax = Vector2.zero;
 
         var panel = panelRt.gameObject.AddComponent<Image>();
-        panel.color = new Color(0f, 0f, 0f, 0.35f);
+        panel.color = new Color(0f, 0f, 0f, 0.22f);
 
         var textRt = new GameObject("Message").AddComponent<RectTransform>();
         textRt.SetParent(panelRt, false);
-        textRt.anchorMin = new Vector2(0.5f, 0.5f);
-        textRt.anchorMax = new Vector2(0.5f, 0.5f);
+        textRt.anchorMin = new Vector2(0.5f, 0.58f);
+        textRt.anchorMax = new Vector2(0.5f, 0.58f);
         textRt.pivot = new Vector2(0.5f, 0.5f);
-        textRt.sizeDelta = new Vector2(1200f, 140f);
+        textRt.sizeDelta = new Vector2(720f, 64f);
 
         _text = textRt.gameObject.AddComponent<TextMeshProUGUI>();
         _text.alignment = TextAlignmentOptions.Center;

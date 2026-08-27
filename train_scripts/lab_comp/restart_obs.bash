@@ -26,6 +26,9 @@ if pgrep -x obs >/dev/null 2>&1; then
   sleep 1
 fi
 
+# После рестарта Unity window id меняется — иначе Xcomposite → чёрный экран.
+bash "${ROOT}/train_scripts/lab_comp/bind_obs_unity_window.bash" 2>/dev/null || true
+
 # Звук: forest_stream.monitor (если есть pactl) — без падения если нет.
 bash "${ROOT}/train_scripts/lab_comp/setup_stream_audio_route.bash" 2>/dev/null || true
 

@@ -71,7 +71,7 @@ public sealed class TwitchChatHelpHud : MonoBehaviour
         rt.anchorMax = new Vector2(1f, 0f);
         rt.pivot = new Vector2(1f, 0f);
         rt.anchoredPosition = new Vector2(-16f, 16f);
-        rt.sizeDelta = new Vector2(460f, 210f);
+        rt.sizeDelta = new Vector2(460f, 248f);
 
         var bg = _panel.AddComponent<Image>();
         bg.color = new Color(0.03f, 0.05f, 0.07f, 0.88f);
@@ -124,6 +124,7 @@ static class TwitchChatCommandCatalog
     public const string HelpText =
         "<b>#join</b> — войти в игру\n" +
         "<b>#do</b> добывай воду   ·   <b>#do</b> руби дерево\n" +
-        "<b>#do</b> убивай овечек   ·   <b>#do</b> иди к дому\n" +
-        "<b>#exit</b> — выйти";
+        "<b>#do</b> убивай овечек   ·   <b>#do</b> бей зомби\n" +
+        "<b>#skins</b> — показывает доступные скины\n" +
+        "<b>#stats</b> — статистика   ·   <b>#exit</b> — выйти";
 }

@@ -26,9 +26,12 @@ public static class DeathFreeze
         _frozen = true;
         _frozenEnvRoot = envRoot;
 
-        // Presentation worker: не ставим Time.timeScale=0 — иначе зависает ML-Agents и respawn.
+        // OBS stream / presentation worker: не ставим Time.timeScale=0 —
+        // иначе зависает ML-Agents, respawn и КД волка (Time.time).
         if (!TrainingEnvSpace.HasMultipleTrainingEnvs()
-            && !TrainingEnvSpace.IsPresentationWorkerProcess)
+            && !TrainingEnvSpace.IsPresentationWorkerProcess
+            && !TrainingEnvSpace.IsLivePresentationForObs
+            && !TrainingEnvSpace.IsStreamOnlyMode)
         {
             _savedTimeScale = Time.timeScale;
             Time.timeScale = 0f;
@@ -48,6 +51,8 @@ public static class DeathFreeze
 
         if (!TrainingEnvSpace.HasMultipleTrainingEnvs()
             && !TrainingEnvSpace.IsPresentationWorkerProcess
+            && !TrainingEnvSpace.IsLivePresentationForObs
+            && !TrainingEnvSpace.IsStreamOnlyMode
             && Time.timeScale == 0f)
             Time.timeScale = _savedTimeScale > 0.001f ? _savedTimeScale : 1f;
 

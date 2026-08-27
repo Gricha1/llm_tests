@@ -1,19 +1,53 @@
+using System;
 using System.Collections.Generic;
 using UnityEngine;
+using Object = UnityEngine.Object;
+using Random = UnityEngine.Random;
 
 /// <summary>
 /// Персонаж зрителя Streaming Survival: ходьба с анимацией, путь к воде через GoalWater,
 /// рубка дерева, очередь действий (N воды → N дерева).
 /// </summary>
-public sealed class StreamingSurvivalPlayer : MonoBehaviour
+public sealed class StreamingSurvivalPlayer : MonoBehaviour, IHasHp
 {
     public string Username { get; private set; } = "viewer";
     public string Action { get; private set; } = "idle";
     public string ActionName { get; private set; } = "Ждёт у базы";
     public string PhaseName => _phase.ToString();
+    public bool IsWolfSkin => _isWolfSkin;
+    public bool WolfCdStuckThisEpisode => _wolfCdStuckThisEpisode;
+    public int WolfCdStuckCount => _wolfCdStuckCount;
+    public int WolfHitsThisEpisode => _wolfHitsThisEpisode;
+    public float WolfCdLeftPublic => WolfCdLeft;
+
+    /// <summary>Боевое HP от ударов зомби (не путать с _wolfHp — stamina атаки волка).</summary>
+    const int CombatMaxHp = 100;
+    const int ZombieHitsToKill = 2;
+    int _combatHp = CombatMaxHp;
+    int _zombieHitsTaken;
+    public int Hp => _combatHp;
+    public int MaxHp => CombatMaxHp;
+    public int ZombieHitsTaken => _zombieHitsTaken;
+    /// <summary>Убит зомби — лежит на месте до конца эпизода.</summary>
+    public bool IsDeadToZombies => _combatHp <= 0;
+
+    // Последнее #do (не idle) — чтобы на старте раунда снова пойти делать это.
+    string _lastDoAction = "";
+    string _lastDoActionName = "";
+    int _lastDoAmount = 1;
+
+    /// <summary>Живая овца, на которую сейчас идёт/рубит этот игрок (для claim между фолловерами).</summary>
+    public Transform ClaimedSheep =>
+        (Action == "collect_food" || Action == "kill_sheep" || Action == "go_to_sheep")
+        && IsLiveHarvestSheep(_sheepVictim)
+            ? _sheepVictim
+            : null;
 
     CharacterController _cc;
     Animator _anim;
+    bool _animHasSpeed;
+    bool _isWolfSkin;
+    StreamingSurvivalWolfAnim _wolfAnim;
     TextMesh _label;
     Transform _labelTf;
     Vector3 _home;
@@ -38,7 +72,29 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
     const float LogPosInterval = 1.25f;
     float _animSpeed;
     Transform _sheepVictim;
+    Transform _zombieVictim;
     GameObject _treeVictim;
+    const int WolfMaxHp = 100;
+    const int WolfHitHpCost = WolfMaxHp / 4;
+    /// <summary>Дистанция удара по зомби (не нужно ждать полной остановки жертвы).</summary>
+    const float WolfAttackRange = 3.5f;
+    /// <summary>Один удар волка — зомби мёртв.</summary>
+    const int WolfHitsToKillZombie = 1;
+    /// <summary>КД между ударами волка — чтобы не зачищать всех подряд.</summary>
+    const float WolfAttackCooldown = 2.8f;
+    int _wolfHp = WolfMaxHp;
+    /// <summary>
+    /// Конец КД по DateTime.UtcNow (секунды с Unix epoch).
+    /// Не зависит от Time.timeScale / realtimeSinceStartup / DeathFreeze.
+    /// </summary>
+    double _wolfCdEndsUnix;
+    double _wolfCdWatchStartUnix = -1;
+    float _wolfCdWatchLeft = -1f;
+    bool _wolfCdStuckThisEpisode;
+    int _wolfCdStuckCount;
+    int _wolfHitsThisEpisode;
+    static readonly DateTime UnixEpochUtc = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+    static double WallUnixNow() => (DateTime.UtcNow - UnixEpochUtc).TotalSeconds;
     bool _allowWander;
     int _needAmount = 1;
     int _doneAmount;
@@ -70,6 +126,8 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
         "manual_respawn_command",
         "round_reset",
         "round_start",
+        "wolf_down",
+        "zombie_kill",
     };
 
     const float MaxStuckNudge = 1.5f;
@@ -122,6 +180,9 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
         Debug.Log(
             $"[SSPos] controlled_teleport user={Username} reason={useReason} " +
             $"from=({from.x:F2},{from.z:F2}) to=({transform.position.x:F2},{transform.position.z:F2})");
+        FollowerEpisodeJournal.NoteEvent(
+            this, "teleport",
+            $"reason={useReason} from=({from.x:F1},{from.z:F1})");
         var rec = StreamingSurvivalTrajectoryRecorder.Instance;
         if (rec != null)
         {
@@ -417,8 +478,128 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
         PrepareAnimator();
         SnapToGround();
         _home = transform.position;
+        _combatHp = CombatMaxHp;
+        _zombieHitsTaken = 0;
         EnsureLabel();
         SetAction(action, actionName, 1, null);
+    }
+
+    public void TakeDamage(int amount)
+    {
+        if (IsDeadToZombies || amount <= 0)
+            return;
+
+        // Урон зомби для фолловеров — всегда через счётчик ударов.
+        if (amount >= Mathf.Max(1, CombatMaxHp / 2))
+        {
+            RegisterZombieHit();
+            return;
+        }
+
+        _combatHp = Mathf.Max(0, _combatHp - amount);
+        Debug.Log(
+            $"[SSPos] damage user={Username} dmg={amount} hp={_combatHp}/{CombatMaxHp} " +
+            $"skin={(_isWolfSkin ? "wolf" : "human")}");
+        if (_combatHp <= 0)
+            OnKilledByZombie();
+        else
+            RefreshLabel();
+    }
+
+    /// <summary>Один удар зомби. Смерть гарантированно на 2-м попадании.</summary>
+    public void RegisterZombieHit()
+    {
+        if (IsDeadToZombies)
+            return;
+
+        _zombieHitsTaken++;
+        int left = Mathf.Max(0, ZombieHitsToKill - _zombieHitsTaken);
+        _combatHp = left <= 0 ? 0 : Mathf.Max(1, CombatMaxHp * left / ZombieHitsToKill);
+        Debug.Log(
+            $"[SSPos] zombie_hit user={Username} hits={_zombieHitsTaken}/{ZombieHitsToKill} " +
+            $"hp={_combatHp}/{CombatMaxHp} skin={(_isWolfSkin ? "wolf" : "human")}");
+
+        if (_zombieHitsTaken >= ZombieHitsToKill || _combatHp <= 0)
+        {
+            OnKilledByZombie();
+            return;
+        }
+
+        RefreshLabel();
+    }
+
+    void OnKilledByZombie()
+    {
+        Vector3 p = transform.position;
+        Debug.Log(
+            $"[SSPos] killed_by_zombie user={Username} — dead until episode end " +
+            $"pos=({p.x:F1},{p.z:F1})");
+        _combatHp = 0;
+        _zombieHitsTaken = ZombieHitsToKill;
+        _zombieVictim = null;
+        _hasLockedWorkTarget = false;
+        _wolfCdEndsUnix = 0;
+        _queue.Clear();
+        Action = "idle";
+        ActionName = "Мёртв";
+        _needAmount = 1;
+        _doneAmount = 0;
+        _phase = Phase.IdleStand;
+        _allowWander = false;
+        SetAnimSpeed(0f);
+        if (_wolfAnim != null)
+            _wolfAnim.SetMoveAmount(0f);
+        HeroDeathVisual.Play(
+            this,
+            _isWolfSkin ? HeroDeathVisual.DeathFallMode.Side : HeroDeathVisual.DeathFallMode.Back);
+        FollowerEpisodeJournal.NoteEvent(this, "killed_by_zombie", "dead_until_episode_end");
+        RefreshLabel();
+    }
+
+    /// <summary>Старт раунда / эпизода: сброс боя.</summary>
+    public void PrepareForRoundRestart()
+    {
+        HeroDeathVisual.Clear(this);
+        _zombieHitsTaken = 0;
+        _combatHp = CombatMaxHp;
+        _zombieVictim = null;
+        _sheepVictim = null;
+        _treeVictim = null;
+        _hasLockedWorkTarget = false;
+        _waterPath = null;
+        _waterSpawnHubDone = false;
+    }
+
+    /// <summary>После телепорта на спавн раунда — снова последнее #do (если было).</summary>
+    public void RestoreLastDoAfterRoundSpawn()
+    {
+        if (!string.IsNullOrEmpty(_lastDoAction)
+            && (Action == "idle" || Action == "idle_stand" || Action == "idle_wander"
+                || (ActionName != null && (
+                    ActionName.IndexOf("Убит", System.StringComparison.Ordinal) >= 0
+                    || ActionName.IndexOf("Мёртв", System.StringComparison.Ordinal) >= 0))))
+        {
+            ApplyStep(_lastDoAction, _lastDoActionName, _lastDoAmount);
+            return;
+        }
+        ResumeLastAction();
+    }
+
+    static bool IsPersistableDoAction(string action)
+    {
+        if (string.IsNullOrEmpty(action))
+            return false;
+        switch (action.ToLowerInvariant())
+        {
+            case "idle":
+            case "idle_stand":
+            case "idle_wander":
+            case "manual_respawn":
+            case "respawn_character":
+                return false;
+            default:
+                return true;
+        }
     }
 
     void PrepareAnimator()
@@ -428,7 +609,246 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
         if (_anim == null) return;
         _anim.applyRootMotion = false;
         _anim.cullingMode = AnimatorCullingMode.AlwaysAnimate;
-        _anim.SetFloat("Speed", 0f);
+        _animHasSpeed = AnimatorHasFloat(_anim, "Speed");
+        if (_animHasSpeed)
+            _anim.SetFloat("Speed", 0f);
+    }
+
+    static bool AnimatorHasFloat(Animator anim, string param)
+    {
+        if (anim == null) return false;
+        try
+        {
+            for (int i = 0; i < anim.parameterCount; i++)
+            {
+                var p = anim.GetParameter(i);
+                if (p != null && p.name == param && p.type == AnimatorControllerParameterType.Float)
+                    return true;
+            }
+        }
+        catch (System.Exception)
+        {
+            return false;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Личный скин mysticggx: модель Wolf_1 ×1.2 + процедурные idle/run
+    /// (в FBX пака нет клипов анимации).
+    /// </summary>
+    public bool ApplyWolfSkin()
+    {
+        if (_isWolfSkin)
+            return true;
+        const float wolfScale = 1.2f;
+        // Всегда сносим старый скин сразу (Destroy отложен — иначе кадр с двумя волками).
+        for (int i = transform.childCount - 1; i >= 0; i--)
+        {
+            var ch = transform.GetChild(i);
+            if (ch != null && ch.name == "WolfSkin")
+                DestroyImmediate(ch.gameObject);
+        }
+        _isWolfSkin = false;
+        _wolfAnim = null;
+        _anim = null;
+
+        var prefab = Resources.Load<GameObject>("Wolf_1");
+        if (prefab == null)
+        {
+            Debug.LogError($"[SSPos] wolf skin missing Resources/Wolf_1 user={Username}");
+            return false;
+        }
+
+        // Спрятать humanoid/Jack визуал, оставить лейбл и логику на корне.
+        var renderers = GetComponentsInChildren<Renderer>(true);
+        for (int i = 0; i < renderers.Length; i++)
+        {
+            var r = renderers[i];
+            if (r == null) continue;
+            if (_label != null && r.gameObject == _label.gameObject) continue;
+            r.enabled = false;
+        }
+        var oldAnims = GetComponentsInChildren<Animator>(true);
+        for (int i = 0; i < oldAnims.Length; i++)
+        {
+            if (oldAnims[i] != null)
+                oldAnims[i].enabled = false;
+        }
+
+        var wolf = Object.Instantiate(prefab, transform);
+        wolf.name = "WolfSkin";
+        wolf.transform.localPosition = Vector3.zero;
+        wolf.transform.localRotation = Quaternion.identity;
+        wolf.transform.localScale = Vector3.one * wolfScale;
+        wolf.SetActive(true);
+
+        // Non-convex MeshCollider ломает CharacterController.
+        foreach (var col in wolf.GetComponentsInChildren<Collider>(true))
+        {
+            if (col == null) continue;
+            if (col is MeshCollider)
+            {
+                Destroy(col);
+                continue;
+            }
+            col.enabled = false;
+        }
+        foreach (var wander in wolf.GetComponentsInChildren<MonoBehaviour>(true))
+        {
+            if (wander == null) continue;
+            string tn = wander.GetType().Name;
+            if (tn == "SheepWander" || tn.Contains("Wander"))
+                Destroy(wander);
+        }
+
+        // Пустой Animator + Avatar на FBX scale100 — лучше снести, bind-pose как есть.
+        foreach (var a in wolf.GetComponentsInChildren<Animator>(true))
+        {
+            if (a != null)
+                Destroy(a);
+        }
+        _anim = null;
+        _animHasSpeed = false;
+
+        _wolfAnim = wolf.GetComponent<StreamingSurvivalWolfAnim>();
+        if (_wolfAnim == null)
+            _wolfAnim = wolf.AddComponent<StreamingSurvivalWolfAnim>();
+        _wolfAnim.Bind(wolf.transform);
+        _wolfAnim.SetMoveAmount(0f);
+
+        if (_cc != null)
+        {
+            _cc.height = 0.95f;
+            _cc.radius = 0.45f;
+            _cc.center = new Vector3(0f, 0.45f, 0f);
+        }
+
+        if (_labelTf != null)
+            _labelTf.localPosition = new Vector3(0f, 1.55f, 0f);
+
+        _isWolfSkin = true;
+        _wolfHp = WolfMaxHp;
+        _combatHp = CombatMaxHp;
+        _zombieHitsTaken = 0;
+        _wolfCdEndsUnix = 0;
+        SnapToGround();
+        Debug.Log($"[SSPos] wolf_skin_applied user={Username} scale=1.2 static_bind_pose=1");
+        return true;
+    }
+
+    /// <summary>Вернуть humanoid Jack-визуал (после #i_human).</summary>
+    public bool ApplyHumanSkin()
+    {
+        if (!_isWolfSkin)
+        {
+            // Уже человек — только убедиться, что меши включены (после кривого clone).
+            var renderersAlready = GetComponentsInChildren<Renderer>(true);
+            for (int i = 0; i < renderersAlready.Length; i++)
+            {
+                var r = renderersAlready[i];
+                if (r != null) r.enabled = true;
+            }
+            return true;
+        }
+        for (int i = transform.childCount - 1; i >= 0; i--)
+        {
+            var ch = transform.GetChild(i);
+            if (ch != null && ch.name == "WolfSkin")
+                DestroyImmediate(ch.gameObject);
+        }
+        _wolfAnim = null;
+        _isWolfSkin = false;
+        _wolfCdEndsUnix = 0;
+
+        var renderers = GetComponentsInChildren<Renderer>(true);
+        for (int i = 0; i < renderers.Length; i++)
+        {
+            var r = renderers[i];
+            if (r == null) continue;
+            if (_label != null && r.gameObject == _label.gameObject) continue;
+            r.enabled = true;
+        }
+        var anims = GetComponentsInChildren<Animator>(true);
+        for (int i = 0; i < anims.Length; i++)
+        {
+            if (anims[i] != null)
+                anims[i].enabled = true;
+        }
+        _anim = null;
+        PrepareAnimator();
+        if (_cc != null)
+        {
+            _cc.height = 1.8f;
+            _cc.radius = 0.35f;
+            _cc.center = new Vector3(0f, 0.9f, 0f);
+        }
+        if (_labelTf != null)
+            _labelTf.localPosition = new Vector3(0f, 1.55f, 0f);
+        if (Action == "kill_zombie")
+            ApplyStep("idle", "Ждёт у базы", 1);
+        else
+            RefreshLabel();
+        Debug.Log($"[SSPos] human_skin_applied user={Username}");
+        return true;
+    }
+
+    public void ResetEpisodeWolfDiagnostics()
+    {
+        _wolfCdStuckThisEpisode = false;
+        _wolfHitsThisEpisode = 0;
+        _wolfCdWatchStartUnix = -1;
+        _wolfCdWatchLeft = -1f;
+    }
+
+    /// <summary>
+    /// Всегда из Controller.Update: детект залипшего КД + обновление лейбла,
+    /// даже если TickGameplay рано вышел (inactive hierarchy).
+    /// </summary>
+    public void TickWolfDiagnosticsAndLabel()
+    {
+        if (!_isWolfSkin)
+            return;
+        WatchAndFixWolfCd();
+        RefreshLabel();
+    }
+
+    void WatchAndFixWolfCd()
+    {
+        float left = WolfCdLeft;
+        double now = WallUnixNow();
+        if (left <= 0.05f)
+        {
+            _wolfCdWatchStartUnix = -1;
+            _wolfCdWatchLeft = -1f;
+            return;
+        }
+
+        // КД должен падать ~1с/с. Если за 0.6с wall-clock почти не упал — залипание.
+        if (_wolfCdWatchStartUnix < 0)
+        {
+            _wolfCdWatchStartUnix = now;
+            _wolfCdWatchLeft = left;
+            return;
+        }
+
+        double elapsed = now - _wolfCdWatchStartUnix;
+        if (elapsed < 0.6)
+            return;
+
+        float dropped = _wolfCdWatchLeft - left;
+        if (dropped < 0.15f)
+        {
+            _wolfCdStuckThisEpisode = true;
+            _wolfCdStuckCount++;
+            _wolfCdEndsUnix = 0;
+            Debug.LogWarning(
+                $"[SSPos] wolf_cd_stuck_cleared user={Username} left={left:F2} " +
+                $"dropped={dropped:F2} over={elapsed:F2}s count={_wolfCdStuckCount}");
+        }
+
+        _wolfCdWatchStartUnix = now;
+        _wolfCdWatchLeft = WolfCdLeft;
     }
 
     void SnapToGround()
@@ -506,6 +926,7 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
             case "collect_stone": return "Добывает камень";
             case "collect_food": return "Собирает еду";
             case "kill_sheep": return "Убивает овечек";
+            case "kill_zombie": return "Бьёт зомби";
             case "build_campfire": return "Ставит костёр";
             case "go_home":
             case "go_to_base": return "Идёт к дому";
@@ -535,7 +956,25 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
             case "collect_wood":
             case "collect_food":
             case "kill_sheep":
+            case "kill_zombie":
             case "build_campfire":
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    static bool IsWolfForbiddenGatherAction(string action)
+    {
+        switch ((action ?? "").ToLowerInvariant())
+        {
+            case "collect_water":
+            case "go_to_water":
+            case "collect_wood":
+            case "go_to_tree":
+            case "collect_food":
+            case "kill_sheep":
+            case "go_to_sheep":
                 return true;
             default:
                 return false;
@@ -558,13 +997,65 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
         }
     }
 
+    bool ShouldPersistDoAction(string action)
+    {
+        if (!IsPersistableDoAction(action))
+            return false;
+        if (_isWolfSkin && IsWolfForbiddenGatherAction(action))
+            return false;
+        return true;
+    }
+
+    void RememberDoAction(string action, string actionName, int amount)
+    {
+        if (!ShouldPersistDoAction(action))
+            return;
+        _lastDoAction = action;
+        _lastDoActionName = string.IsNullOrEmpty(actionName) ? NameFor(action) : actionName;
+        _lastDoAmount = amount < 1 ? 1 : amount;
+    }
+
     void ApplyStep(string action, string actionName, int amount)
     {
-        Action = string.IsNullOrEmpty(action) ? "idle" : action.ToLowerInvariant();
+        string normalized = string.IsNullOrEmpty(action) ? "idle" : action.ToLowerInvariant();
+
+        if (_combatHp <= 0)
+        {
+            RememberDoAction(normalized, actionName, amount);
+            RefreshLabel();
+            return;
+        }
+
+        Action = normalized;
         if (Action == "circle") Action = "walk_circle";
         if (Action == "go_to_base") Action = "go_home";
         if (Action == "respawn_character") Action = "manual_respawn";
+        if (Action == "kill_zombie" && !_isWolfSkin)
+        {
+            Debug.LogWarning($"[SSPos] kill_zombie requires wolf skin user={Username}");
+            Action = "idle";
+            ActionName = "Нужен #i_wolf";
+            _needAmount = 1;
+            _doneAmount = 0;
+            RefreshLabel();
+            ResumeLastAction();
+            return;
+        }
+        // Волк — только бой с зомби (не добыча воды/дерева/еды).
+        if (_isWolfSkin && IsWolfForbiddenGatherAction(Action))
+        {
+            Debug.LogWarning($"[SSPos] wolf_forbid_gather user={Username} action={Action}");
+            Action = "idle";
+            ActionName = "Волк: только #do бей зомби";
+            _needAmount = 1;
+            _doneAmount = 0;
+            RefreshLabel();
+            ResumeLastAction();
+            return;
+        }
         ActionName = string.IsNullOrEmpty(actionName) ? NameFor(Action) : actionName;
+        if (Action == "kill_zombie")
+            ActionName = $"{NameFor(Action)} ({_wolfHp} HP)";
         _needAmount = amount < 1 ? 1 : amount;
         _doneAmount = 0;
         ReachedResourceFlag = false;
@@ -574,9 +1065,10 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
             : StreamingSurvivalResourceGuard.CollectState.None;
         _allowWander = ActionName.IndexOf("Гуля", System.StringComparison.OrdinalIgnoreCase) >= 0
             || ActionName.IndexOf("гуля", System.StringComparison.OrdinalIgnoreCase) >= 0;
-        if (_needAmount > 1)
+        if (_needAmount > 1 && Action != "kill_zombie")
             ActionName = $"{ActionName} ({_doneAmount}/{_needAmount})";
         RefreshLabel();
+        RememberDoAction(Action, ActionName, _needAmount);
         Vector3 p = transform.position;
         Debug.Log(
             $"[SSPos] set_action user={Username} action={Action} amount={_needAmount} " +
@@ -771,8 +1263,13 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
             CanCompleteResourceNow = false;
             LastGuardDistance = dist;
         }
-        // Stream overlay: nickname only (no debug Action/State/TELEPORT dump).
-        _label.text = string.IsNullOrEmpty(Username) ? "viewer" : Username;
+        // Stream overlay: nickname; for wolf — CD remaining (realtime wall clock).
+        string nick = string.IsNullOrEmpty(Username) ? "viewer" : Username;
+        float cdLeft = WolfCdLeft;
+        if (_isWolfSkin && cdLeft > 0.05f)
+            _label.text = $"{nick}\nКД {cdLeft:0.0}с";
+        else
+            _label.text = nick;
     }
 
     int _gameplayTickFrame = -1;
@@ -795,6 +1292,34 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
 
         var ctrl = StreamingSurvivalController.Instance;
         if (ctrl == null) return;
+
+        if (_combatHp <= 0)
+        {
+            SetAnimSpeed(0f);
+            RefreshLabel();
+            return;
+        }
+
+        // Волчий бой / лейбл КД — даже если иерархия ещё inactive (иначе КД замирает на 2.8).
+        if (_isWolfSkin && Action == "kill_zombie")
+        {
+            if (!gameObject.activeSelf)
+                gameObject.SetActive(true);
+            if (!enabled)
+                enabled = true;
+            WatchAndFixWolfCd();
+            TickWolfKillZombie();
+            RefreshLabel();
+            // Если GO всё ещё выключен — хотя бы лейбл/КД уже обновлены.
+            if (!isActiveAndEnabled || !gameObject.activeInHierarchy)
+            {
+                var host = StreamingSurvivalController.Instance;
+                if (host != null && !gameObject.activeInHierarchy)
+                    transform.SetParent(host.transform, true);
+            }
+            return;
+        }
+
         if (!isActiveAndEnabled || !gameObject.activeInHierarchy)
         {
             // Recover from inactive hierarchy / disabled script so QA agents keep walking.
@@ -851,19 +1376,26 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
                 break;
 
             case Phase.GoTarget:
-                // Sheep wander — keep chasing the nearest live one, never a frozen rock/spawner stand.
+                // Sheep: держим claim на одну овцу; stand обновляем вокруг неё (овца бродит).
+                // Не перескакивать на «ближайшую» каждый кадр — иначе двое телепортятся на одну.
                 if (Action == "collect_food" || Action == "kill_sheep" || Action == "go_to_sheep")
                 {
-                    if (!_hasLockedWorkTarget)
+                    if (!_hasLockedWorkTarget || !IsLiveHarvestSheep(_sheepVictim))
                     {
                         _phaseEnteredAt = Time.time;
                         if (StreamingSurvivalResourceGuard.IsResourceAction(Action))
                             CollectState = StreamingSurvivalResourceGuard.CollectState.MovingToResource;
+                        _lockedWorkTarget = Action == "go_to_sheep"
+                            ? ResolveMovementTarget()
+                            : ResolveWorkTarget();
+                        _hasLockedWorkTarget = true;
                     }
-                    _lockedWorkTarget = Action == "go_to_sheep"
-                        ? ResolveMovementTarget()
-                        : ResolveWorkTarget();
-                    _hasLockedWorkTarget = true;
+                    else if (_sheepVictim != null)
+                    {
+                        _lockedWorkTarget = ApproachStandSpread(
+                            transform.position, _sheepVictim.position, 1.35f);
+                        SetTargetMeta("sheep", "sheep_live", _lockedWorkTarget, _sheepVictim.position);
+                    }
                 }
                 else if (!_hasLockedWorkTarget)
                 {
@@ -890,6 +1422,17 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
                 }
                 if (TryBeginWorkAtResource(ctrl))
                     break;
+                // За деревянным забором — сначала в paddock (цветы/спавн), потом к овце.
+                if ((Action == "collect_food" || Action == "kill_sheep" || Action == "go_to_sheep")
+                    && !StreamingSurvivalCampBounds.ContainsCamp(transform.position))
+                {
+                    Vector3 hub = SpawnPos(ctrl);
+                    hub.y = transform.position.y;
+                    _target = hub;
+                    _hasLockedWorkTarget = false;
+                    MoveToward(hub);
+                    break;
+                }
                 // East of fence → yard goal (tree/sheep/food): reverse corridor via spawn first.
                 {
                     Vector3 dest = _lockedWorkTarget;
@@ -1177,6 +1720,8 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
         if (Action == "collect_wood" || Action == "go_to_tree"
             || Action == "collect_food" || Action == "kill_sheep" || Action == "go_to_sheep")
             return Mathf.Max(r, 1.55f);
+        if (Action == "kill_zombie")
+            return Mathf.Max(r, WolfAttackRange);
         if (r > 0f) return r;
         return 1.4f;
     }
@@ -1200,6 +1745,15 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
             if (FindSheep() == null || !IsLiveHarvestSheep(_sheepVictim))
                 return false;
             if (Horiz(transform.position, _sheepVictim.position) > arrive + 0.6f)
+                return false;
+        }
+        if (Action == "kill_zombie")
+        {
+            if (!_isWolfSkin || FindZombie() == null || !IsLiveZombie(_zombieVictim))
+                return false;
+            if (IsWolfOnCooldown)
+                return false;
+            if (Horiz(transform.position, _zombieVictim.position) > WolfAttackRange)
                 return false;
         }
 
@@ -1263,6 +1817,7 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
             // Single chat action without queue — keep farming until viewer sends a new #do.
             if (Action == "collect_water" || Action == "collect_wood"
                 || Action == "collect_food" || Action == "kill_sheep"
+                || Action == "kill_zombie"
                 || Action == "build_campfire")
             {
                 _doneAmount = 0;
@@ -1320,10 +1875,86 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
 
     void LateUpdate()
     {
+        if (_isWolfSkin && Action == "kill_zombie")
+            RefreshLabel();
         if (_labelTf == null) return;
         var cam = BillboardIconCamera.Resolve(_labelTf.position, null);
         if (cam != null)
             _labelTf.rotation = cam.transform.rotation;
+    }
+
+    /// <summary>
+    /// Прямой бой волка с зомби: бежит к телу зомби и бьёт с КД, без фазы Work.
+    /// </summary>
+    void TickWolfKillZombie()
+    {
+        if (!_isWolfSkin)
+        {
+            Debug.LogWarning($"[SSPos] kill_zombie requires wolf skin user={Username}");
+            ApplyStep("idle", "Нужен #i_wolf", 1);
+            return;
+        }
+
+        _phase = Phase.GoTarget;
+        CollectState = StreamingSurvivalResourceGuard.CollectState.MovingToResource;
+
+        if (!IsLiveZombie(_zombieVictim))
+            FindZombie();
+
+        if (!IsLiveZombie(_zombieVictim))
+        {
+            SetAnimSpeed(0f);
+            ActionName = $"Бьёт зомби ({_wolfHp} HP) — нет целей";
+            RefreshLabel();
+            return;
+        }
+
+        Vector3 zpos = _zombieVictim.position;
+        float d = Horiz(transform.position, zpos);
+        SetTargetMeta("zombie", "zombie_live", zpos, zpos);
+        _target = zpos;
+        _lockedWorkTarget = zpos;
+        _hasLockedWorkTarget = true;
+        ActionName = $"Бьёт зомби ({_wolfHp} HP)";
+
+        float cdLeft = WolfCdLeft;
+        bool onCd = cdLeft > 0.05f;
+
+        // Пока КД — можно подбегать ближе, но не бить.
+        if (d > WolfAttackRange * 0.85f)
+        {
+            MoveToward(zpos);
+            RefreshLabel();
+            return;
+        }
+
+        SetAnimSpeed(0f);
+        Vector3 to = zpos - transform.position;
+        to.y = 0f;
+        if (to.sqrMagnitude > 1e-4f)
+            transform.rotation = Quaternion.LookRotation(to.normalized, Vector3.up);
+
+        if (onCd)
+        {
+            RefreshLabel();
+            return;
+        }
+
+        if (!TryWolfHitZombie())
+        {
+            _zombieVictim = null;
+            _hasLockedWorkTarget = false;
+            RefreshLabel();
+            return;
+        }
+
+        if (_wolfHp <= 0)
+        {
+            OnWolfHpDepleted();
+            return;
+        }
+
+        RefreshLabel();
     }
 
     void DoIdleWander(StreamingSurvivalController ctrl)
@@ -1447,6 +2078,21 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
             var sheepSpawner = TrainingEnvSpace.FindInPresentation<SheepSpawner>()
                 ?? Object.FindFirstObjectByType<SheepSpawner>();
             sheepSpawner?.NotifySheepEaten();
+        }
+        if (Action == "kill_zombie")
+        {
+            if (!TryWolfHitZombie())
+            {
+                CollectState = StreamingSurvivalResourceGuard.CollectState.Denied;
+                RefreshLabel();
+                return;
+            }
+            if (_wolfHp <= 0)
+            {
+                CollectState = StreamingSurvivalResourceGuard.CollectState.ResourceAdded;
+                OnWolfHpDepleted();
+                return;
+            }
         }
         Deliver(ctrl);
         CollectState = StreamingSurvivalResourceGuard.CollectState.ResourceAdded;
@@ -1637,6 +2283,9 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
                 // Еда = мясо с овцы; в #stats одна метрика — овцы (не дублировать food+sheep).
                 StreamingSurvivalStatsReporter.Report(Username, "sheep");
                 break;
+            case "kill_zombie":
+                // Стату кидаем только при реальном убийстве (внутри TryWolfHitZombie).
+                break;
         }
     }
 
@@ -1694,13 +2343,25 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
                 var live = FindSheep();
                 if (live.HasValue)
                 {
-                    Vector3 stand = ApproachStand(transform.position, live.Value, 1.35f);
+                    Vector3 stand = ApproachStandSpread(transform.position, live.Value, 1.35f);
                     SetTargetMeta("sheep", "sheep_live", stand, live.Value);
                     return stand;
                 }
-                Vector3 meadow = SheepMeadowStand();
+                Vector3 meadow = ApproachStandSpread(transform.position, SheepMeadowStand(), 1.8f);
                 SetTargetMeta("sheep", "sheep_meadow", meadow);
                 return meadow;
+            }
+            case "kill_zombie":
+            {
+                var z = FindZombie();
+                if (z.HasValue)
+                {
+                    Vector3 stand = ApproachStandSpread(transform.position, z.Value, 2.55f);
+                    SetTargetMeta("zombie", "zombie_live", stand, z.Value);
+                    return stand;
+                }
+                SetTargetMeta("zombie", "zombie_missing", _home, _home);
+                return _home;
             }
             default:
                 return _home;
@@ -1736,14 +2397,14 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
                 var sh = reg != null ? reg.GetNearestSheep(transform.position) : null;
                 if (sh != null)
                 {
-                    Vector3 stand = ApproachStand(transform.position, sh.Position, 1.35f);
+                    Vector3 stand = ApproachStandSpread(transform.position, sh.Position, 1.35f);
                     SetTargetMeta("sheep", sh.Id, stand, sh.Position);
                     return stand;
                 }
                 var sheep = FindSheep();
                 if (sheep.HasValue)
                 {
-                    Vector3 stand = ApproachStand(transform.position, sheep.Value, 1.35f);
+                    Vector3 stand = ApproachStandSpread(transform.position, sheep.Value, 1.35f);
                     SetTargetMeta("sheep", "sheep_fallback", stand, sheep.Value);
                     return stand;
                 }
@@ -1761,6 +2422,36 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
         if (d.sqrMagnitude < 0.0001f)
             d = Vector3.back;
         return new Vector3(anchor.x, from.y, anchor.z) + d.normalized * standDist;
+    }
+
+    /// <summary>Стоянка вокруг цели со смещением по нику — двое не встают в одну точку.</summary>
+    Vector3 ApproachStandSpread(Vector3 from, Vector3 anchor, float standDist)
+    {
+        Vector3 d = from - anchor;
+        d.y = 0f;
+        if (d.sqrMagnitude < 0.0001f)
+            d = Vector3.back;
+        float yaw = UsernameStandYaw();
+        Vector3 dir = Quaternion.Euler(0f, yaw, 0f) * d.normalized;
+        if (dir.sqrMagnitude < 0.0001f)
+            dir = Quaternion.Euler(0f, yaw, 0f) * Vector3.back;
+        Vector3 stand = new Vector3(anchor.x, from.y, anchor.z) + dir.normalized * standDist;
+        if (Action == "collect_food" || Action == "kill_sheep" || Action == "go_to_sheep")
+            stand = StreamingSurvivalCampBounds.ClampToSheepMeadow(stand);
+        return stand;
+    }
+
+    float UsernameStandYaw()
+    {
+        unchecked
+        {
+            int h = 17;
+            string u = Username ?? "viewer";
+            for (int i = 0; i < u.Length; i++)
+                h = h * 31 + char.ToLowerInvariant(u[i]);
+            // 0..330° шагом ~30° — разные ники вокруг овцы/поляны.
+            return (Mathf.Abs(h) % 12) * 30f;
+        }
     }
 
     Vector3 BasePos(StreamingSurvivalController ctrl)
@@ -2436,11 +3127,129 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
 
     void TriggerDo()
     {
+        if (_isWolfSkin)
+        {
+            if (_wolfAnim != null)
+                _wolfAnim.PlayAttack();
+            Debug.Log($"[SSPos] wolf_attack user={Username} action={Action} hp={_wolfHp}");
+            return;
+        }
         if (_anim == null) PrepareAnimator();
         if (_anim == null) return;
         _anim.ResetTrigger("Do");
         _anim.SetTrigger("Do");
         Debug.Log($"[SSPos] anim_do user={Username} action={Action}");
+    }
+
+    static bool IsLiveZombie(Transform t)
+    {
+        if (t == null || !t.gameObject.activeInHierarchy) return false;
+        return t.GetComponentInChildren<ZombieChase>(true) != null;
+    }
+
+    Vector3? FindZombie()
+    {
+        if (IsLiveZombie(_zombieVictim))
+            return _zombieVictim.position;
+
+        var root = TrainingEnvSpace.PresentationRoot;
+        var chases = root != null
+            ? root.GetComponentsInChildren<ZombieChase>(true)
+            : Object.FindObjectsByType<ZombieChase>(FindObjectsInactive.Exclude, FindObjectsSortMode.None);
+        Transform best = null;
+        float bestD = float.MaxValue;
+        Vector3 from = transform.position;
+        if (chases != null)
+        {
+            for (int i = 0; i < chases.Length; i++)
+            {
+                var z = chases[i];
+                if (z == null || !z.gameObject.activeInHierarchy) continue;
+                float d = Horiz(from, z.transform.position);
+                if (d >= bestD) continue;
+                bestD = d;
+                best = z.transform;
+            }
+        }
+        _zombieVictim = best;
+        return best != null ? best.position : (Vector3?)null;
+    }
+
+    /// <returns>true if hit landed (zombie may still be alive).</returns>
+    bool TryWolfHitZombie()
+    {
+        if (!_isWolfSkin)
+            return false;
+        // Wall-clock КД — не зависит от Time.timeScale / DeathFreeze.
+        if (IsWolfOnCooldown)
+            return false;
+        if (!IsLiveZombie(_zombieVictim))
+            FindZombie();
+        if (!IsLiveZombie(_zombieVictim))
+            return false;
+
+        var chase = _zombieVictim.GetComponentInChildren<ZombieChase>(true);
+        if (chase == null)
+            return false;
+
+        // Ставим КД сразу, до эффектов — защита от двойного удара в одном кадре.
+        _wolfCdEndsUnix = WallUnixNow() + WolfAttackCooldown;
+        _wolfCdWatchStartUnix = WallUnixNow();
+        _wolfCdWatchLeft = WolfAttackCooldown;
+        _wolfHitsThisEpisode++;
+
+        if (_wolfAnim != null)
+            _wolfAnim.PlayAttack();
+
+        // Face the zombie.
+        Vector3 to = _zombieVictim.position - transform.position;
+        to.y = 0f;
+        if (to.sqrMagnitude > 1e-4f)
+            transform.rotation = Quaternion.LookRotation(to.normalized, Vector3.up);
+
+        chase.Stun(0.55f);
+        bool killed = chase.RegisterMeleeDoHitAndMaybeDie(WolfHitsToKillZombie);
+
+        _wolfHp = Mathf.Max(0, _wolfHp - WolfHitHpCost);
+        ActionName = $"{NameFor("kill_zombie")} ({_wolfHp} HP)";
+        RefreshLabel();
+        Debug.Log(
+            $"[SSPos] wolf_hit_zombie user={Username} killed={killed} hp={_wolfHp} " +
+            $"cd={WolfAttackCooldown:0.0}s wallclock z=({_zombieVictim.position.x:F1},{_zombieVictim.position.z:F1})");
+
+        if (killed)
+        {
+            StreamingSurvivalStatsReporter.Report(Username, "zombie");
+            _zombieVictim = null;
+            _hasLockedWorkTarget = false;
+        }
+
+        return true;
+    }
+
+    bool IsWolfOnCooldown => WallUnixNow() < _wolfCdEndsUnix;
+    float WolfCdLeft => Mathf.Max(0f, (float)(_wolfCdEndsUnix - WallUnixNow()));
+
+    void OnWolfHpDepleted()
+    {
+        // Раньше телепорт на _home (wolf_down) — выглядело как «выброс на спавн» среди боя.
+        // Stamina обнуляется после ~4 ударов; остаёмся на месте и продолжаем #do бей зомби.
+        Vector3 p = transform.position;
+        Debug.Log(
+            $"[SSPos] WOLF_STAMINA_RESET_NO_TELEPORT user={Username} " +
+            $"pos=({p.x:F1},{p.z:F1})");
+        FollowerEpisodeJournal.NoteEvent(this, "wolf_stamina_reset", "no_teleport");
+        _wolfHp = WolfMaxHp;
+        _zombieVictim = null;
+        _hasLockedWorkTarget = false;
+        ActionName = $"{NameFor("kill_zombie")} ({_wolfHp} HP)";
+        RefreshLabel();
+        if (Action == "kill_zombie")
+            ResumeLastAction();
+        else if (!string.IsNullOrEmpty(_lastDoAction) && _lastDoAction == "kill_zombie")
+            ApplyStep(_lastDoAction, _lastDoActionName, _lastDoAmount);
+        else
+            ApplyStep("kill_zombie", NameFor("kill_zombie"), 1);
     }
 
     Vector3? FindWater()
@@ -2540,12 +3349,17 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
 
     Vector3? FindSheep()
     {
+        // Держим claim: пока овца жива — не прыгать на другую (иначе mysticggx+polina телепортятся вдвоём).
+        if (IsLiveHarvestSheep(_sheepVictim)
+            && !IsSheepClaimedByOther(_sheepVictim)
+            && StreamingSurvivalCampBounds.ContainsSheepMeadow(_sheepVictim.position))
+            return _sheepVictim.position;
+
+        var ctrl = StreamingSurvivalController.Instance;
         var spawner = TrainingEnvSpace.FindInPresentation<SheepSpawner>()
             ?? Object.FindFirstObjectByType<SheepSpawner>();
         if (spawner != null
-            && spawner.TryGetNearestAliveSheep(transform.position, out GameObject go, out Vector3 pos)
-            && go != null
-            && IsLiveHarvestSheep(go.transform))
+            && TryPickUnclaimedSheep(spawner, ctrl, out GameObject go, out Vector3 pos))
         {
             _sheepVictim = go.transform;
             return pos;
@@ -2562,6 +3376,24 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
             {
                 var s = sheep[i];
                 if (!IsLiveHarvestSheep(s != null ? s.transform : null)) continue;
+                if (IsSheepClaimedByOther(s.transform)) continue;
+                if (!StreamingSurvivalCampBounds.ContainsSheepMeadow(s.transform.position)) continue;
+                float d = Horiz(transform.position, s.transform.position);
+                if (d < bestD)
+                {
+                    bestD = d;
+                    best = s.transform;
+                }
+            }
+        }
+        // Все заняты — fallback на ближайшую внутри paddock (не гоняться за овцой за забором).
+        if (best == null && sheep != null)
+        {
+            for (int i = 0; i < sheep.Length; i++)
+            {
+                var s = sheep[i];
+                if (!IsLiveHarvestSheep(s != null ? s.transform : null)) continue;
+                if (!StreamingSurvivalCampBounds.ContainsSheepMeadow(s.transform.position)) continue;
                 float d = Horiz(transform.position, s.transform.position);
                 if (d < bestD)
                 {
@@ -2572,6 +3404,34 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
         }
         _sheepVictim = best;
         return best != null ? best.position : (Vector3?)null;
+    }
+
+    bool TryPickUnclaimedSheep(
+        SheepSpawner spawner, StreamingSurvivalController ctrl, out GameObject sheep, out Vector3 worldPos)
+    {
+        sheep = null;
+        worldPos = default;
+        if (spawner == null) return false;
+        // Prefer nearest unclaimed via spawner list.
+        if (!spawner.TryGetNearestAliveSheep(transform.position, out GameObject nearest, out Vector3 nearestPos))
+            return false;
+        if (nearest != null
+            && IsLiveHarvestSheep(nearest.transform)
+            && StreamingSurvivalCampBounds.ContainsSheepMeadow(nearestPos)
+            && (ctrl == null || !ctrl.IsSheepClaimedByOther(nearest.transform, this)))
+        {
+            sheep = nearest;
+            worldPos = nearestPos;
+            return true;
+        }
+        // Nearest claimed — scan all via FindObjects path in FindSheep.
+        return false;
+    }
+
+    bool IsSheepClaimedByOther(Transform sheep)
+    {
+        var ctrl = StreamingSurvivalController.Instance;
+        return ctrl != null && ctrl.IsSheepClaimedByOther(sheep, this);
     }
 
     Vector3 SheepMeadowStand()
@@ -2642,9 +3502,11 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
             return;
         }
         Vector3 dir = SteerAroundObstacles(flat.normalized);
-        Vector3 move = dir * (_speed * Time.deltaTime);
+        // При timeScale=0 (зависший DeathFreeze на стриме) всё равно двигаем wall-clock'ом.
+        float dt = Time.timeScale > 0.01f ? Time.deltaTime : Time.unscaledDeltaTime;
+        Vector3 move = dir * (_speed * dt);
         if (_cc != null && _cc.enabled)
-            _cc.Move(move + Vector3.down * 9.81f * Time.deltaTime);
+            _cc.Move(move + Vector3.down * 9.81f * dt);
         else
             transform.position += move;
         StreamingSurvivalTrajectoryRecorder.SampleGround(
@@ -2654,7 +3516,7 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
         if (dir.sqrMagnitude > 0.0001f)
         {
             transform.rotation = Quaternion.Slerp(
-                transform.rotation, Quaternion.LookRotation(dir), 8f * Time.deltaTime);
+                transform.rotation, Quaternion.LookRotation(dir), 8f * dt);
         }
         SetAnimSpeed(1f);
     }
@@ -2707,10 +3569,13 @@ public sealed class StreamingSurvivalPlayer : MonoBehaviour
     void SetAnimSpeed(float target)
     {
         _animSpeed = Mathf.MoveTowards(_animSpeed, target, 6f * Time.deltaTime);
+        if (_wolfAnim != null)
+            _wolfAnim.SetMoveAmount(_animSpeed);
         if (_anim != null)
         {
             _anim.applyRootMotion = false;
-            _anim.SetFloat("Speed", _animSpeed);
+            if (_animHasSpeed)
+                _anim.SetFloat("Speed", _animSpeed);
         }
     }
 

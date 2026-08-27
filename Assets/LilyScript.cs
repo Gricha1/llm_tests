@@ -708,6 +708,7 @@ public class LilyScript : Agent, IHasHp
     public override void OnEpisodeBegin()
     {
         _deathSequenceStarted = false;
+        HeroDeathVisual.Clear(this);
         if (TrainingEnvSpace.IsPresentationTransform(transform))
         {
             DeathFreeze.UnfreezeWorld();

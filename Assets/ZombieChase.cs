@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using UnityEngine;
 
 /// <summary>
@@ -43,6 +44,168 @@ public class ZombieChase : MonoBehaviour
     [SerializeField] private float walkAnimSpeedDamp = 0f;
 
     static readonly int SpeedParamHash = Animator.StringToHash("Speed");
+
+    private Transform _lastChaseTarget;
+    private string _lastChaseTargetKind = "";
+    private string _lastChaseTargetName = "";
+    private float _lastChaseTargetDist = -1f;
+
+    public Transform LastChaseTarget => _lastChaseTarget;
+    public string LastChaseTargetKind => _lastChaseTargetKind;
+    public string LastChaseTargetName => _lastChaseTargetName;
+    public float LastChaseTargetDist => _lastChaseTargetDist;
+
+    public struct ChaseCandidate
+    {
+        public string kind;
+        public string name;
+        public float x;
+        public float z;
+        public float dist;
+        /// <summary>ok или skip:reason</summary>
+        public string status;
+    }
+
+    public void RememberChaseTarget(Transform target)
+    {
+        _lastChaseTarget = target;
+        if (target == null)
+        {
+            _lastChaseTargetKind = "";
+            _lastChaseTargetName = "";
+            _lastChaseTargetDist = -1f;
+            return;
+        }
+
+        DescribeTarget(target, transform.position, out _lastChaseTargetKind, out _lastChaseTargetName, out _lastChaseTargetDist);
+    }
+
+    public static void DescribeTarget(
+        Transform target, Vector3 fromPos, out string kind, out string name, out float dist)
+    {
+        kind = "unknown";
+        name = target != null ? target.name : "";
+        dist = -1f;
+        if (target == null)
+            return;
+
+        Vector3 p = target.position;
+        float dx = p.x - fromPos.x;
+        float dz = p.z - fromPos.z;
+        dist = Mathf.Sqrt(dx * dx + dz * dz);
+
+        var follower = target.GetComponentInParent<StreamingSurvivalPlayer>();
+        if (follower != null)
+        {
+            kind = "follower";
+            name = string.IsNullOrEmpty(follower.Username) ? follower.name : follower.Username;
+            return;
+        }
+
+        var lily = target.GetComponentInParent<LilyScript>();
+        if (lily != null)
+        {
+            kind = "lily";
+            name = "Lily";
+            return;
+        }
+
+        var agent = target.GetComponentInParent<AgentGoToHouseDiscrete>();
+        if (agent != null)
+        {
+            kind = TrainingEnvSpace.IsGeorgeAgent(agent) ? "george" : "jack";
+            name = kind == "george" ? "George" : "Jack";
+            return;
+        }
+    }
+
+    /// <summary>Все кандидаты целей с этого зомби (для SNAP / UI).</summary>
+    public void CollectChaseCandidates(List<ChaseCandidate> into)
+    {
+        if (into == null)
+            return;
+        CollectChaseCandidatesFrom(transform.position, TrainingEnvSpace.FindRoot(transform), into);
+    }
+
+    public static void CollectChaseCandidatesFrom(
+        Vector3 fromPos, Transform zombieEnvRoot, List<ChaseCandidate> into)
+    {
+        if (into == null)
+            return;
+
+        void Add(string kind, string name, Transform t, string status)
+        {
+            if (t == null)
+                return;
+            float dx = t.position.x - fromPos.x;
+            float dz = t.position.z - fromPos.z;
+            into.Add(new ChaseCandidate
+            {
+                kind = kind,
+                name = name,
+                x = t.position.x,
+                z = t.position.z,
+                dist = Mathf.Sqrt(dx * dx + dz * dz),
+                status = status,
+            });
+        }
+
+        var envRoot = zombieEnvRoot;
+        if (envRoot != null)
+        {
+            var agents = envRoot.GetComponentsInChildren<AgentGoToHouseDiscrete>(false);
+            for (int i = 0; i < agents.Length; i++)
+            {
+                var a = agents[i];
+                if (a == null) continue;
+                string kind = TrainingEnvSpace.IsGeorgeAgent(a) ? "george" : "jack";
+                string status = IsValidChaseAgent(a) ? "ok" : "skip:invalid_agent";
+                Add(kind, kind == "george" ? "George" : "Jack", a.transform, status);
+            }
+
+            var lilies = envRoot.GetComponentsInChildren<LilyScript>(false);
+            for (int i = 0; i < lilies.Length; i++)
+            {
+                var lily = lilies[i];
+                if (lily == null) continue;
+                string status = IsValidChaseLily(lily) ? "ok" : "skip:invalid_lily";
+                Add("lily", "Lily", lily.transform, status);
+            }
+        }
+
+        var followers = GetCachedFollowers();
+        if (followers != null)
+        {
+            for (int i = 0; i < followers.Length; i++)
+            {
+                var p = followers[i];
+                if (p == null) continue;
+                string status = FollowerChaseStatus(p, zombieEnvRoot);
+                Add("follower", string.IsNullOrEmpty(p.Username) ? p.name : p.Username, p.transform, status);
+            }
+        }
+        else
+        {
+            var ctrl = StreamingSurvivalController.Instance;
+            ctrl?.ForEachPlayer(p =>
+            {
+                if (p == null) return;
+                string status = FollowerChaseStatus(p, zombieEnvRoot);
+                Add("follower", string.IsNullOrEmpty(p.Username) ? p.name : p.Username, p.transform, status);
+            });
+        }
+    }
+
+    public static string FollowerChaseStatus(StreamingSurvivalPlayer p, Transform zombieEnvRoot)
+    {
+        if (p == null) return "skip:null";
+        if (!p.gameObject.activeInHierarchy) return "skip:inactive";
+        if (!p.enabled) return "skip:component_disabled";
+        if (p.Hp <= 0) return "skip:hp0";
+        if (!IsValidChaseFollower(p, zombieEnvRoot))
+            return "skip:filter";
+        return "ok";
+    }
 
     private CharacterController controller;
     private Rigidbody rb;
@@ -121,7 +284,36 @@ public class ZombieChase : MonoBehaviour
 
     static bool IsValidChaseLily(LilyScript lily)
     {
-        return lily != null && lily.gameObject.activeInHierarchy && lily.Hp > 0;
+        return lily != null && lily.gameObject.activeInHierarchy && lily.Hp > 0 && !lily.IsInDeathState;
+    }
+
+    static bool IsValidChaseTransform(Transform candidate, Transform zombieEnvRoot)
+    {
+        if (candidate == null || !candidate.gameObject.activeInHierarchy)
+            return false;
+
+        var lily = candidate.GetComponentInParent<LilyScript>();
+        if (lily != null)
+            return IsValidChaseLily(lily);
+
+        var agent = candidate.GetComponentInParent<AgentGoToHouseDiscrete>();
+        if (agent != null)
+            return IsValidChaseAgent(agent);
+
+        var follower = candidate.GetComponentInParent<StreamingSurvivalPlayer>();
+        if (follower != null)
+            return IsValidChaseFollower(follower, zombieEnvRoot);
+
+        return false;
+    }
+
+    void PruneStaleSerializedTargets()
+    {
+        var envRoot = TrainingEnvSpace.FindRoot(transform);
+        if (!IsValidChaseTransform(jackTarget, envRoot))
+            jackTarget = null;
+        if (!IsValidChaseTransform(lilyTarget, envRoot))
+            lilyTarget = null;
     }
 
     float GetEffectiveStopDistance(Transform target)
@@ -466,13 +658,17 @@ public class ZombieChase : MonoBehaviour
             return;
         }
 
+        PruneStaleSerializedTargets();
+
         Transform target = GetClosestTarget();
+        RememberChaseTarget(target);
         if (target == null)
         {
             // Цель могла появиться позже спавна (Jack ещё не active) — перепривязать.
             if (jackTarget == null)
                 ResolveTargetsFromEnv();
             target = GetClosestTarget();
+            RememberChaseTarget(target);
         }
 
         if (target == null)
@@ -570,7 +766,10 @@ public class ZombieChase : MonoBehaviour
             return;
         }
 
+        PruneStaleSerializedTargets();
+
         Transform target = GetClosestTarget();
+        RememberChaseTarget(target);
         if (target == null) return;
 
         Vector3 delta = target.position - transform.position;
@@ -751,7 +950,10 @@ public class ZombieChase : MonoBehaviour
             animator.SetFloat(SpeedParamHash, target);
     }
 
-    /// <summary>Ближайший живой Jack, George или Lily в этом Env.</summary>
+    /// <summary>Для SNAP/UI: тот же выбор, что в Update.</summary>
+    public Transform PickClosestTargetPublic() => GetClosestTarget();
+
+    /// <summary>Ближайший живой Jack/George/Lily или стрим-фолловер.</summary>
     private Transform GetClosestTarget()
     {
         Vector3 pos = transform.position;
@@ -777,13 +979,88 @@ public class ZombieChase : MonoBehaviour
                     continue;
                 TryPickNearest(lilies[i].transform, pos, ref best, ref bestDist);
             }
-
-            if (best != null)
-                return best;
         }
 
-        TryPickNearest(jackTarget, pos, ref best, ref bestDist);
-        TryPickNearest(lilyTarget, pos, ref best, ref bestDist);
+        // Фолловеры со стрима — всегда в пуле целей (не только Jack/Lily).
+        ConsiderStreamingFollowers(pos, envRoot, ref best, ref bestDist);
+
+        if (IsValidChaseTransform(jackTarget, envRoot))
+            TryPickNearest(jackTarget, pos, ref best, ref bestDist);
+        if (IsValidChaseTransform(lilyTarget, envRoot))
+            TryPickNearest(lilyTarget, pos, ref best, ref bestDist);
         return best;
+    }
+
+    static StreamingSurvivalPlayer[] _followerCache;
+    static int _followerCacheFrame = -1;
+
+    /// <summary>Кэш фолловеров на кадр — общий для chase и attack.</summary>
+    public static StreamingSurvivalPlayer[] GetCachedFollowers()
+    {
+        int frame = Time.frameCount;
+        if (_followerCacheFrame != frame)
+        {
+            _followerCacheFrame = frame;
+            _followerCache = Object.FindObjectsByType<StreamingSurvivalPlayer>(
+                FindObjectsInactive.Exclude, FindObjectsSortMode.None);
+        }
+        return _followerCache;
+    }
+
+    static void ConsiderStreamingFollowers(
+        Vector3 fromPos, Transform zombieEnvRoot, ref Transform best, ref float bestDist)
+    {
+        var followers = GetCachedFollowers();
+        if (followers == null || followers.Length == 0)
+        {
+            var ctrl = StreamingSurvivalController.Instance;
+            if (ctrl == null)
+                return;
+            var tmp = new List<StreamingSurvivalPlayer>(8);
+            ctrl.ForEachPlayer(p =>
+            {
+                if (p != null)
+                    tmp.Add(p);
+            });
+            for (int i = 0; i < tmp.Count; i++)
+            {
+                if (!IsValidChaseFollower(tmp[i], zombieEnvRoot))
+                    continue;
+                TryPickNearest(tmp[i].transform, fromPos, ref best, ref bestDist);
+            }
+            return;
+        }
+
+        for (int i = 0; i < followers.Length; i++)
+        {
+            var p = followers[i];
+            if (!IsValidChaseFollower(p, zombieEnvRoot))
+                continue;
+            TryPickNearest(p.transform, fromPos, ref best, ref bestDist);
+        }
+    }
+
+    static bool IsValidChaseFollower(StreamingSurvivalPlayer p, Transform zombieEnvRoot)
+    {
+        if (p == null || !p.gameObject.activeInHierarchy)
+            return false;
+        // Не требуем enabled: TickGameplay иногда идёт с контроллера.
+        if (p.IsDeadToZombies || p.Hp <= 0)
+            return false;
+
+        // Стрим / live OBS / unified: любой живой фолловер — цель.
+        // Без Env-фильтра: иначе mysticggx / SSPlayer вне FindRoot зомби игнорируются.
+        if (TrainingEnvSpace.UseUnifiedFollowers
+            || TrainingEnvSpace.IsStreamOnlyMode
+            || TrainingEnvSpace.IsLivePresentationForObs)
+            return true;
+
+        if (zombieEnvRoot == null)
+            return true;
+
+        var root = TrainingEnvSpace.FindRoot(p.transform);
+        if (root != null && root != zombieEnvRoot)
+            return false;
+        return true;
     }
 }

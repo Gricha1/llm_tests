@@ -31,6 +31,7 @@ ALLOWED_ACTIONS = frozenset(
         "spin_in_place",
         "idle",
         "attack_user",
+        "kill_zombie",
     }
 )
 
@@ -50,6 +51,7 @@ KEEP_FARM_ACTIONS = frozenset(
         "collect_wood",
         "collect_food",
         "kill_sheep",
+        "kill_zombie",
         "build_campfire",
     }
 )
@@ -77,6 +79,7 @@ ACTION_NAMES_RU = {
     "spin_in_place": "Крутится",
     "idle": "Ждёт у базы",
     "attack_user": "Атакует игрока",
+    "kill_zombie": "Бьёт зомби",
 }
 
 FALLBACK_REPLY = "Не понял точно, персонаж будет ждать у базы."
@@ -102,6 +105,7 @@ _CANONICAL = frozenset(
         "spin_in_place",
         "idle",
         "attack_user",
+        "kill_zombie",
     }
 )
 
@@ -266,7 +270,13 @@ def _detect_action(t: str) -> Optional[str]:
     ):
         return "manual_respawn"
 
-    if re.search(r"атакуй|атаковать|attack\s*user|бей\s+\w+", t):
+    # Волк vs зомби — раньше attack_user (иначе «бей зомби» → attack_user).
+    if re.search(r"зомб|zombie|нежить|мертвец", t):
+        return "kill_zombie"
+
+    if re.search(r"атакуй|атаковать|attack\s*user|бей\s+\w+", t) and not re.search(
+        r"зомб|zombie", t
+    ):
         return "attack_user"
 
     if re.search(r"patrol|патрул|впер[её]д.*назад|назад.*впер[её]д|forward.*back", t):
@@ -334,6 +344,12 @@ def _detect_action(t: str) -> Optional[str]:
             return "go_to_sheep"
         return "kill_sheep"
 
+    # Zombie (wolf fight)
+    if re.search(r"зомб|zombie|нежить|мертвец", t):
+        if harvest or re.search(r"убива|убей|бей|бить|атак|дерись|дери|fight|attack|kill", t):
+            return "kill_zombie"
+        return "kill_zombie"
+
     # Stone
     if re.search(r"камен|камн|stone|скал|валун", t):
         return "collect_stone"
@@ -365,11 +381,13 @@ def _detect_action(t: str) -> Optional[str]:
         "go_to_water",
         "go_to_tree",
         "go_to_sheep",
+        "kill_zombie",
         "go_to_base",
         "go_home",
         "collect_water",
         "collect_wood",
         "build_campfire",
+        "kill_sheep",
     ):
         if a in t:
             return normalize_action(a)

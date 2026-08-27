@@ -100,9 +100,15 @@ public class ZombieAttack : MonoBehaviour
         if (Time.time - lastHitTime < hitCooldown * _hitCooldownMultiplier)
             return;
 
-        // Запас под #size Джека (CC radius ×5): иначе OverlapSphere не дотягивает до центра.
-        float radius = GetScanDamageRadius();
-        Collider[] hits = Physics.OverlapSphere(transform.position, radius);
+        // 1) Явный поиск ближайшей валидной цели (герои + стрим-фолловеры) —
+        //    CharacterController фолловеров OverlapSphere иногда не видит.
+        float scanR = GetScanDamageRadius();
+        var nearest = FindNearestAttackable(scanR);
+        if (nearest != null && TryDamage(nearest.gameObject))
+            return;
+
+        // 2) Fallback: physics overlap (Jack CC / коллайдеры).
+        Collider[] hits = Physics.OverlapSphere(transform.position, scanR);
         if (hits == null || hits.Length == 0)
             return;
 
@@ -110,9 +116,76 @@ public class ZombieAttack : MonoBehaviour
         {
             if (hits[i] == null)
                 continue;
-            TryDamage(hits[i].gameObject);
-            return;
+            if (TryDamage(hits[i].gameObject))
+                return;
         }
+    }
+
+    MonoBehaviour FindNearestAttackable(float scanRadius)
+    {
+        Vector3 pos = transform.position;
+        float bestDist = scanRadius;
+        MonoBehaviour best = null;
+
+        var envRoot = TrainingEnvSpace.FindRoot(transform);
+        if (envRoot != null)
+        {
+            var agents = envRoot.GetComponentsInChildren<AgentGoToHouseDiscrete>(false);
+            for (int i = 0; i < agents.Length; i++)
+            {
+                var a = agents[i];
+                if (a == null || !a.gameObject.activeInHierarchy || a.Hp <= 0 || !a.IsAliveForTwitch)
+                    continue;
+                if (TwitchEphemeralEffects.IsTwitchClone(a))
+                    continue;
+                float d = HorizDist(pos, a.transform.position);
+                if (d < bestDist)
+                {
+                    bestDist = d;
+                    best = a;
+                }
+            }
+
+            var lilies = envRoot.GetComponentsInChildren<LilyScript>(false);
+            for (int i = 0; i < lilies.Length; i++)
+            {
+                var lily = lilies[i];
+                if (lily == null || !lily.gameObject.activeInHierarchy || lily.Hp <= 0 || lily.IsInDeathState)
+                    continue;
+                float d = HorizDist(pos, lily.transform.position);
+                if (d < bestDist)
+                {
+                    bestDist = d;
+                    best = lily;
+                }
+            }
+        }
+
+        var followers = ZombieChase.GetCachedFollowers();
+        if (followers != null)
+        {
+            for (int i = 0; i < followers.Length; i++)
+            {
+                var p = followers[i];
+                if (p == null || !p.isActiveAndEnabled || p.IsDeadToZombies || p.Hp <= 0)
+                    continue;
+                float d = HorizDist(pos, p.transform.position);
+                if (d < bestDist)
+                {
+                    bestDist = d;
+                    best = p;
+                }
+            }
+        }
+
+        return best;
+    }
+
+    static float HorizDist(Vector3 a, Vector3 b)
+    {
+        float dx = a.x - b.x;
+        float dz = a.z - b.z;
+        return Mathf.Sqrt(dx * dx + dz * dz);
     }
 
     float GetScanDamageRadius() => damageRadius + 2.5f;
@@ -129,15 +202,33 @@ public class ZombieAttack : MonoBehaviour
         return Mathf.Max(baseR, targetR + selfR + 0.4f);
     }
 
-    private void TryDamage(GameObject other)
+    static bool IsAttackableTarget(IHasHp target)
+    {
+        if (target == null || !IsHeroAttackTarget(target))
+            return false;
+
+        if (target is StreamingSurvivalPlayer follower)
+            return !follower.IsDeadToZombies && follower.Hp > 0;
+
+        if (target is LilyScript lily)
+            return lily.Hp > 0 && !lily.IsInDeathState;
+
+        if (target is AgentGoToHouseDiscrete agent)
+            return agent.IsAliveForTwitch && agent.Hp > 0;
+
+        var mb = target as MonoBehaviour;
+        return mb != null && mb.gameObject.activeInHierarchy && target.Hp > 0;
+    }
+
+    private bool TryDamage(GameObject other)
     {
         var chase = GetComponentInParent<ZombieChase>() ?? GetComponentInChildren<ZombieChase>();
         if (chase != null && chase.IsStunned)
-            return;
+            return false;
 
         var target = other.GetComponentInParent<IHasHp>();
-        if (target == null || !IsHeroAttackTarget(target)) return;
-        if (Time.time - lastHitTime < hitCooldown * _hitCooldownMultiplier) return;
+        if (target == null || !IsAttackableTarget(target)) return false;
+        if (Time.time - lastHitTime < hitCooldown * _hitCooldownMultiplier) return false;
 
         lastHitTime = Time.time;
         TryPlayAttackAnim();
@@ -145,6 +236,7 @@ public class ZombieAttack : MonoBehaviour
         if (pendingHitRoutine != null)
             StopCoroutine(pendingHitRoutine);
         pendingHitRoutine = StartCoroutine(ApplyDelayedDamage(target, chase));
+        return true;
     }
 
     private System.Collections.IEnumerator ApplyDelayedDamage(IHasHp target, ZombieChase chase)
@@ -156,7 +248,7 @@ public class ZombieAttack : MonoBehaviour
         pendingHitRoutine = null;
 
         if (target == null) yield break;
-        if (!IsHeroAttackTarget(target)) yield break;
+        if (!IsAttackableTarget(target)) yield break;
         if (chase != null && chase.IsStunned) yield break;
 
         var targetMb = target as MonoBehaviour;
@@ -169,10 +261,21 @@ public class ZombieAttack : MonoBehaviour
         a.y = 0f;
         b.y = 0f;
         float r = GetEffectiveDamageRadius(targetTr);
-        if ((a - b).sqrMagnitude > r * r) yield break;
+        // Фолловеры часто успевают отойти за damageDelay — не отменяем удар по ним.
+        bool isFollower = target is StreamingSurvivalPlayer;
+        if (!isFollower && (a - b).sqrMagnitude > r * r)
+            yield break;
 
-        int damage = Mathf.Max(1, Mathf.RoundToInt(target.MaxHp / 5f * _damageMultiplier));
-        target.TakeDamage(damage);
+        if (isFollower)
+        {
+            // Ровно 2 удара до смерти, без зависимости от MaxHp / multiplier.
+            ((StreamingSurvivalPlayer)target).RegisterZombieHit();
+        }
+        else
+        {
+            int damage = Mathf.Max(1, Mathf.RoundToInt(target.MaxHp / 5f * _damageMultiplier));
+            target.TakeDamage(damage);
+        }
         HeroDamageFeedback.Play(targetTr);
     }
 
@@ -187,7 +290,9 @@ public class ZombieAttack : MonoBehaviour
 
 
 
-        return target is AgentGoToHouseDiscrete || target is LilyScript;
+        return target is AgentGoToHouseDiscrete
+            || target is LilyScript
+            || target is StreamingSurvivalPlayer;
 
     }
 

@@ -89,9 +89,18 @@ public class SheepWander : MonoBehaviour
         Vector3 posXZ = new Vector3(transform.position.x, 0f, transform.position.z);
         Vector3 center = SpawnCenterXZ;
 
-        if (hasSpawnArea && Vector3.Distance(posXZ, center) > maxDistanceFromSpawn)
+        // Только мягкий разворот: не уходить ЗА западный забор (x слишком мал).
+        // Хард-телепорт каждый кадр замораживал овец на месте.
+        if (transform.position.x < StreamingSurvivalCampBounds.MinX + 0.35f)
+        {
+            moveDir = Vector3.right;
+            timer = 0f;
+        }
+        else if (hasSpawnArea && Vector3.Distance(posXZ, center) > maxDistanceFromSpawn)
         {
             moveDir = (center - posXZ).normalized;
+            if (moveDir.sqrMagnitude < 0.0001f)
+                PickRandomDirection();
             timer = 0f;
         }
         else
@@ -111,12 +120,15 @@ public class SheepWander : MonoBehaviour
             }
         }
 
-        Quaternion targetRot = Quaternion.LookRotation(moveDir);
-        transform.rotation = Quaternion.RotateTowards(
-            transform.rotation,
-            targetRot,
-            rotationSpeed * Time.deltaTime
-        );
+        if (moveDir.sqrMagnitude > 0.0001f)
+        {
+            Quaternion targetRot = Quaternion.LookRotation(moveDir);
+            transform.rotation = Quaternion.RotateTowards(
+                transform.rotation,
+                targetRot,
+                rotationSpeed * Time.deltaTime
+            );
+        }
 
         Vector3 move = transform.forward * moveSpeed;
 

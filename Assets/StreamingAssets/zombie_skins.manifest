@@ -1,0 +1,57 @@
+ManifestFileVersion: 0
+UnityVersion: 6000.0.26f1
+CRC: 2432374001
+Hashes:
+  AssetFileHash:
+    serializedVersion: 2
+    Hash: befb52e39ecbface64f62d82a3c58239
+  TypeTreeHash:
+    serializedVersion: 2
+    Hash: 54e014a6d47a41d1b975512a9ed14dc9
+  IncrementalBuildHash:
+    serializedVersion: 2
+    Hash: 6f13d0c9c88cf88c68a65fb94ec92399
+HashAppended: 0
+ClassTypes:
+- Class: 1
+  Script: {instanceID: 0}
+- Class: 4
+  Script: {instanceID: 0}
+- Class: 21
+  Script: {instanceID: 0}
+- Class: 28
+  Script: {instanceID: 0}
+- Class: 43
+  Script: {instanceID: 0}
+- Class: 48
+  Script: {instanceID: 0}
+- Class: 74
+  Script: {instanceID: 0}
+- Class: 90
+  Script: {instanceID: 0}
+- Class: 91
+  Script: {instanceID: 0}
+- Class: 95
+  Script: {instanceID: 0}
+- Class: 114
+  Script: {fileID: 11500000, guid: a1bdbc44bc1176f42870eaf179e73289, type: 3}
+- Class: 114
+  Script: {fileID: 11500000, guid: ca443f106f18a214e8ea1112bbb1a7ac, type: 3}
+- Class: 114
+  Script: {fileID: 11500000, guid: 3b36f5fe5ff9379439db9c572d18a769, type: 3}
+- Class: 114
+  Script: {fileID: 11500000, guid: fa337f8312e654d4fb94dca5dd53bbc2, type: 3}
+- Class: 115
+  Script: {instanceID: 0}
+- Class: 136
+  Script: {instanceID: 0}
+- Class: 137
+  Script: {instanceID: 0}
+- Class: 143
+  Script: {instanceID: 0}
+- Class: 205
+  Script: {instanceID: 0}
+SerializeReferenceClassIdentifiers: []
+Assets:
+- Assets/Prefabs/ShirtlessZombie.prefab
+Dependencies: []

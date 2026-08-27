@@ -120,22 +120,30 @@ _cfg_lock = threading.Lock()
 _jobs_lock = threading.Lock()
 _jobs: dict[str, dict[str, Any]] = {}
 _ssh_host_cache: str | None = None
-_ssh_gate = threading.Semaphore(1)  # один живой ssh к lab — иначе на Windows копятся ssh.exe
+_ssh_reaper_started = False
+_SSH_STALE_SEC = 9.0  # tracked UI ssh старше — kill
+_SSH_ORPHAN_SEC = 5.0  # BatchMode-сироты вне учёта UI
+_SSH_GATE_STUCK_SEC = 12.0  # holders без отпуска — сброс Semaphore
+_SSH_WARN_COUNT = 6  # жёлтый/осторожно
+_SSH_BAD_COUNT = 10  # красный — близко к лимиту MaxSessions
+_SSH_GATE_SLOTS = 2
+_ssh_count_cache: dict[str, Any] = {"t": 0.0, "local": 0}
+_ssh_count_lock = threading.Lock()
+_ssh_count_inflight = False
+_ssh_gate_held_since = 0.0
+_ssh_gate_holders = 0
+_ssh_gate_held_lock = threading.Lock()
+_ssh_gate = threading.Semaphore(_SSH_GATE_SLOTS)  # stats + карта/действие; purge режет сирот
 _ssh_active_lock = threading.Lock()
 # pid -> {proc, started, remote, host}
 _ssh_active: dict[int, dict[str, Any]] = {}
-_ssh_reaper_started = False
-_SSH_STALE_SEC = 22.0  # висячий ssh старше этого — kill
-_SSH_ORPHAN_SEC = 18.0  # сироты BatchMode вне учёта UI
-_SSH_WARN_COUNT = 6  # жёлтый/осторожно
-_SSH_BAD_COUNT = 10  # красный — близко к лимиту MaxSessions
-_ssh_count_cache: dict[str, Any] = {"t": 0.0, "local": 0}
-_ssh_count_lock = threading.Lock()
 _stats_lock = threading.Lock()
-_stats_cache: dict[str, Any] = {"t": 0.0, "data": None}
+_stats_cache: dict[str, Any] = {"t": 0.0, "data": None, "ok_t": 0.0}
 _stats_inflight = False
-_STATS_CACHE_TTL = 8.0
-_STATS_STALE_MAX = 90.0
+_STATS_CACHE_TTL = 5.0
+_STATS_CACHE_TTL_FAIL = 1.5  # после ssh err — сразу пинать повтор
+_STATS_STALE_MAX = 45.0
+_STATS_KEEP_GOOD_SEC = 25.0  # не затирать последний ok кратким сбоем gate
 _ss_sync_lock = threading.Lock()
 _ss_sync_last_at = 0.0
 _SS_SYNC_INTERVAL = 25.0
@@ -150,7 +158,22 @@ _EMPTY_ACTIVITY = {
     "llm_bot": False,
     "obs": False,
     "tasks": [],
+    "jack_stage": "",
+    "lily_stage": "",
+    "george_stage": "",
 }
+_ACTIVITY_BOOL_KEYS = (
+    "jack",
+    "lily",
+    "george",
+    "joint",
+    "validate",
+    "stream",
+    "streaming_survival",
+    "llm_bot",
+    "obs",
+)
+_ACTIVITY_STAGE_KEYS = ("jack_stage", "lily_stage", "george_stage")
 
 
 # ── config ──────────────────────────────────────────────────────────
@@ -291,7 +314,11 @@ def _ssh_probe(bin_: str, host: str, connect_timeout: int = 6) -> bool:
         return True
     got = _ssh_gate.acquire(timeout=2.0)
     if not got:
+        purge_all_lab_batch_ssh()
+        got = _ssh_gate.acquire(timeout=2.0)
+    if not got:
         return False
+    _mark_ssh_gate_acquired()
     try:
         r = subprocess.run(
             [
@@ -311,98 +338,8 @@ def _ssh_probe(bin_: str, host: str, connect_timeout: int = 6) -> bool:
     except Exception:
         return False
     finally:
+        _mark_ssh_gate_released()
         _ssh_gate.release()
-
-
-def cleanup_orphan_batch_ssh(max_age: float | None = None) -> int:
-    """Убивает сиротские BatchMode ssh к lab (часто остаются после timeout на Windows).
-
-    Не трогает интерактивные/Cursor сессии без BatchMode=yes.
-    """
-    age_lim = float(_SSH_ORPHAN_SEC if max_age is None else max_age)
-    if os.name != "nt":
-        return 0
-    killed = 0
-    try:
-        r = subprocess.run(
-            [
-                "powershell",
-                "-NoProfile",
-                "-Command",
-                "$cut = (Get-Date).AddSeconds(-%d); "
-                "Get-CimInstance Win32_Process -Filter \"Name = 'ssh.exe'\" | "
-                "Where-Object { "
-                "  if (%d -le 0) { $true } "
-                "  else { $_.CreationDate -and ([Management.ManagementDateTimeConverter]::ToDateTime($_.CreationDate) -lt $cut) } "
-                "} | "
-                "ForEach-Object { "
-                "  $cl = [string]$_.CommandLine; "
-                "  if ($cl -match 'BatchMode=yes' -and ("
-                "      ($cl -match 'lab_comp') -or ($cl -match '192\\.168\\.194\\.7') -or "
-                "      ($cl -match '10\\.43\\.71\\.7') -or ($cl -match '192\\.168\\.50\\.18') -or "
-                "      ($cl -match 'lab_comp_local')"
-                "    )) { $_.ProcessId } "
-                "}" % (int(max(0, age_lim)), int(max(0, age_lim))),
-            ],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=8,
-        )
-        pids = []
-        for ln in (r.stdout or "").splitlines():
-            ln = ln.strip()
-            if ln.isdigit():
-                pids.append(int(ln))
-        tracked = set()
-        with _ssh_active_lock:
-            tracked = set(_ssh_active.keys())
-        for pid in pids:
-            if pid in tracked:
-                continue
-            try:
-                subprocess.run(
-                    ["taskkill", "/F", "/T", "/PID", str(pid)],
-                    capture_output=True,
-                    timeout=4,
-                )
-                killed += 1
-            except Exception:
-                pass
-    except Exception:
-        pass
-    return killed
-
-
-def cleanup_stale_ssh(max_age: float | None = None) -> int:
-    """Убивает висячие SSH, запущенные этим UI. Возвращает число убитых."""
-    age = float(_SSH_STALE_SEC if max_age is None else max_age)
-    now = time.time()
-    killed = 0
-    with _ssh_active_lock:
-        items = list(_ssh_active.items())
-    for pid, meta in items:
-        proc = meta.get("proc")
-        started = float(meta.get("started") or 0)
-        try:
-            alive = proc is not None and proc.poll() is None
-        except Exception:
-            alive = False
-        if not alive:
-            with _ssh_active_lock:
-                _ssh_active.pop(pid, None)
-            continue
-        if now - started < age:
-            continue
-        _kill_ssh_proc(proc)
-        with _ssh_active_lock:
-            _ssh_active.pop(pid, None)
-        killed += 1
-    # сироты BatchMode — отдельно, без рекурсии
-    if os.name == "nt":
-        killed += cleanup_orphan_batch_ssh(max_age=max(age, _SSH_ORPHAN_SEC))
-    return killed
 
 
 def _load_saved_ssh_host() -> str | None:
@@ -469,13 +406,16 @@ def scp_bin() -> str:
 
 
 def _ssh_common_opts() -> list[str]:
-    """Быстрее рвём мёртвые коннекты, без долгих retry."""
+    """Быстрее рвём мёртвые коннекты, без долгих retry / password hang."""
     return [
         "-o", "BatchMode=yes",
-        "-o", "ConnectTimeout=5",
+        "-o", "ConnectTimeout=3",
         "-o", "ConnectionAttempts=1",
-        "-o", "ServerAliveInterval=3",
-        "-o", "ServerAliveCountMax=2",
+        "-o", "ServerAliveInterval=2",
+        "-o", "ServerAliveCountMax=1",
+        "-o", "TCPKeepAlive=yes",
+        "-o", "NumberOfPasswordPrompts=0",
+        "-o", "PreferredAuthentications=publickey",
         "-o", "StrictHostKeyChecking=accept-new",
     ]
 
@@ -499,7 +439,7 @@ def _kill_ssh_proc(proc: subprocess.Popen) -> None:
             subprocess.run(
                 ["taskkill", "/F", "/T", "/PID", str(pid)],
                 capture_output=True,
-                timeout=5,
+                timeout=3,
             )
         except Exception:
             pass
@@ -513,9 +453,199 @@ def _kill_ssh_proc(proc: subprocess.Popen) -> None:
             except Exception:
                 pass
     try:
-        proc.wait(timeout=2)
+        proc.wait(timeout=1)
     except Exception:
         pass
+
+
+def _reset_ssh_gate(reason: str = "") -> None:
+    """Сброс Semaphore, если поток умер, держа слот (иначе UI навсегда ssh err)."""
+    global _ssh_gate, _ssh_gate_holders, _ssh_gate_held_since
+    with _ssh_gate_held_lock:
+        _ssh_gate = threading.Semaphore(_SSH_GATE_SLOTS)
+        _ssh_gate_holders = 0
+        _ssh_gate_held_since = 0.0
+    if reason:
+        try:
+            print(f"[train_lab_ui] ssh gate reset: {reason}", flush=True)
+        except Exception:
+            pass
+
+
+def cleanup_orphan_batch_ssh(max_age: float | None = None) -> int:
+    """Убивает сиротские BatchMode ssh к lab (часто остаются после timeout на Windows).
+
+    Не трогает интерактивные/Cursor сессии без BatchMode=yes.
+    """
+    age_lim = float(_SSH_ORPHAN_SEC if max_age is None else max_age)
+    if os.name != "nt":
+        return 0
+    killed = 0
+    try:
+        # tasklist быстрее CIM; commandline — через wmic LIST (один вызов).
+        r = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                (
+                    "$age=%d; $cut=(Get-Date).AddSeconds(-$age); "
+                    "$rows = @(); "
+                    "try { "
+                    "  $rows = Get-CimInstance Win32_Process -Filter \"Name='ssh.exe'\" "
+                    "    -ErrorAction Stop -OperationTimeoutSec 3 "
+                    "} catch { "
+                    "  $rows = Get-WmiObject Win32_Process -Filter \"Name='ssh.exe'\" -ErrorAction SilentlyContinue "
+                    "} "
+                    "foreach ($p in @($rows)) { "
+                    "  $cd = $null; "
+                    "  try { "
+                    "    if ($p.CreationDate) { "
+                    "      if ($p.CreationDate -is [string]) { "
+                    "        $cd = [Management.ManagementDateTimeConverter]::ToDateTime($p.CreationDate) "
+                    "      } else { $cd = [datetime]$p.CreationDate } "
+                    "    } "
+                    "  } catch {} "
+                    "  if ($age -gt 0 -and $cd -and $cd -ge $cut) { continue } "
+                    "  $cl = [string]$p.CommandLine; "
+                    "  if ($cl -match 'BatchMode=yes' -and ("
+                    "      ($cl -match 'lab_comp') -or ($cl -match '192\\.168\\.194\\.7') -or "
+                    "      ($cl -match '10\\.43\\.71\\.7') -or ($cl -match '192\\.168\\.50\\.18') -or "
+                    "      ($cl -match 'lab_comp_local')"
+                    "    )) { $p.ProcessId } "
+                    "}"
+                )
+                % int(max(0, age_lim)),
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+        )
+        pids = []
+        for ln in (r.stdout or "").splitlines():
+            ln = ln.strip()
+            if ln.isdigit():
+                pids.append(int(ln))
+        tracked = set()
+        with _ssh_active_lock:
+            tracked = set(_ssh_active.keys())
+        for pid in pids:
+            if pid in tracked and age_lim > 0:
+                # tracked режет cleanup_stale_ssh; при age=0 (purge) — убиваем всё
+                continue
+            try:
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(pid)],
+                    capture_output=True,
+                    timeout=3,
+                )
+                killed += 1
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return killed
+
+
+def purge_all_lab_batch_ssh() -> int:
+    """Жёстко убить ВСЕ BatchMode ssh.exe к lab (age=0). Gate мог залипнуть на часах."""
+    n = 0
+    try:
+        n += cleanup_stale_ssh(max_age=0.0)
+    except Exception:
+        pass
+    try:
+        n += cleanup_orphan_batch_ssh(max_age=0.0)
+    except Exception:
+        pass
+    return n
+
+
+def _mark_ssh_gate_acquired() -> None:
+    global _ssh_gate_held_since, _ssh_gate_holders
+    with _ssh_gate_held_lock:
+        _ssh_gate_holders += 1
+        if _ssh_gate_held_since <= 0:
+            _ssh_gate_held_since = time.time()
+
+
+def _mark_ssh_gate_released() -> None:
+    global _ssh_gate_held_since, _ssh_gate_holders
+    with _ssh_gate_held_lock:
+        _ssh_gate_holders = max(0, _ssh_gate_holders - 1)
+        if _ssh_gate_holders <= 0:
+            _ssh_gate_holders = 0
+            _ssh_gate_held_since = 0.0
+
+
+def _ssh_gate_held_for() -> float:
+    with _ssh_gate_held_lock:
+        t0 = float(_ssh_gate_held_since or 0)
+        holders = int(_ssh_gate_holders or 0)
+    if t0 <= 0 or holders <= 0:
+        return 0.0
+    return max(0.0, time.time() - t0)
+
+
+def cleanup_stale_ssh(max_age: float | None = None) -> int:
+    """Убивает висячие SSH, запущенные этим UI. Возвращает число убитых."""
+    age = float(_SSH_STALE_SEC if max_age is None else max_age)
+    now = time.time()
+    killed = 0
+    with _ssh_active_lock:
+        items = list(_ssh_active.items())
+    for pid, meta in items:
+        proc = meta.get("proc")
+        started = float(meta.get("started") or 0)
+        try:
+            alive = proc is not None and proc.poll() is None
+        except Exception:
+            alive = False
+        if not alive:
+            with _ssh_active_lock:
+                _ssh_active.pop(pid, None)
+            continue
+        if now - started < age:
+            continue
+        _kill_ssh_proc(proc)
+        with _ssh_active_lock:
+            _ssh_active.pop(pid, None)
+        killed += 1
+    # сироты BatchMode — отдельно, без рекурсии
+    if os.name == "nt":
+        killed += cleanup_orphan_batch_ssh(max_age=max(0.0, age) if age > 0 else 0.0)
+    return killed
+
+
+def _ensure_ssh_reaper() -> None:
+    global _ssh_reaper_started
+    if _ssh_reaper_started:
+        return
+    _ssh_reaper_started = True
+
+    def loop() -> None:
+        # сразу подчистить зомби от прошлого запуска UI
+        try:
+            purge_all_lab_batch_ssh()
+        except Exception:
+            pass
+        while True:
+            try:
+                held = _ssh_gate_held_for()
+                if held > _SSH_GATE_STUCK_SEC:
+                    # communicate завис / поток умер со слотом
+                    purge_all_lab_batch_ssh()
+                    _reset_ssh_gate(f"held {held:.0f}s")
+                else:
+                    cleanup_stale_ssh()
+                    _count_local_ssh_to_lab(refresh=False)
+            except Exception:
+                pass
+            time.sleep(1.5)
+
+    threading.Thread(target=loop, name="ssh-stale-reaper", daemon=True).start()
 
 
 def _lab_ssh_cmdline_markers() -> tuple[str, ...]:
@@ -528,56 +658,73 @@ def _lab_ssh_cmdline_markers() -> tuple[str, ...]:
     )
 
 
-def _count_local_ssh_to_lab() -> int:
-    """Сколько ssh.exe/ssh на этом ПК смотрят на lab (без нового SSH)."""
+def _count_local_ssh_to_lab(*, refresh: bool = False) -> int:
+    """Сколько ssh.exe на этом ПК смотрят на lab.
+
+    По умолчанию НЕ блокирует HTTP: отдаёт кэш, а PowerShell считает в фоне.
+    Get-CimInstance на Windows может висеть секунды — из‑за этого UI «вечно грузит».
+    """
+    global _ssh_count_inflight
     markers = _lab_ssh_cmdline_markers()
     now = time.time()
     with _ssh_count_lock:
         age = now - float(_ssh_count_cache.get("t") or 0)
-        if age < 3.0 and _ssh_count_cache.get("t"):
-            return int(_ssh_count_cache.get("local") or 0)
-    n = 0
-    try:
-        if os.name == "nt":
-            r = subprocess.run(
-                [
-                    "powershell",
-                    "-NoProfile",
-                    "-Command",
-                    "Get-CimInstance Win32_Process -Filter \"Name = 'ssh.exe'\" "
-                    "| Select-Object -ExpandProperty CommandLine",
-                ],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=4,
-            )
-            lines = (r.stdout or "").splitlines()
-        else:
-            r = subprocess.run(
-                ["ps", "-eo", "args="],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=3,
-            )
-            lines = [
-                ln
-                for ln in (r.stdout or "").splitlines()
-                if re.search(r"(^|[/\s])ssh(\.exe)?(\s|$)", ln)
-            ]
-        for ln in lines:
-            low = ln.lower()
-            if any(m.lower() in low for m in markers):
-                n += 1
-    except Exception:
+        cached = int(_ssh_count_cache.get("local") or 0)
+        has = bool(_ssh_count_cache.get("t"))
+        if has and age < 8.0 and not refresh:
+            return cached
+        kick = not _ssh_count_inflight
+        if kick:
+            _ssh_count_inflight = True
+
+    def _work() -> None:
+        global _ssh_count_inflight
         n = 0
-    with _ssh_count_lock:
-        _ssh_count_cache["t"] = now
-        _ssh_count_cache["local"] = n
-    return n
+        try:
+            if os.name == "nt":
+                r = subprocess.run(
+                    [
+                        "powershell",
+                        "-NoProfile",
+                        "-Command",
+                        "Get-CimInstance Win32_Process -Filter \"Name = 'ssh.exe'\" "
+                        "| Select-Object -ExpandProperty CommandLine",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=4,
+                )
+                lines = (r.stdout or "").splitlines()
+            else:
+                r = subprocess.run(
+                    ["ps", "-eo", "args="],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=3,
+                )
+                lines = [
+                    ln
+                    for ln in (r.stdout or "").splitlines()
+                    if re.search(r"(^|[/\s])ssh(\.exe)?(\s|$)", ln)
+                ]
+            for ln in lines:
+                low = ln.lower()
+                if any(m.lower() in low for m in markers):
+                    n += 1
+        except Exception:
+            n = cached
+        with _ssh_count_lock:
+            _ssh_count_cache["t"] = time.time()
+            _ssh_count_cache["local"] = n
+            _ssh_count_inflight = False
+
+    if kick:
+        threading.Thread(target=_work, name="ssh-count", daemon=True).start()
+    return cached if has else 0
 
 
 def ssh_sessions_snapshot(activity: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -617,28 +764,6 @@ def ssh_sessions_snapshot(activity: dict[str, Any] | None = None) -> dict[str, A
     }
 
 
-def _ensure_ssh_reaper() -> None:
-    global _ssh_reaper_started
-    if _ssh_reaper_started:
-        return
-    _ssh_reaper_started = True
-
-    def loop() -> None:
-        # сразу подчистить зомби от прошлого запуска UI
-        try:
-            cleanup_orphan_batch_ssh(max_age=8.0)
-            cleanup_stale_ssh(max_age=12.0)
-        except Exception:
-            pass
-        while True:
-            try:
-                cleanup_stale_ssh()
-            except Exception:
-                pass
-            time.sleep(5.0)
-
-    threading.Thread(target=loop, name="ssh-stale-reaper", daemon=True).start()
-
 
 def _ssh_popen(host: str, remote_cmd: str) -> subprocess.Popen:
     kwargs: dict[str, Any] = {
@@ -648,7 +773,10 @@ def _ssh_popen(host: str, remote_cmd: str) -> subprocess.Popen:
         "encoding": "utf-8",
         "errors": "replace",
     }
-    if os.name != "nt":
+    if os.name == "nt":
+        # Отдельная process group → taskkill /T реально убивает дерево.
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
+    else:
         kwargs["start_new_session"] = True
     return subprocess.Popen(
         [ssh_bin(), *_ssh_common_opts(), host, remote_cmd],
@@ -676,8 +804,13 @@ def _ssh_communicate(proc: subprocess.Popen, timeout: float | None) -> subproces
             out, err = proc.communicate(timeout=eff_timeout)
         except subprocess.TimeoutExpired as e:
             _kill_ssh_proc(proc)
+            # На Windows после timeout часто остаётся сирота — добить BatchMode сразу.
             try:
-                out, err = proc.communicate(timeout=2)
+                cleanup_orphan_batch_ssh(max_age=0.0)
+            except Exception:
+                pass
+            try:
+                out, err = proc.communicate(timeout=1)
             except Exception:
                 out, err = "", ""
             raise subprocess.TimeoutExpired(e.cmd, eff_timeout or 0, output=out, stderr=err) from None
@@ -737,14 +870,12 @@ def ssh_run(
     timeout: float | None = 120,
     *,
     preferred: str | None = None,
-    gate_timeout: float = 12.0,
+    gate_timeout: float = 8.0,
     skip_if_busy: bool = False,
 ) -> subprocess.CompletedProcess:
     """SSH с failover: при timeout/refusal пробует остальные IP lab_comp.
 
     Если UI уже на lab — выполняет команду локально (без SSH к себе).
-    Висячие ssh убиваются по timeout процесса и фоновым reaper'ом.
-    skip_if_busy=True — для частых health-probe: не ждать слот, а сразу выйти.
     """
     global _ssh_host_cache
     if ui_runs_on_lab() or host == "local":
@@ -754,7 +885,11 @@ def ssh_run(
             raise TimeoutError(f"local lab cmd timeout: {e}") from e
 
     _ensure_ssh_reaper()
-    cleanup_stale_ssh()
+    if _ssh_gate_held_for() > _SSH_GATE_STUCK_SEC:
+        purge_all_lab_batch_ssh()
+        _reset_ssh_gate("before ssh_run")
+    else:
+        cleanup_stale_ssh()
 
     preferred = preferred or "lab_comp"
     try:
@@ -767,6 +902,9 @@ def ssh_run(
     for h in ssh_candidates(preferred):
         if h and h != "local" and h not in hosts:
             hosts.append(h)
+    if _ssh_host_cache and _ssh_host_cache in hosts:
+        hosts = [_ssh_host_cache] + [h for h in hosts if h != _ssh_host_cache]
+    hosts = hosts[:3]
 
     last: subprocess.CompletedProcess | None = None
     last_exc: BaseException | None = None
@@ -774,11 +912,15 @@ def ssh_run(
 
     got_gate = _ssh_gate.acquire(timeout=max(0.05, float(gate_timeout)))
     if not got_gate:
-        cleanup_stale_ssh(max_age=12.0)  # агрессивнее чистим, если слот занят
+        purge_all_lab_batch_ssh()
+        if _ssh_gate_held_for() > 6.0:
+            _reset_ssh_gate("acquire busy")
         got_gate = _ssh_gate.acquire(timeout=2.0 if not skip_if_busy else 0.05)
     if not got_gate:
         raise TimeoutError("SSH занят (слишком много параллельных запросов к lab_comp)")
+
     try:
+        _mark_ssh_gate_acquired()
         for h in hosts:
             tried.append(h)
             proc: subprocess.Popen | None = None
@@ -791,11 +933,9 @@ def ssh_run(
                     _save_ssh_host(h)
                     return r
                 if not _is_ssh_connect_error(r):
-                    # Команда на сервере упала — хост живой, не крутим IP.
                     _ssh_host_cache = h
                     _save_ssh_host(h)
                     return r
-                # connect fail — процесс мог остаться зомби на Windows
                 if proc is not None:
                     _kill_ssh_proc(proc)
                 clear_ssh_host_cache()
@@ -808,6 +948,7 @@ def ssh_run(
                 clear_ssh_host_cache()
                 continue
     finally:
+        _mark_ssh_gate_released()
         _ssh_gate.release()
 
     if last is not None:
@@ -1449,11 +1590,12 @@ def _parse_activity_json(raw: str) -> dict[str, Any]:
     if not isinstance(data, dict):
         data = empty
     out = dict(empty)
-    for k in _EMPTY_ACTIVITY:
-        if k == "tasks":
-            out["tasks"] = list(data.get("tasks") or [])
-        else:
-            out[k] = bool(data.get(k))
+    out["tasks"] = list(data.get("tasks") or [])
+    for k in _ACTIVITY_BOOL_KEYS:
+        out[k] = bool(data.get(k))
+    for k in _ACTIVITY_STAGE_KEYS:
+        v = str(data.get(k) or "").strip().lower()
+        out[k] = v if v in ("s1", "s2") else ""
     # stream_fps / ssh_remote не булевы — протаскиваем как есть
     fps = data.get("stream_fps")
     out["stream_fps"] = fps if isinstance(fps, dict) else {}
@@ -1609,9 +1751,39 @@ llm_bot = any(
     for c in cmds
 )
 joint = is_joint_train()
-jack = (not joint) and train_yaml("Jack_single_agent")
-lily = (not joint) and train_yaml("Lily_single_agent")
-george = (not joint) and train_yaml("George_single_agent")
+
+def hero_train_info(yaml_name, bash_re):
+    running = False
+    stage = ""
+    for c in cmds:
+        if is_ui_noise(c):
+            continue
+        if re.search(bash_re, c) and "python3 -" not in c:
+            running = True
+            if "stage2" in c or "stage_2" in c:
+                stage = "s2"
+            elif "stage1" in c or "stage_1" in c:
+                stage = stage or "s1"
+        if "mlagents-learn" not in c or yaml_name not in c or "--inference" in c:
+            continue
+        running = True
+        m = re.search(r"--run-id[=\s]+([^\s]+)", c)
+        if m:
+            rid = (m.group(1) or "").lower()
+            if "stage2" in rid:
+                stage = "s2"
+            elif not stage:
+                stage = "s1"
+    if running and not stage:
+        stage = "s1"
+    return running, stage
+
+jack, jack_stage = hero_train_info("Jack_single_agent", r"(?:^|[\s/])train_headless_jack_stage")
+lily, lily_stage = hero_train_info("Lily_single_agent", r"(?:^|[\s/])train_headless_lily_stage")
+george, george_stage = hero_train_info("George_single_agent", r"(?:^|[\s/])train_headless_george_stage")
+if joint:
+    jack = lily = george = False
+    jack_stage = lily_stage = george_stage = ""
 
 def run_id_hint():
     for c in cmds:
@@ -1957,6 +2129,9 @@ print(json.dumps({
     "jack": bool(jack),
     "lily": bool(lily),
     "george": bool(george),
+    "jack_stage": jack_stage or "",
+    "lily_stage": lily_stage or "",
+    "george_stage": george_stage or "",
     "joint": bool(joint),
     "validate": bool(validate),
     "stream": bool(stream),
@@ -1988,7 +2163,7 @@ def _fetch_server_stats_uncached(host: str | None = None) -> dict[str, Any]:
     """RAM + nvidia-smi + activity JSON (SSH или local, если UI на lab)."""
     try:
         t0 = time.time()
-        r = ssh_run(host, _REMOTE_STATS_AND_ACTIVITY, timeout=18, gate_timeout=8.0)
+        r = ssh_run(host, _REMOTE_STATS_AND_ACTIVITY, timeout=12, gate_timeout=5.0)
         latency_ms = int(max(0.0, (time.time() - t0) * 1000))
         used = "local" if ui_runs_on_lab() else (_ssh_host_cache or host or "?")
         # stdout отдельно: stderr часто содержит чужие {...} и ломал парсер activity
@@ -2062,25 +2237,65 @@ def _stats_pending_payload(host: str | None = None) -> dict[str, Any]:
     }
 
 
+def _stats_store_result(out: dict[str, Any], host: str | None = None) -> None:
+    """Пишет результат опроса. Краткий fail не убивает недавний ok в UI."""
+    now = time.time()
+    with _stats_lock:
+        prev = _stats_cache.get("data")
+        if out.get("ok"):
+            _stats_cache["t"] = now
+            _stats_cache["ok_t"] = now
+            _stats_cache["data"] = out
+            return
+        ok_age = now - float(_stats_cache.get("ok_t") or 0)
+        if (
+            isinstance(prev, dict)
+            and prev.get("ok")
+            and ok_age < _STATS_KEEP_GOOD_SEC
+        ):
+            soft = dict(prev)
+            soft["soft_stale"] = True
+            soft["last_error"] = out.get("text") or "ssh transient fail"
+            soft["pending"] = False
+            _stats_cache["t"] = now
+            _stats_cache["data"] = soft
+            return
+        fail = dict(out)
+        fail["ok"] = False
+        fail["pending"] = False
+        if not fail.get("host"):
+            fail["host"] = host or _ssh_host_cache or "lab_comp"
+        _stats_cache["t"] = now
+        _stats_cache["data"] = fail
+
+
 def _stats_refresh_worker(host: str | None = None) -> None:
     global _stats_inflight
     try:
-        # Не звать resolve_ssh_host_fast здесь — он сам может висеть минутами.
+        # Подчистить висячие ssh.exe — иначе gate залипает и stats навсегда «ssh err».
+        try:
+            cleanup_stale_ssh(max_age=8.0)
+        except Exception:
+            pass
+        # Не звать resolve_ssh_host здесь — он сам держит gate и усугубляет «SSH занят».
         # ssh_run уже перебирает IP при ошибке коннекта.
-        h = host or _ssh_host_cache or "lab_comp"
+        h = host or _ssh_host_cache or _load_saved_ssh_host() or "lab_comp"
         out = _fetch_server_stats_uncached(h)
-        with _stats_lock:
-            _stats_cache["t"] = time.time()
-            _stats_cache["data"] = out
+        if not out.get("ok") and "SSH занят" in str(out.get("text") or ""):
+            purge_all_lab_batch_ssh()
+            out = _fetch_server_stats_uncached(h)
+        _stats_store_result(out, h)
     except Exception as e:
-        with _stats_lock:
-            fail = _stats_pending_payload(host)
-            fail["pending"] = False
-            fail["text"] = f"[ssh] {e}"
-            # не затираем хороший stale при ошибке refresh
-            if _stats_cache.get("data") is None:
-                _stats_cache["t"] = time.time()
-                _stats_cache["data"] = fail
+        fail = _stats_pending_payload(host)
+        fail["pending"] = False
+        fail["text"] = f"[ssh] {e}"
+        fail["ok"] = False
+        if "SSH занят" in str(e):
+            try:
+                purge_all_lab_batch_ssh()
+            except Exception:
+                pass
+        _stats_store_result(fail, host)
     finally:
         with _stats_lock:
             _stats_inflight = False
@@ -2094,19 +2309,32 @@ def fetch_server_stats(host: str | None = None) -> dict[str, Any]:
     with _stats_lock:
         cached = _stats_cache.get("data")
         age = now - float(_stats_cache.get("t") or 0)
-        # если worker завис — сбросить флаг
-        if _stats_inflight and age > 45 and cached is not None:
+        # если worker завис — сбросить флаг (раньше 45с — UI «умирал»)
+        if _stats_inflight and age > 20:
             _stats_inflight = False
-        if _stats_inflight and cached is None and age > 45:
-            _stats_inflight = False
-        fresh = cached is not None and age < _STATS_CACHE_TTL
+        failed = (
+            isinstance(cached, dict)
+            and not cached.get("ok")
+            and not cached.get("pending")
+            and not cached.get("soft_stale")
+        )
+        ttl = _STATS_CACHE_TTL_FAIL if failed else _STATS_CACHE_TTL
+        fresh = cached is not None and age < ttl
         stale_ok = cached is not None and age < _STATS_STALE_MAX
-        if not fresh and not _stats_inflight:
+        # После err / soft_stale / протухания — всегда пинать refresh.
+        need = (not fresh) or failed or bool(
+            isinstance(cached, dict) and cached.get("soft_stale")
+        )
+        if need and not _stats_inflight:
             _stats_inflight = True
             kick = True
             if cached is None:
                 _stats_cache["t"] = now  # точка отсчёта для watchdog
-        out = cached if (fresh or stale_ok) else None
+        # Важно: протухший fail НЕ превращать в «загрузка…» — иначе UI вечно крутит pending.
+        if cached is not None and (fresh or stale_ok or cached.get("soft_stale") or failed):
+            out = cached
+        else:
+            out = None
     if kick:
         threading.Thread(
             target=_stats_refresh_worker,
@@ -2128,13 +2356,46 @@ def start_stats_background_loop() -> None:
             resolve_ssh_host(load_cfg().get("ssh_host") or "lab_comp")
         except Exception:
             pass
+        fail_streak = 0
         while True:
             try:
                 h = _ssh_host_cache or _load_saved_ssh_host() or "lab_comp"
-                fetch_server_stats(h)
+                s = fetch_server_stats(h)
+                ok = isinstance(s, dict) and bool(s.get("ok"))
+                if ok:
+                    fail_streak = 0
+                else:
+                    fail_streak += 1
+                    # После серии фейлов — сбросить кэш хоста и перебрать IP.
+                    if fail_streak >= 2:
+                        try:
+                            clear_ssh_host_cache()
+                            cleanup_stale_ssh(max_age=8.0)
+                        except Exception:
+                            pass
+
+                        def _reprobe() -> None:
+                            try:
+                                resolve_ssh_host(
+                                    load_cfg().get("ssh_host") or "lab_comp",
+                                    force=True,
+                                )
+                            except Exception:
+                                pass
+
+                        # Не блокируем stats-loop длинным probe всех IP.
+                        threading.Thread(
+                            target=_reprobe,
+                            name="lab-ssh-reprobe",
+                            daemon=True,
+                        ).start()
+                        fail_streak = 0  # не спамить reprobe каждый тик
+                time.sleep(
+                    _STATS_CACHE_TTL if ok else _STATS_CACHE_TTL_FAIL
+                )
             except Exception:
-                pass
-            time.sleep(_STATS_CACHE_TTL)
+                fail_streak += 1
+                time.sleep(_STATS_CACHE_TTL_FAIL)
 
     threading.Thread(target=loop, name="lab-stats-loop", daemon=True).start()
 
@@ -2165,6 +2426,15 @@ _RE_LANDMARKS = re.compile(
     r"(?:\s+n_stones=\d+)?"
     r"(?:\s+fences=(?:\[(?P<fences>[^\]]*)\]|\[\]))?",
     re.M,
+)
+_RE_FOLLOWERS_WOLF = re.compile(
+    r"^\s*followers_wolf=\[(?P<body>[^\]]*)\]",
+    re.M,
+)
+_RE_WOLF_ENTRY = re.compile(
+    r"(?P<user>[^\s{]+)\{hits=(?P<hits>\d+)\s+cd_stuck=(?P<stuck>[01])\s+"
+    r"stuck_n=(?P<stuck_n>\d+)\s+cd_left=(?P<cd_left>-?\d+(?:\.\d+)?)\s+"
+    r"action=(?P<action>[^}]*)\}"
 )
 
 # ForestScene / SS world map fallback (пока стрим без нового DLL).
@@ -2234,6 +2504,43 @@ def _parse_landmarks_block(block: str) -> dict[str, Any] | None:
     return lm
 
 
+def _dedupe_lakes(lakes: Any) -> list[dict[str, Any]]:
+    """Схлопнуть почти совпадающие озера (два WaterSource на одном водоёме)."""
+    if not isinstance(lakes, list):
+        return []
+    out: list[dict[str, Any]] = []
+    merge_dist2 = 8.0 * 8.0
+    for raw in lakes:
+        if not isinstance(raw, dict) or raw.get("x") is None:
+            continue
+        try:
+            x = float(raw["x"])
+            z = float(raw.get("z") or 0)
+            sx = float(raw.get("sx") or 8)
+            sz = float(raw.get("sz") or 6)
+        except Exception:
+            continue
+        merged = False
+        for i, cur in enumerate(out):
+            dx = cur["x"] - x
+            dz = cur["z"] - z
+            if dx * dx + dz * dz > merge_dist2:
+                continue
+            a = max(0.01, float(cur.get("sx") or 1) * float(cur.get("sz") or 1))
+            b = max(0.01, sx * sz)
+            out[i] = {
+                "x": (cur["x"] * a + x * b) / (a + b),
+                "z": (cur["z"] * a + z * b) / (a + b),
+                "sx": max(float(cur.get("sx") or 0), sx),
+                "sz": max(float(cur.get("sz") or 0), sz),
+            }
+            merged = True
+            break
+        if not merged:
+            out.append({"x": x, "z": z, "sx": sx, "sz": sz})
+    return out
+
+
 def _ensure_landmarks(data: dict[str, Any]) -> dict[str, Any]:
     """Подставляет fallback из ForestScene/SS map, если стрим ещё не пишет landmarks."""
     lm = data.get("landmarks")
@@ -2242,13 +2549,15 @@ def _ensure_landmarks(data: dict[str, Any]) -> dict[str, Any]:
     ):
         # если live/log дал дом/озеро без забора — дорисуем забор из fallback
         fb = _load_pres_landmarks_fallback()
+        lm = dict(lm)
+        if lm.get("lakes"):
+            lm["lakes"] = _dedupe_lakes(lm.get("lakes"))
         if not lm.get("fences") and fb.get("fences"):
-            lm = dict(lm)
             lm["fences"] = fb["fences"]
             if not lm.get("stones") and fb.get("stones"):
                 lm["stones"] = fb["stones"]
             lm["source"] = str(lm.get("source") or "partial") + "+fence_fallback"
-            data["landmarks"] = lm
+        data["landmarks"] = lm
     else:
         data["landmarks"] = _load_pres_landmarks_fallback()
     # кадры эпизода наследуют landmarks для карты
@@ -2264,17 +2573,43 @@ def _ensure_landmarks(data: dict[str, Any]) -> dict[str, Any]:
                 fl.get("house") or fl.get("lakes") or fl.get("fences") or fl.get("stones")
             ):
                 fr["landmarks"] = shared
-            elif not fl.get("fences") and shared.get("fences"):
+            else:
                 fl = dict(fl)
-                fl["fences"] = shared["fences"]
-                if not fl.get("stones") and shared.get("stones"):
-                    fl["stones"] = shared["stones"]
+                if fl.get("lakes"):
+                    fl["lakes"] = _dedupe_lakes(fl.get("lakes"))
+                if not fl.get("fences") and shared.get("fences"):
+                    fl["fences"] = shared["fences"]
+                    if not fl.get("stones") and shared.get("stones"):
+                        fl["stones"] = shared["stones"]
                 fr["landmarks"] = fl
     return data
 
 
 def _empty_agent(name: str) -> dict[str, Any]:
     return {"name": name, "ok": False}
+
+
+def _parse_followers_wolf(block: str) -> list[dict[str, Any]]:
+    """Парсит строку SNAP followers_wolf=[user{hits=.. cd_stuck=..} …]."""
+    m = _RE_FOLLOWERS_WOLF.search(block or "")
+    if not m:
+        return []
+    body = (m.group("body") or "").strip()
+    if not body:
+        return []
+    out: list[dict[str, Any]] = []
+    for em in _RE_WOLF_ENTRY.finditer(body):
+        out.append(
+            {
+                "user": em.group("user"),
+                "hits": int(em.group("hits") or 0),
+                "cd_stuck": int(em.group("stuck") or 0) == 1,
+                "stuck_n": int(em.group("stuck_n") or 0),
+                "cd_left": float(em.group("cd_left") or 0),
+                "action": (em.group("action") or "").strip(),
+            }
+        )
+    return out
 
 
 def _map_frame_from_snap(snap: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -2287,6 +2622,7 @@ def _map_frame_from_snap(snap: dict[str, Any] | None) -> dict[str, Any] | None:
         "trees_n", "sheep_n", "zombies_n",
         "trees_target", "sheep_target",
         "jack", "lily", "george", "landmarks",
+        "followers_wolf",
     )
     out = {k: snap.get(k) for k in keys if k in snap}
     out["ok"] = True
@@ -2349,6 +2685,7 @@ def parse_presentation_world_log(text: str) -> dict[str, Any]:
             if kind in ("trees", "sheep") and target:
                 world[f"{kind}_target"] = target
         landmarks = _parse_landmarks_block(block)
+        wolves = _parse_followers_wolf(block)
         out = {
             "ok": True,
             "ts": ts,
@@ -2360,14 +2697,18 @@ def parse_presentation_world_log(text: str) -> dict[str, Any]:
             "jack": agents["jack"],
             "lily": agents["lily"],
             "george": agents["george"],
+            "followers_wolf": wolves,
         }
         if landmarks:
             out["landmarks"] = landmarks
         return out
 
     # episode / last_round из последовательности SNAP
-    episode = {"water": 0, "wood": 0, "sheep_killed": 0, "trees_chopped": 0}
-    last_round = {"water": 0, "wood": 0, "sheep_killed": 0, "trees_chopped": 0, "episode": 0, "at": ""}
+    episode = {"water": 0, "wood": 0, "sheep_killed": 0, "trees_chopped": 0, "wolf_cd_stuck": False}
+    last_round = {
+        "water": 0, "wood": 0, "sheep_killed": 0, "trees_chopped": 0,
+        "episode": 0, "at": "", "wolf_cd_stuck": False, "followers_wolf": [],
+    }
     prev_w = {"jack": -1, "lily": -1, "george": -1}
     prev_wood = {"jack": -1, "george": -1}
     prev_sheep = prev_trees = -1
@@ -2402,13 +2743,18 @@ def parse_presentation_world_log(text: str) -> dict[str, Any]:
                 "trees_chopped": episode["trees_chopped"],
                 "episode": episode_index or inferred_ep,
                 "at": snap.get("ts") or "",
+                "wolf_cd_stuck": bool(episode.get("wolf_cd_stuck")),
+                "followers_wolf": list((prev_snap or {}).get("followers_wolf") or []),
             }
             # конец завершённого эпизода — последний SNAP до reset
             end_fr = _map_frame_from_snap(prev_snap) or _map_frame_from_snap(snap)
             last_completed_end = end_fr
             last_completed_start = cur_start
             last_completed_ep = int(last_round.get("episode") or 0)
-            episode = {"water": 0, "wood": 0, "sheep_killed": 0, "trees_chopped": 0}
+            episode = {
+                "water": 0, "wood": 0, "sheep_killed": 0, "trees_chopped": 0,
+                "wolf_cd_stuck": False,
+            }
             ep_active = False
         jw = int((snap.get("jack") or {}).get("water") or -1)
         lw = int((snap.get("lily") or {}).get("water") or -1)
@@ -2424,7 +2770,10 @@ def parse_presentation_world_log(text: str) -> dict[str, Any]:
                 inferred_ep = 1
             episode_index = snap_ep if snap_ep > 0 else inferred_ep
             ep_active = True
-            episode = {"water": 0, "wood": 0, "sheep_killed": 0, "trees_chopped": 0}
+            episode = {
+                "water": 0, "wood": 0, "sheep_killed": 0, "trees_chopped": 0,
+                "wolf_cd_stuck": False,
+            }
             prev_w = {"jack": jw, "lily": lw, "george": gw}
             prev_wood = {"jack": jwood, "george": gwood}
             prev_sheep, prev_trees = sn, tn
@@ -2442,6 +2791,10 @@ def parse_presentation_world_log(text: str) -> dict[str, Any]:
             episode["sheep_killed"] += prev_sheep - sn
         if prev_trees >= 0 and tn < prev_trees:
             episode["trees_chopped"] += prev_trees - tn
+        for w in snap.get("followers_wolf") or []:
+            if isinstance(w, dict) and w.get("cd_stuck"):
+                episode["wolf_cd_stuck"] = True
+                break
         prev_sheep, prev_trees = sn, tn
         prev_snap = snap
 
@@ -2579,6 +2932,20 @@ fi
                     ep_obj = data.get("episode")
                     if isinstance(ep_obj, dict) and ep_obj.get("index"):
                         data["episode_index"] = ep_obj.get("index")
+                # live JSON: followers[] → followers_wolf[] для UI эпизода
+                if not data.get("followers_wolf") and isinstance(data.get("followers"), list):
+                    data["followers_wolf"] = [
+                        {
+                            "user": f.get("user") or "?",
+                            "hits": int(f.get("wolf_hits") or 0),
+                            "cd_stuck": bool(f.get("wolf_cd_stuck")),
+                            "stuck_n": int(f.get("wolf_cd_stuck_n") or 0),
+                            "cd_left": float(f.get("wolf_cd_left") or 0),
+                            "action": f.get("action") or "",
+                        }
+                        for f in data["followers"]
+                        if isinstance(f, dict) and f.get("skin") == "wolf"
+                    ]
                 data = _ensure_landmarks(data)
                 with _pres_world_lock:
                     _pres_world_cache.update(t=now, key=key, data=data)
@@ -2878,25 +3245,45 @@ def action_repair_spawn(cfg: dict, run_id: str = "", force: bool = True) -> str:
         try:
             rid_q = sh_quote(rid) if rid else "''"
             if force:
+                # rid без кавычек для путей; rid_q — для shell-safe echo
+                rid_path = rid or "_"
                 cmd = f"""
 set +e
 cd {REMOTE_DIR}
-cat > .forest_repair_spawners <<'EOF'
-manual ui repair_spawn
-utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-run_id={rid}
-reason=force_ui
-EOF
-# подставить реальный utc
-sed -i "s|^utc=.*|utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)|" .forest_repair_spawners 2>/dev/null || true
-echo "wrote .forest_repair_spawners"
-cat .forest_repair_spawners
-sleep 10
-if [ -f .forest_repair_spawners_result ]; then
-  echo '=== result ==='
-  cat .forest_repair_spawners_result
-elif [ -f .forest_repair_spawners ]; then
-  echo 'WARN: flag still present — Unity StreamSpawnRepairWatcher not running (нужен свежий DLL)?'
+rm -f .forest_repair_spawners_result
+UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+BODY=$(printf 'manual ui repair_spawn\\nutc=%s\\nrun_id=%s\\nreason=force_ui\\n' "$UTC" {rid_q})
+printf '%s' "$BODY" > .forest_repair_spawners
+mkdir -p "results/{rid_path}" 2>/dev/null || true
+printf '%s' "$BODY" > "results/{rid_path}/.forest_repair_spawners" 2>/dev/null || true
+printf '%s' "$BODY" > "results/.forest_repair_spawners" 2>/dev/null || true
+echo "wrote flags:"
+ls -la .forest_repair_spawners "results/{rid_path}/.forest_repair_spawners" "results/.forest_repair_spawners" 2>/dev/null || true
+ok=0
+for i in $(seq 1 25); do
+  sleep 1
+  if [ -f .forest_repair_spawners_result ]; then
+    echo "=== result after ${{i}}s ==="
+    cat .forest_repair_spawners_result
+    ok=1
+    break
+  fi
+  if [ ! -f .forest_repair_spawners ]; then
+    echo "flag consumed at ${{i}}s, waiting result..."
+  fi
+done
+if [ "$ok" != 1 ]; then
+  echo 'WARN: нет .forest_repair_spawners_result — Unity StreamSpawnRepairWatcher не ответил'
+  ls -la .forest_repair_spawners .forest_repair_spawners_result 2>&1 || true
+  if [ -f "results/{rid_path}/stream_world_live.json" ]; then
+    python3 -c "import json;d=json.load(open('results/{rid_path}/stream_world_live.json',encoding='utf-8-sig'));print('live trees',d.get('trees_n'),'/',d.get('trees_target'),'sheep',d.get('sheep_n'))"
+  fi
+  echo EXIT:1
+  exit 0
+fi
+if [ -f "results/{rid_path}/stream_world_live.json" ]; then
+  sleep 2
+  python3 -c "import json;d=json.load(open('results/{rid_path}/stream_world_live.json',encoding='utf-8-sig'));print('live_after trees',d.get('trees_n'),'/',d.get('trees_target'),'sheep',d.get('sheep_n'))"
 fi
 echo EXIT:0
 """
@@ -2913,9 +3300,14 @@ if [ -f .forest_repair_spawners_result ]; then
   cat .forest_repair_spawners_result
 fi
 """
-            r = ssh_run(host, cmd, timeout=45)
-            append_log(jid, (r.stdout or "") + (r.stderr or ""))
-            finish_job(jid, r.returncode)
+            r = ssh_run(host, cmd, timeout=60)
+            out = (r.stdout or "") + (r.stderr or "")
+            append_log(jid, out)
+            # EXIT:1 в теле = watcher не ответил
+            code = 1 if "WARN: нет .forest_repair_spawners_result" in out else r.returncode
+            if "fail_trees_still_0" in out:
+                code = 1
+            finish_job(jid, code)
         except Exception as e:
             append_log(jid, str(e))
             finish_job(jid, 1)
@@ -2972,6 +3364,59 @@ def action_kill_mode_streaming(cfg: dict) -> str:
             except Exception:
                 pass
             finish_job(jid, r.returncode)
+        except Exception as e:
+            append_log(jid, str(e))
+            finish_job(jid, 1)
+
+    threading.Thread(target=runner, daemon=True).start()
+    return jid
+
+
+def action_ensure_tensorboard(cfg: dict) -> str:
+    """Поднятие TensorBoard (--all results/) если ещё не слушает :6006."""
+    host = resolve_ssh_host(cfg.get("ssh_host") or "lab_comp")
+    jid = new_job("ensure_tb", "run_tensorboard.bash --daemon --all")
+
+    def runner() -> None:
+        try:
+            remote = (
+                f"cd {REMOTE_DIR} && "
+                f"if pgrep -f 'tensorboard.*--port[= ]?6006' >/dev/null 2>&1; then "
+                f"echo '[tb] already running'; "
+                f"else bash train_scripts/lab_comp/run_tensorboard.bash --daemon --all; fi"
+            )
+            r = ssh_run(host, remote, timeout=90)
+            append_log(jid, (r.stdout or "") + (r.stderr or ""))
+            finish_job(jid, r.returncode)
+        except Exception as e:
+            append_log(jid, str(e))
+            finish_job(jid, 1)
+
+    threading.Thread(target=runner, daemon=True).start()
+    return jid
+
+
+def action_kill_tensorboard(cfg: dict) -> str:
+    """Убить TensorBoard на lab (графики UI). Train/stream не трогает."""
+    host = resolve_ssh_host(cfg.get("ssh_host") or "lab_comp")
+    jid = new_job("kill_tb", "pkill tensorboard")
+
+    def runner() -> None:
+        try:
+            remote = r"""
+set +e
+pkill -TERM -f 'tensorboard.*forest_survival/results' 2>/dev/null
+pkill -TERM -f 'tensorboard.*--port[= ]?6006' 2>/dev/null
+sleep 1
+pkill -KILL -f 'tensorboard.*forest_survival/results' 2>/dev/null
+pkill -KILL -f 'tensorboard.*--port[= ]?6006' 2>/dev/null
+rm -f /tmp/forest_tensorboard_6006.pid 2>/dev/null
+n=$(pgrep -c -f 'tensorboard' 2>/dev/null || echo 0)
+echo "[kill_tb] tensorboard left=${n:-0}"
+"""
+            r = ssh_run(host, remote, timeout=40)
+            append_log(jid, (r.stdout or "") + (r.stderr or ""))
+            finish_job(jid, 0)
         except Exception as e:
             append_log(jid, str(e))
             finish_job(jid, 1)
@@ -4798,6 +5243,7 @@ button.george { border-color: #3d6b52; }
 .pres-map-legend .tree::before { background: #4a8f4a; border-radius: 2px; }
 .pres-map-legend .sheep::before { background: #e8e0d0; }
 .pres-map-legend .zombie::before { background: #c45a5a; }
+.pres-map-legend .follower::before { background: #f0a040; }
 .pres-map-legend .lake::before { background: #3a7ec8; border-radius: 2px; }
 .pres-map-legend .house::before { background: #c9a227; border-radius: 2px; }
 .pres-map-legend .fence::before { background: #8b6914; border-radius: 1px; }
@@ -4874,11 +5320,11 @@ button.george { border-color: #3d6b52; }
         <div class="host-card-title" id="serverHostTitle">lab_comp</div>
         <div class="host-online pending" id="serverHostOnline">…</div>
       </div>
-      <div id="serverHostMeters"><div class="hint">загрузка метрик…</div></div>
+      <div id="serverHostMeters"><div class="hint">первый опрос lab…</div></div>
     </div>
     <details class="host-raw">
       <summary>сырой SSH-вывод</summary>
-      <pre class="server-pre" id="serverStats">загрузка RAM / nvidia-smi с lab_comp…</pre>
+    <pre class="server-pre" id="serverStats">загрузка RAM / nvidia-smi с lab_comp…</pre>
     </details>
     <h2 style="margin-top:10px;font-size:14px">Сейчас на lab <span class="pill" id="labTasksPill">—</span></h2>
     <div class="lab-tasks" id="labTasks"><div class="lab-tasks-empty">нет активных задач</div></div>
@@ -5030,10 +5476,10 @@ button.george { border-color: #3d6b52; }
             <label>Быстрый выбор</label>
             <div class="btns" style="flex-wrap:wrap">
               <button type="button" id="btnJointTbTrio" title="Только выбрать Jack+Lily+George из новой папки">Трое из новой папки</button>
-              <button type="button" class="primary" id="btnJointTbDraw" title="Скачать серии TB и нарисовать Cumulative Reward">Нарисовать TB</button>
-              <button type="button" class="danger" id="btnJointTbClear" title="Снять выбор runs и очистить график">Выключить TB</button>
+              <button type="button" class="primary" id="btnJointTbDraw" title="Поднятие TensorBoard + график Cumulative Reward">Нарисовать TB</button>
+              <button type="button" class="danger" id="btnJointTbClear" title="Очистить график и убить процесс TensorBoard">Выключить</button>
             </div>
-            <p class="hint" style="margin:0">Трое — только выбор. Нарисовать TB — график. Выключить — убрать график.</p>
+            <p class="hint" style="margin:0">По умолчанию график выкл. Нарисовать TB — поднять TB и нарисовать. Выключить — убрать график и убить tensorboard.</p>
           </div>
         </div>
         <div class="btns train-btns">
@@ -5103,12 +5549,15 @@ button.george { border-color: #3d6b52; }
             <span class="lg tree">деревья</span>
             <span class="lg sheep">овцы</span>
             <span class="lg zombie">зомби</span>
+            <span class="lg follower">фолловеры</span>
             <span class="lg lake">озеро</span>
             <span class="lg house">дом</span>
             <span class="lg fence">забор</span>
             <span class="lg stone">камни</span>
           </div>
           <p class="hint" style="margin:0">Два кадра последнего завершённого эпизода (или «сейчас», пока раунд ещё идёт). Ориентиры — дом / озеро / забор / камни.</p>
+          <div id="presWolfCdDiag" class="hint" style="margin-top:6px;font-family:ui-monospace,monospace;white-space:pre-wrap">волки / КД: —</div>
+          <div id="presZombieChaseDiag" class="hint" style="margin-top:6px;font-family:ui-monospace,monospace;white-space:pre-wrap;max-height:220px;overflow:auto">зомби цели: —</div>
         </div>
       </div>
     </div>
@@ -5207,25 +5656,26 @@ button.george { border-color: #3d6b52; }
           <button type="button" id="btnLlmRosterMode" title="Переключить: только в игре / вся история">В игре</button>
           <button type="button" id="btnLlmRosterResync" title="Отправить список в Unity после рестарта стрима">↻ Resync → Unity</button>
         </div>
-        <p class="hint" style="margin:6px 0 8px">База <code>stream_bot.sqlite3</code>: кто писал #join, когда, вода/дерево/овцы/костры. #exit → не «в игре», но в истории остаётся. После рестарта стрима жми Resync (или он сам после restart_stream).</p>
+        <p class="hint" style="margin:6px 0 8px">База <code>stream_bot.sqlite3</code>: кто писал #join, когда, вода/дерево/овцы/костры. #exit и 48ч без активности → не «в игре», но в истории/статистике остаётся. Вернуться — снова #join. После рестарта стрима жми Resync (или он сам после restart_stream).</p>
         <div id="llmRosterEmpty" class="hint" style="padding:6px 0">Пока никого — зрители пишут #join в чат</div>
         <div style="overflow:auto;max-height:320px">
           <table id="llmRosterTable" style="width:100%;border-collapse:collapse;font-size:12px;display:none">
-            <thead>
-              <tr style="color:#9aa4b8;text-align:left">
-                <th style="padding:4px 6px">#</th>
-                <th style="padding:4px 6px">Ник</th>
+          <thead>
+            <tr style="color:#9aa4b8;text-align:left">
+              <th style="padding:4px 6px">#</th>
+              <th style="padding:4px 6px">Ник</th>
                 <th style="padding:4px 6px">Статус</th>
-                <th style="padding:4px 6px">Действие</th>
+              <th style="padding:4px 6px">Действие</th>
+                <th style="padding:4px 6px">Активность</th>
                 <th style="padding:4px 6px">Вход</th>
                 <th style="padding:4px 6px">💧</th>
                 <th style="padding:4px 6px">🪵</th>
                 <th style="padding:4px 6px">🐑</th>
                 <th style="padding:4px 6px">🔥</th>
-              </tr>
-            </thead>
-            <tbody id="llmRosterBody"></tbody>
-          </table>
+            </tr>
+          </thead>
+          <tbody id="llmRosterBody"></tbody>
+        </table>
         </div>
       </div>
       <div class="btns" style="flex-wrap:wrap">
@@ -5319,7 +5769,7 @@ function heroCard(hero, title, color) {
   const chart = el("div", {
     className:"chart-wrap",
     id:`chart-${hero}`,
-    title:"Нажми — все метрики TB",
+    title:"Нажми — все метрики TB (после «Нарисовать TB»)",
     onClick: () => openDetail(hero, title),
   }, [el("span", {className:"click-hint", text:"клик → все графики"})]);
   root.append(
@@ -5329,20 +5779,32 @@ function heroCard(hero, title, color) {
     ]),
     chart,
     el("div", {className:"legend", id:`legend-${hero}`}),
+    el("div", {className:"btns", style:"margin:6px 0 8px;flex-wrap:wrap"}, [
+      btn("Нарисовать TB", "primary", () => drawHeroTb(hero)),
+      btn("Выключить", "danger", () => clearHeroTb(hero)),
+    ]),
+    el("p", {className:"hint", style:"margin:0 0 8px", text:"По умолчанию график выкл. Выключить — также убивает процесс TensorBoard."}),
     el("div", {className:"grid2"}, [
       fieldSelect(`tb1-${hero}`, "TB Stage1", h.tb_s1),
       fieldSelect(`tb2-${hero}`, "TB Stage2", h.tb_s2),
     ]),
     el("div", {className:"grid2"}, [
-      fieldInput(`run1-${hero}`, "База Stage1 = INIT_FROM (веса)", h.run_s1),
-      fieldInput(`run2-${hero}`, "Папка Stage2 = RUN_ID (куда писать)", h.run_s2),
+      fieldInputWithStatus(`run1-${hero}`, `status-s1-${hero}`, "База Stage1 = INIT_FROM (веса)", h.run_s1),
+      fieldInputWithStatus(`run2-${hero}`, `status-s2-${hero}`, "Папка Stage2 = RUN_ID (куда писать)", h.run_s2),
     ]),
     el("div", {className:"btns train-btns"}, [
-      btn("▶ Запуск Stage1", "primary "+hero, () => train(hero,"s1")),
-      btn("▶ Запуск Stage2", "primary "+hero, () => train(hero,"s2")),
-      btn("▶ Curriculum 1→2", "primary "+hero, () => train(hero,"cur")),
-      btn("Resume Stage1", "", () => train(hero,"s1", true)),
-      btn("Resume Stage2", "", () => train(hero,"s2", true)),
+      el("button", {
+        className: "primary " + hero,
+        id: `btn-s1-${hero}`,
+        text: "▶ Запуск Stage1",
+        onClick: () => train(hero, "s1"),
+      }),
+      el("button", {
+        className: "primary " + hero,
+        id: `btn-s2-${hero}`,
+        text: "▶ Запуск Stage2",
+        onClick: () => train(hero, "s2"),
+      }),
     ]),
     el("p", {className:"hint", text: hintFor(hero)}),
   );
@@ -5350,14 +5812,22 @@ function heroCard(hero, title, color) {
 }
 
 function hintFor(hero) {
-  if (hero==="jack") return "Stage2 читает веса из INIT_FROM (левое поле), пишет в RUN_ID (правое). Пример: 97 → 97_stage2; для базы 100 поставь слева 100, справа 100_stage2.";
-  return "Stage2: INIT_FROM=левое поле, RUN_ID=правое. Curriculum Stage1→Stage2 на lab_comp.";
+  if (hero==="jack") return "Stage2 читает веса из INIT_FROM (левое поле), пишет в RUN_ID (правое). Пример: 97 → 97_stage2.";
+  return "Stage2: INIT_FROM=левое поле, RUN_ID=правое.";
 }
 
 function fieldInput(id, label, value) {
   return el("div", {className:"field"}, [
     el("label", {text: label}),
     el("input", {id, value: value||""}),
+  ]);
+}
+
+function fieldInputWithStatus(id, statusId, label, value) {
+  return el("div", {className:"field"}, [
+    el("label", {text: label}),
+    el("input", {id, value: value||""}),
+    el("span", {className:"run-status", id: statusId, text:"—"}),
   ]);
 }
 
@@ -5589,6 +6059,123 @@ function applyJointTrainLock(jointRunning) {
   }
 }
 
+const HERO_LOCK_IDS = (hero) => [`tb1-${hero}`, `tb2-${hero}`, `run1-${hero}`, `run2-${hero}`];
+const _heroLockGraceUntil = { jack: 0, lily: 0, george: 0 };
+
+function readHeroLocked(hero) {
+  const L = (CFG && CFG[hero] && CFG[hero].locked) || null;
+  if (!L || typeof L !== "object") return null;
+  if (!L.run_s1 && !L.run_s2 && !L.tb_s1 && !L.tb_s2) return null;
+  return {
+    run_s1: String(L.run_s1 || ""),
+    run_s2: String(L.run_s2 || ""),
+    tb_s1: String(L.tb_s1 || ""),
+    tb_s2: String(L.tb_s2 || ""),
+    stage: String(L.stage || ""),
+  };
+}
+
+async function persistHeroLocked(hero, snap) {
+  if (!CFG) CFG = {};
+  if (!CFG[hero]) CFG[hero] = {};
+  CFG[hero].locked = snap;
+  try {
+    const body = {
+      build: document.getElementById("buildName").value.trim(),
+      tb_url: document.getElementById("tbUrl").value.trim(),
+      jack: collectHero("jack"),
+      lily: collectHero("lily"),
+      george: collectHero("george"),
+      joint: collectJoint(),
+    };
+    body[hero] = Object.assign({}, collectHero(hero), { locked: snap });
+    if (CFG.joint && CFG.joint.locked) body.joint.locked = CFG.joint.locked;
+    CFG = (await api("/api/config", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(body),
+    })).config;
+  } catch (_) {}
+}
+
+function applyHeroTrainUI(hero, running, stage) {
+  const btn1 = document.getElementById(`btn-s1-${hero}`);
+  const btn2 = document.getElementById(`btn-s2-${hero}`);
+  let snap = readHeroLocked(hero);
+  if (!running && snap && Date.now() < (_heroLockGraceUntil[hero] || 0)) {
+    running = true;
+    stage = stage || snap.stage || "s1";
+  }
+  if (running) {
+    if (!snap) {
+      snap = Object.assign({}, collectHero(hero), { stage: stage || "s1" });
+      persistHeroLocked(hero, snap);
+    }
+    const setVal = (id, v) => {
+      const n = document.getElementById(id);
+      if (n && v != null) n.value = v;
+    };
+    setVal(`run1-${hero}`, snap.run_s1);
+    setVal(`run2-${hero}`, snap.run_s2);
+    setVal(`tb1-${hero}`, snap.tb_s1);
+    setVal(`tb2-${hero}`, snap.tb_s2);
+    for (const id of HERO_LOCK_IDS(hero)) {
+      const n = document.getElementById(id);
+      if (!n) continue;
+      n.disabled = true;
+      if (n.parentElement) n.parentElement.classList.add("locked");
+    }
+    const st = (stage || snap.stage || "s1");
+    if (btn1) {
+      if (st === "s1") {
+        btn1.textContent = "● Запущено Stage1";
+        btn1.classList.add("live-on");
+        btn1.classList.remove("primary");
+        btn1.disabled = true;
+      } else {
+        btn1.textContent = "▶ Запуск Stage1";
+        btn1.classList.remove("live-on");
+        btn1.classList.add("primary");
+        btn1.disabled = true;
+      }
+    }
+    if (btn2) {
+      if (st === "s2") {
+        btn2.textContent = "● Запущено Stage2";
+        btn2.classList.add("live-on");
+        btn2.classList.remove("primary");
+        btn2.disabled = true;
+      } else {
+        btn2.textContent = "▶ Запуск Stage2";
+        btn2.classList.remove("live-on");
+        btn2.classList.add("primary");
+        btn2.disabled = true;
+      }
+    }
+  } else {
+    _heroLockGraceUntil[hero] = 0;
+    for (const id of HERO_LOCK_IDS(hero)) {
+      const n = document.getElementById(id);
+      if (!n) continue;
+      n.disabled = false;
+      if (n.parentElement) n.parentElement.classList.remove("locked");
+    }
+    if (btn1) {
+      btn1.textContent = "▶ Запуск Stage1";
+      btn1.classList.remove("live-on");
+      btn1.classList.add("primary");
+      btn1.disabled = false;
+    }
+    if (btn2) {
+      btn2.textContent = "▶ Запуск Stage2";
+      btn2.classList.remove("live-on");
+      btn2.classList.add("primary");
+      btn2.disabled = false;
+    }
+    if (readHeroLocked(hero)) persistHeroLocked(hero, null);
+  }
+}
+
 function jointPreferRuns(runId) {
   const rid = (runId || "").trim();
   if (!rid) return [];
@@ -5669,6 +6256,46 @@ function setJointTbBtnBusy(btn, busyText) {
   };
 }
 
+const _tbDrawOn = { jack: false, lily: false, george: false, joint: false };
+let _tbPollTimer = null;
+
+function anyTbDrawOn() {
+  return Object.values(_tbDrawOn).some(Boolean);
+}
+
+function scheduleTbPoll() {
+  if (_tbPollTimer) {
+    clearInterval(_tbPollTimer);
+    _tbPollTimer = null;
+  }
+  if (!anyTbDrawOn()) return;
+  _tbPollTimer = setInterval(() => {
+    if (!anyTbDrawOn()) return;
+    loadCharts().catch(() => {});
+  }, 30000);
+}
+
+async function ensureTensorboardUp() {
+  const j = await api("/api/action", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({ action: "ensure_tensorboard" }),
+  });
+  LAST_JOB = j.job_id;
+  // дать TB подняться перед первым запросом серий
+  await new Promise((r) => setTimeout(r, 2500));
+}
+
+async function killTensorboardProc() {
+  const j = await api("/api/action", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({ action: "kill_tensorboard" }),
+  });
+  LAST_JOB = j.job_id;
+  pollJobs();
+}
+
 async function drawJointTb() {
   const sel = document.getElementById("jointTb");
   const runs = [...sel.selectedOptions].map((o) => o.value.trim()).filter(Boolean);
@@ -5678,8 +6305,11 @@ async function drawJointTb() {
   }
   const btn = document.getElementById("btnJointTbDraw");
   const restore = setJointTbBtnBusy(btn, "● Рисуется…");
-  flash("hdrMeta", "TB: рисую…");
+  flash("hdrMeta", "TB: поднимаю TensorBoard и рисую…");
   try {
+    await ensureTensorboardUp();
+    _tbDrawOn.joint = true;
+    scheduleTbPoll();
     await loadJointChart();
     await saveCfg();
     flash("hdrMeta", `TB нарисован · ${runs.length} run(s)`);
@@ -5693,13 +6323,24 @@ async function drawJointTb() {
 async function clearJointTb() {
   const btn = document.getElementById("btnJointTbClear");
   const restore = setJointTbBtnBusy(btn, "● Выключается…");
-  flash("hdrMeta", "TB: выключаю…");
+  flash("hdrMeta", "TB: выключаю + kill tensorboard…");
   try {
-    const sel = document.getElementById("jointTb");
-    for (const o of sel.options) o.selected = false;
+    _tbDrawOn.jack = false;
+    _tbDrawOn.lily = false;
+    _tbDrawOn.george = false;
+    _tbDrawOn.joint = false;
+    scheduleTbPoll();
+  const sel = document.getElementById("jointTb");
+  for (const o of sel.options) o.selected = false;
     await loadJointChart();
+    for (const hero of ["jack", "lily", "george"]) {
+      drawChart(hero, {});
+      const pill = document.getElementById(`pill-${hero}`);
+      if (pill && !pill.classList.contains("live")) pill.textContent = "Cumulative Reward";
+    }
+    await killTensorboardProc();
     await saveCfg();
-    flash("hdrMeta", "TB выключен");
+    flash("hdrMeta", "TB выключен (tensorboard убит)");
   } catch (e) {
     flash("hdrMeta", "TB err: " + (e.message || e));
   } finally {
@@ -5707,10 +6348,60 @@ async function clearJointTb() {
   }
 }
 
+async function drawHeroTb(hero) {
+  const a = document.getElementById(`tb1-${hero}`);
+  const b = document.getElementById(`tb2-${hero}`);
+  const runs = [a && a.value, b && b.value].filter(Boolean);
+  if (!runs.length) {
+    flash("hdrMeta", `${hero}: выбери TB Stage1/Stage2`);
+    return;
+  }
+  flash("hdrMeta", `${hero}: TB поднимаю и рисую…`);
+  try {
+    await ensureTensorboardUp();
+    _tbDrawOn[hero] = true;
+    scheduleTbPoll();
+    await loadCharts();
+    await saveCfg();
+    flash("hdrMeta", `${hero}: TB нарисован`);
+  } catch (e) {
+    flash("hdrMeta", `${hero} TB err: ` + (e.message || e));
+  }
+}
+
+async function clearHeroTb(hero) {
+  flash("hdrMeta", `${hero}: TB выключаю…`);
+  try {
+    _tbDrawOn.jack = false;
+    _tbDrawOn.lily = false;
+    _tbDrawOn.george = false;
+    _tbDrawOn.joint = false;
+    scheduleTbPoll();
+    for (const h of ["jack", "lily", "george"]) {
+      drawChart(h, {});
+      const pill = document.getElementById(`pill-${h}`);
+      if (pill && !pill.classList.contains("live")) pill.textContent = "Cumulative Reward";
+    }
+    const host = document.getElementById("chart-joint");
+    const leg = document.getElementById("legend-joint");
+    if (host) drawChartInto(host, leg, {}, 140);
+    await killTensorboardProc();
+    flash("hdrMeta", `${hero}: TB выключен (tensorboard убит)`);
+  } catch (e) {
+    flash("hdrMeta", `${hero} TB err: ` + (e.message || e));
+  }
+}
+
 let _jointWeightTimer = null;
 function scheduleJointWeightStatus() {
   if (_jointWeightTimer) clearTimeout(_jointWeightTimer);
   _jointWeightTimer = setTimeout(() => refreshJointWeightStatus(), 350);
+}
+
+let _heroWeightTimer = null;
+function scheduleHeroWeightStatus() {
+  if (_heroWeightTimer) clearTimeout(_heroWeightTimer);
+  _heroWeightTimer = setTimeout(() => refreshAllHeroWeightStatus(), 350);
 }
 
 function setJointStatusEl(id, item) {
@@ -5724,6 +6415,40 @@ function setJointStatusEl(id, item) {
   const ok = !!(item.exists && item.has_weights);
   eln.className = "run-status " + (ok ? "ok" : (item.exists ? "ok" : "missing"));
   eln.textContent = item.label || (ok ? "есть" : "нет папки");
+}
+
+function setHeroStatusEl(id, item) {
+  setJointStatusEl(id, item);
+}
+
+async function refreshHeroWeightStatus(hero) {
+  const h = collectHero(hero);
+  const s1 = document.getElementById(`status-s1-${hero}`);
+  const s2 = document.getElementById(`status-s2-${hero}`);
+  if (s1) { s1.className = "run-status checking"; s1.textContent = "…"; }
+  if (s2) { s2.className = "run-status checking"; s2.textContent = "…"; }
+  try {
+    if (!h.run_s1) setHeroStatusEl(`status-s1-${hero}`, null);
+    else {
+      const data1 = await api("/api/joint/run_weights?" + new URLSearchParams({ [hero]: h.run_s1 }).toString());
+      setHeroStatusEl(`status-s1-${hero}`, (data1 && data1.items && data1.items[hero]) || { exists: false, has_weights: false, label: "нет папки" });
+    }
+    if (!h.run_s2) setHeroStatusEl(`status-s2-${hero}`, null);
+    else {
+      const data2 = await api("/api/joint/run_weights?" + new URLSearchParams({ [hero]: h.run_s2 }).toString());
+      setHeroStatusEl(`status-s2-${hero}`, (data2 && data2.items && data2.items[hero]) || { exists: false, has_weights: false, label: "нет папки" });
+    }
+  } catch (e) {
+    const msg = String(e.message || e);
+    for (const id of [`status-s1-${hero}`, `status-s2-${hero}`]) {
+      const eln = document.getElementById(id);
+      if (eln) { eln.className = "run-status missing"; eln.textContent = "err · " + msg.slice(0, 40); }
+    }
+  }
+}
+
+async function refreshAllHeroWeightStatus() {
+  await Promise.all(["jack", "lily", "george"].map((h) => refreshHeroWeightStatus(h)));
 }
 
 async function refreshJointWeightStatus() {
@@ -6096,7 +6821,15 @@ async function killStreamOnly() {
 }
 
 async function repairStreamSpawn() {
-  if (!confirm("Починить спавн деревьев/овец в Presentation?\\n\\nСкрипт напишет .forest_repair_spawners → Unity сделает ResetSpawners.\\nНужен свежий билд со StreamSpawnRepairWatcher + фикс TreeSpawner.")) return;
+  const btn = document.getElementById("btnRepairSpawn");
+  const setBtn = (label, cls) => {
+    if (!btn) return;
+    btn.textContent = label;
+    btn.disabled = !!cls && cls !== "done" && cls !== "fail";
+    if (cls === "busy") btn.classList.add("busy"); else btn.classList.remove("busy");
+  };
+  if (!confirm("Починить спавн деревьев/овец в Presentation?\\n\\nUnity должен ответить .forest_repair_spawners_result (до ~25с).")) return;
+  setBtn("⏳ Чиню спавн…", "busy");
   flash("hdrMeta", "repair spawn…");
   try {
     const j = await api("/api/action", {
@@ -6109,7 +6842,49 @@ async function repairStreamSpawn() {
     });
     LAST_JOB = j.job_id;
     pollJobs();
-  } catch (e) { alert(e.message||e); }
+    let final = "fail";
+    let msg = "нет ответа";
+    for (let i = 0; i < 40; i++) {
+      await new Promise(r => setTimeout(r, 1500));
+      let detail = null;
+      try { detail = await api("/api/jobs/"+encodeURIComponent(j.job_id)); } catch (_) {}
+      if (!detail) continue;
+      const tail = (detail.log_tail || "");
+      if (detail.status === "running") {
+        setBtn("⏳ Чиню… " + (i+1), "busy");
+        continue;
+      }
+      if (detail.status === "ok") {
+        final = "done";
+        const m = tail.match(/live_after trees\s+(\d+)\s*\/\s*(\d+)/);
+        msg = m ? ("деревья " + m[1] + "/" + m[2]) : "ok";
+        if (/OKTREE/.test(tail) || (/ok reason=/.test(tail) && !/FAILTREE|fail_trees/.test(tail))) { final = "ok"; msg = "спавн ок"; }
+        else if (/FAILTREE/.test(tail) || /fail_trees/.test(tail)) { final = "fail"; msg = "деревья всё ещё 0"; }
+        break;
+      }
+      if (detail.status === "error") {
+        final = "fail";
+        if (/WARN: нет \.forest_repair_spawners_result/.test(tail)) msg = "Unity не ответил (нужен DLL)";
+        else if (/fail_trees_still_0/.test(tail)) msg = "деревья всё ещё 0";
+        else msg = (tail.trim().split("\n").filter(Boolean).pop() || "error").slice(0, 60);
+        break;
+      }
+    }
+    if (final === "done") {
+      setBtn("✓ Починено · " + msg, "done");
+      flash("hdrMeta", "spawn repaired · " + msg);
+    } else {
+      setBtn("⚠ Не вышло · " + msg, "fail");
+      flash("hdrMeta", "spawn repair fail · " + msg);
+    }
+    setTimeout(pollServer, 1500);
+    setTimeout(pollPresWorld, 2500);
+    setTimeout(() => setBtn("🔧 Починить спавн", ""), 8000);
+  } catch (e) {
+    setBtn("⚠ Ошибка", "fail");
+    alert(e.message||e);
+    setTimeout(() => setBtn("🔧 Починить спавн", ""), 5000);
+  }
 }
 
 async function killModeTraining() {
@@ -6376,6 +7151,22 @@ function fmtRosterTime(ts) {
   } catch (_) { return "—"; }
 }
 
+/** last_action_changed_at / last_seen_at → «сейчас», «3 мин», «2 ч»… */
+function fmtRosterActivity(u) {
+  const raw = Number((u && (u.last_action_changed_at || u.last_seen_at)) || 0);
+  if (!Number.isFinite(raw) || raw <= 0) return "—";
+  const sec = Math.max(0, Math.floor(Date.now() / 1000 - raw));
+  if (sec < 10) return "сейчас";
+  if (sec < 60) return sec + " с";
+  if (sec < 3600) return Math.floor(sec / 60) + " мин";
+  if (sec < 86400) {
+    const h = Math.floor(sec / 3600);
+    const m = Math.floor((sec % 3600) / 60);
+    return m ? (h + " ч " + m + " м") : (h + " ч");
+  }
+  return Math.floor(sec / 86400) + " д";
+}
+
 function renderLlmRoster(roster, count, players) {
   const activeRows = Array.isArray(roster) ? roster : [];
   const histRows = Array.isArray(players) ? players : activeRows;
@@ -6416,6 +7207,8 @@ function renderLlmRoster(roster, count, players) {
     const name = esc(u.username || u.user || "?");
     const act = esc(u.action_name || u.action || "idle");
     const since = fmtRosterTime(u.joined_at);
+    const activity = fmtRosterActivity(u);
+    const activityAbs = esc(fmtRosterTime(u.last_action_changed_at || u.last_seen_at));
     const live = !!(u.is_active === true || u.is_active === 1 || (!LLM_ROSTER_HISTORY));
     const st = live ? '<span style="color:#3ecf8e">in</span>' : '<span style="color:#7a8499">out</span>';
     const dim = live ? "" : "opacity:.65";
@@ -6424,6 +7217,7 @@ function renderLlmRoster(roster, count, players) {
       <td style="padding:4px 6px"><b>${name}</b></td>
       <td style="padding:4px 6px">${st}</td>
       <td style="padding:4px 6px">${act}</td>
+      <td style="padding:4px 6px;color:#9aa4b8;white-space:nowrap" title="${activityAbs}">${activity}</td>
       <td style="padding:4px 6px;color:#9aa4b8;white-space:nowrap">${since}</td>
       <td style="padding:4px 6px">${num(u.total_water_collected)}</td>
       <td style="padding:4px 6px">${num(u.total_wood_collected)}</td>
@@ -6582,9 +7376,9 @@ async function saveCfg() {
   const body = {
     build: document.getElementById("buildName").value.trim(),
     tb_url: document.getElementById("tbUrl").value.trim(),
-    jack: collectHero("jack"),
-    lily: collectHero("lily"),
-    george: collectHero("george"),
+    jack: Object.assign({}, collectHero("jack"), { locked: readHeroLocked("jack") }),
+    lily: Object.assign({}, collectHero("lily"), { locked: readHeroLocked("lily") }),
+    george: Object.assign({}, collectHero("george"), { locked: readHeroLocked("george") }),
     joint: j,
   };
   CFG = (await api("/api/config", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)})).config;
@@ -6593,6 +7387,8 @@ async function saveCfg() {
 
 async function train(hero, stage, resume=false) {
   await saveCfg();
+  _heroLockGraceUntil[hero] = Date.now() + 90000;
+  applyHeroTrainUI(hero, true, stage);
   const h = collectHero(hero);
   const j = await api("/api/action", {
     method:"POST", headers:{"Content-Type":"application/json"},
@@ -6777,6 +7573,10 @@ function drawChart(hero, seriesMap) {
 
 async function loadCharts() {
   for (const hero of ["jack","lily","george"]) {
+    if (!_tbDrawOn[hero]) {
+      // не трогаем pill RUNNING; пустой график только если ещё «нет данных»
+      continue;
+    }
     const a = document.getElementById(`tb1-${hero}`);
     const b = document.getElementById(`tb2-${hero}`);
     if (!a || !b) continue;
@@ -6792,14 +7592,20 @@ async function loadCharts() {
         mapped[`${runName} · Cumulative Reward`] = data.series[k];
       });
       drawChart(hero, mapped);
-      document.getElementById(`pill-${hero}`).textContent = `${Object.keys(mapped).length} · Cumulative Reward`;
+      const pill = document.getElementById(`pill-${hero}`);
+      if (pill && !pill.classList.contains("live")) {
+        pill.textContent = `${Object.keys(mapped).length} · Cumulative Reward`;
+      }
     } catch (e) {
-      document.getElementById(`pill-${hero}`).textContent = "TB err";
+      const pill = document.getElementById(`pill-${hero}`);
+      if (pill && !pill.classList.contains("live")) pill.textContent = "TB err";
       const host = document.getElementById(`chart-${hero}`);
       if (host) host.textContent = String(e.message||e);
     }
   }
+  if (_tbDrawOn.joint) {
   try { await loadJointChart(); } catch (_) {}
+  }
 }
 
 async function openDetail(hero, title) {
@@ -6887,21 +7693,26 @@ async function pollServer() {
     const tried = (s.tried || []).join(" → ");
     const modeLabel = document.getElementById("serverModeLabel");
     if (modeLabel) modeLabel.textContent = mode === "local" ? "(local на lab)" : "(только SSH)";
+    const soft = !!s.soft_stale;
     document.getElementById("serverHostHint").textContent =
       s.ok
         ? (mode === "local"
           ? `host=local · UI уже на lab_comp, команды без SSH (это нормально)`
-          : `host=${host} · данные по SSH с lab (не с твоего ПК)`)
+          : (soft
+            ? `host=${host} · last ok (retry SSH…)`
+            : `host=${host} · данные по SSH с lab (не с твоего ПК)`))
         : (s.pending
           ? `host=${host} · опрос…`
           : (mode === "local"
             ? `local fail · ${s.text || "?"}`
-            : `ssh fail · пробовали: ${tried || host}`));
+            : `ssh fail · retry… · пробовали: ${tried || host}`));
     document.getElementById("serverStats").textContent =
       `[${mode} ${host}]\n` + (s.text || "(пусто)");
     const pill = document.getElementById("serverPill");
     if (s.ok) {
-      pill.textContent = mode === "local" ? "local ok" : "ssh ok";
+      pill.textContent = soft
+        ? (mode === "local" ? "local ~" : "ssh ~")
+        : (mode === "local" ? "local ok" : "ssh ok");
       pill.className = "pill on";
     } else if (s.pending) {
       pill.textContent = mode === "local" ? "local…" : "ssh…";
@@ -6910,6 +7721,8 @@ async function pollServer() {
       pill.textContent = mode === "local" ? "local err" : "ssh err";
       pill.className = "pill";
     }
+    // При ошибке опрашиваем чаще — иначе UI «замирает» после одного fail.
+    _serverPollFail = !(s.ok || s.pending);
     renderServerHost(s);
     applyLabActivity(s.activity || {});
     renderStreamFps((s.activity || {}).stream_fps || {});
@@ -6918,6 +7731,7 @@ async function pollServer() {
     if (streamOn) schedulePresWorldPoll(true);
     else if (_presWorldTimer) { /* keep last frame; soft refresh less often */ schedulePresWorldPoll(false); }
   } catch (e) {
+    _serverPollFail = true;
     document.getElementById("serverStats").textContent = "server_stats: " + (e.message||e);
     document.getElementById("serverPill").textContent = "err";
     document.getElementById("serverPill").className = "pill";
@@ -6926,6 +7740,16 @@ async function pollServer() {
     renderStreamFps({});
     renderObsSsh({});
   }
+}
+
+let _serverPollFail = false;
+function scheduleServerPoll() {
+  const loop = () => {
+    Promise.resolve(pollServer()).finally(() => {
+      setTimeout(loop, _serverPollFail ? 2000 : 5000);
+    });
+  };
+  loop();
 }
 
 function hostMeterHtml(label, valueHtml, pct, barClass) {
@@ -7011,7 +7835,15 @@ function renderServerHost(s) {
     );
   }
   if (!parts.length) {
-    meters.innerHTML = '<div class="hint">' + ((s && s.text) ? "нет структурированных метрик — см. сырой вывод" : "загрузка метрик…") + '</div>';
+    let hint = "первый опрос lab…";
+    if (s && s.pending) hint = "опрос lab (фон)…";
+    else if (s && s.text) {
+      const t = String(s.text);
+      if (/SSH занят/i.test(t)) hint = "SSH занят — UI сам чистит зависшие ssh.exe и повторяет…";
+      else if (/ssh/i.test(t)) hint = "ssh err — повтор… · " + t.slice(0, 120);
+      else hint = "нет структурированных метрик — см. сырой вывод";
+    }
+    meters.innerHTML = '<div class="hint">' + hint + '</div>';
     return;
   }
   meters.innerHTML = parts.join("");
@@ -7091,6 +7923,9 @@ function applyLabActivity(a) {
   setPillLive("pill-stream", stream, false, "idle");
 
   applyJointTrainLock(!!joint);
+  applyHeroTrainUI("jack", jack, a.jack_stage || "");
+  applyHeroTrainUI("lily", lily, a.lily_stage || "");
+  applyHeroTrainUI("george", george, a.george_stage || "");
 
   if (isStreamStopping()) applyStreamButtons("stopping");
   else if (stream) applyStreamButtons("running");
@@ -7159,6 +7994,17 @@ function _presNum(v, fallback) {
 
 function _presFrameFromLive(data) {
   if (!data || !data.ok) return null;
+  let wolves = data.followers_wolf;
+  if (!Array.isArray(wolves) && Array.isArray(data.followers)) {
+    wolves = data.followers.filter(f => f && f.skin === "wolf").map(f => ({
+      user: f.user || "?",
+      hits: f.wolf_hits|0,
+      cd_stuck: !!f.wolf_cd_stuck,
+      stuck_n: f.wolf_cd_stuck_n|0,
+      cd_left: Number(f.wolf_cd_left||0),
+      action: f.action || "",
+    }));
+  }
   return {
     ok: true,
     ts: data.ts || "",
@@ -7168,6 +8014,10 @@ function _presFrameFromLive(data) {
     trees_target: data.trees_target, sheep_target: data.sheep_target,
     jack: data.jack, lily: data.lily, george: data.george,
     landmarks: data.landmarks,
+    followers: data.followers || [],
+    followers_wolf: wolves || [],
+    zombie_chases: data.zombie_chases || [],
+    zombie_pool: data.zombie_pool || [],
   };
 }
 
@@ -7267,12 +8117,114 @@ function renderPresWorld(data) {
   const cam = _presSharedCamera([startFr, endFr, data]);
   drawPresWorldMap("presWorldMapStart", startFr, cam);
   drawPresWorldMap("presWorldMapEnd", endFr, cam);
+
+  const wolfHost = document.getElementById("presWolfCdDiag");
+  if (wolfHost) {
+    const lr = data.last_round || {};
+    const fmtWolves = (fr, label) => {
+      const ws = (fr && fr.followers_wolf) || [];
+      if (!ws.length) return label + ": нет волков";
+      return label + ": " + ws.map(w => {
+        const stuck = w.cd_stuck ? "STUCK" : "ok";
+        return w.user + "{hits=" + (w.hits|0) + " cd=" + stuck
+          + " n=" + (w.stuck_n|0) + " left=" + Number(w.cd_left||0).toFixed(1) + "}";
+      }).join(" ");
+    };
+    const epStuck = lr.wolf_cd_stuck || (data.episode && data.episode.wolf_cd_stuck);
+    wolfHost.textContent =
+      "эпизод #" + (frEp || "—") + " · wolf_cd_stuck=" + (epStuck ? "YES" : "no") + "\n"
+      + fmtWolves(startFr, "start") + "\n"
+      + fmtWolves(endFr, pending ? "now" : "end");
+  }
+
+  const zHost = document.getElementById("presZombieChaseDiag");
+  if (zHost) {
+    const fr = endFr || data;
+    const pool = (fr && fr.zombie_pool) || data.zombie_pool || [];
+    const chases = (fr && fr.zombie_chases) || data.zombie_chases || [];
+    const followers = (fr && fr.followers) || data.followers || [];
+    const lines = [];
+    const okF = pool.filter(p => p && p.kind === "follower" && p.status === "ok");
+    const skipF = pool.filter(p => p && p.kind === "follower" && p.status !== "ok");
+    lines.push(
+      "zombie_pool n=" + pool.length
+      + " · followers_ok=" + okF.length
+      + " · followers_skip=" + skipF.length
+      + " · chases=" + chases.length
+    );
+    if (followers.length) {
+      lines.push("followers: " + followers.map(f => {
+        const st = f.chase_status || "?";
+        return (f.user || "?") + "{" + (f.skin || "?")
+          + " hp=" + (f.hp != null ? f.hp : "?")
+          + "/" + (f.max_hp != null ? f.max_hp : "?")
+          + " chase=" + st
+          + " xz=(" + Number(f.x||0).toFixed(1) + "," + Number(f.z||0).toFixed(1) + ")"
+          + " act=" + (f.action || "") + "}";
+      }).join(" "));
+    } else {
+      lines.push("followers: []  ← если mysticggx тут нет, DLL/стрим без SSPlayer");
+    }
+    if (pool.length) {
+      lines.push("pool: " + pool.map(p =>
+        (p.kind || "?") + ":" + (p.name || "?")
+        + "{" + (p.status || "?") + " d=" + Number(p.dist||0).toFixed(1) + "}"
+      ).join(" "));
+    }
+    const show = chases.slice(0, 12);
+    for (const z of show) {
+      const tgt = z.has_target
+        ? ((z.target_kind || "?") + ":" + (z.target_name || "?") + " d=" + Number(z.target_dist||0).toFixed(1))
+        : "NONE";
+      const poolShort = (z.pool || []).slice(0, 8).map(c =>
+        (c.kind || "?") + ":" + (c.name || "?") + "=" + (c.status || "?") + "@" + Number(c.dist||0).toFixed(1)
+      ).join(",");
+      lines.push(
+        "z(" + Number(z.x||0).toFixed(1) + "," + Number(z.z||0).toFixed(1) + ")->" + tgt
+        + (poolShort ? " | " + poolShort : "")
+      );
+    }
+    if (chases.length > show.length) {
+      lines.push("… ещё " + (chases.length - show.length) + " зомби");
+    }
+    zHost.textContent = lines.join("\n");
+  }
+}
+
+function _presDedupeLakes(lakes) {
+  const src = Array.isArray(lakes) ? lakes : [];
+  const out = [];
+  const d2 = 8 * 8;
+  for (const lake of src) {
+    if (!lake || lake.x == null) continue;
+    const x = Number(lake.x), z = Number(lake.z) || 0;
+    const sx = Math.max(2, Number(lake.sx) || 8);
+    const sz = Math.max(2, Number(lake.sz) || 6);
+    let merged = false;
+    for (let i = 0; i < out.length; i++) {
+      const cur = out[i];
+      const dx = cur.x - x, dz = cur.z - z;
+      if (dx * dx + dz * dz > d2) continue;
+      const a = Math.max(0.01, cur.sx * cur.sz), b = Math.max(0.01, sx * sz);
+      out[i] = {
+        x: (cur.x * a + x * b) / (a + b),
+        z: (cur.z * a + z * b) / (a + b),
+        sx: Math.max(cur.sx, sx),
+        sz: Math.max(cur.sz, sz),
+      };
+      merged = true;
+      break;
+    }
+    if (!merged) out.push({ x, z, sx, sz });
+  }
+  return out;
 }
 
 function _presCollectPts(data) {
   const pts = [];
   if (!data) return pts;
   const lm = data.landmarks || {};
+  const lakes = _presDedupeLakes(lm.lakes);
   for (const k of ["trees", "sheep", "zombies"]) {
     const arr = Array.isArray(data[k]) ? data[k] : [];
     for (const p of arr) if (p && p.x != null) pts.push(p);
@@ -7281,11 +8233,18 @@ function _presCollectPts(data) {
     const a = data[key];
     if (a && a.ok) pts.push(a);
   }
+  for (const f of (data.followers || [])) {
+    if (f && f.x != null) pts.push(f);
+  }
+  for (const z of (data.zombie_chases || [])) {
+    if (z && z.x != null) pts.push(z);
+    if (z && z.has_target && z.target_x != null) pts.push({ x: z.target_x, z: z.target_z });
+  }
   if (lm.house && lm.house.x != null) pts.push(lm.house);
-  for (const p of (lm.lakes || [])) if (p && p.x != null) pts.push(p);
+  for (const p of lakes) pts.push(p);
   for (const p of (lm.stones || [])) if (p && p.x != null) pts.push(p);
   for (const p of (lm.fences || [])) if (p && p.x != null) pts.push(p);
-  for (const r of [...(lm.lakes || []), ...(lm.fences || [])]) {
+  for (const r of [...lakes, ...(lm.fences || [])]) {
     if (!r || r.x == null) continue;
     const hx = (Number(r.sx) || 0) * 0.5;
     const hz = (Number(r.sz) || 0) * 0.5;
@@ -7326,8 +8285,9 @@ function drawPresWorldMap(canvasId, data, cam) {
     return;
   }
 
-  const lm = data.landmarks || {};
-  const pts = _presCollectPts(data);
+  const lmRaw = data.landmarks || {};
+  const lm = Object.assign({}, lmRaw, { lakes: _presDedupeLakes(lmRaw.lakes) });
+  const pts = _presCollectPts(Object.assign({}, data, { landmarks: lm }));
   if (!pts.length) {
     ctx.fillStyle = "#6a7384";
     ctx.font = "14px sans-serif";
@@ -7422,6 +8382,35 @@ function drawPresWorldMap(canvasId, data, cam) {
   drawDots(data.sheep, "#e8e0d0", 3);
   drawDots(data.zombies, "#c45a5a", 3.5);
 
+  // Линии зомби → текущая цель
+  ctx.lineWidth = 1.2;
+  for (const z of (data.zombie_chases || [])) {
+    if (!z || !z.has_target || z.target_x == null) continue;
+    const a = toXY(z.x, z.z);
+    const b = toXY(z.target_x, z.target_z);
+    const isFollower = (z.target_kind || "") === "follower";
+    ctx.strokeStyle = isFollower ? "rgba(240,160,64,0.85)" : "rgba(196,90,90,0.55)";
+    ctx.beginPath();
+    ctx.moveTo(a.x, a.y);
+    ctx.lineTo(b.x, b.y);
+    ctx.stroke();
+  }
+
+  // Фолловеры стрима
+  for (const f of (data.followers || [])) {
+    if (!f || f.x == null) continue;
+    const c = toXY(f.x, f.z);
+    const ok = (f.chase_status || "") === "ok";
+    ctx.fillStyle = ok ? "#f0a040" : "#7a5a30";
+    ctx.beginPath();
+    ctx.arc(c.x, c.y, f.skin === "wolf" ? 6.5 : 5.5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = "#1a1208";
+    ctx.font = "bold 9px sans-serif";
+    const label = (f.user || "?").slice(0, 8);
+    ctx.fillText(label, c.x + 6, c.y - 4);
+  }
+
   const agentColors = { jack: "#6aa6ff", lily: "#e070b0", george: "#3ecf8e" };
   for (const key of ["jack", "lily", "george"]) {
     const a = data[key];
@@ -7448,7 +8437,7 @@ function renderStreamFps(fps) {
   const lagNow = !!f.lag_now || (n === n && n < 15) || (hitchMs === hitchMs && hitchMs >= 800);
   const soft = (n === n && n < 20 && !lagNow);
   if (pre) {
-    const lines = [];
+  const lines = [];
     if (n === n) {
       const mark = lagNow ? "  ← НИЗКИЙ FPS" : (soft ? "  ← слабо" : "");
       let line = `fps ≈ ${n.toFixed(1)}`;
@@ -7457,12 +8446,12 @@ function renderStreamFps(fps) {
       line += `   step ≈ ${Number(f.step_ms||0).toFixed(0)} ms   steps=${f.steps||"?"}${mark}`;
       lines.push(line);
     }
-    if (f.hitches != null) lines.push(`hitches (окно) ${f.hitches}   slow>50ms ${f.slow||0}`);
-    if (hitchMs === hitchMs) lines.push(`last hitch ${hitchMs} ms  (step ${f.hitch_step||"?"}, ~${f.hitch_ema_fps||"?"} FPS)`);
-    if (f.summary) lines.push(String(f.summary).replace(/^\[stream_onnx\]\s*/, ""));
-    if (f.hitch && !hitchMs) lines.push(String(f.hitch).replace(/^\[stream_onnx\]\s*/, ""));
-    if (f.age_s != null) lines.push(`обновлено ${f.age_s}s назад · ${f.source||"?"}${f.log ? " · "+f.log : ""}`);
-    pre.textContent = lines.length ? lines.join("\n") : "нет данных (стрим не пишет лог)";
+  if (f.hitches != null) lines.push(`hitches (окно) ${f.hitches}   slow>50ms ${f.slow||0}`);
+  if (hitchMs === hitchMs) lines.push(`last hitch ${hitchMs} ms  (step ${f.hitch_step||"?"}, ~${f.hitch_ema_fps||"?"} FPS)`);
+  if (f.summary) lines.push(String(f.summary).replace(/^\[stream_onnx\]\s*/, ""));
+  if (f.hitch && !hitchMs) lines.push(String(f.hitch).replace(/^\[stream_onnx\]\s*/, ""));
+  if (f.age_s != null) lines.push(`обновлено ${f.age_s}s назад · ${f.source||"?"}${f.log ? " · "+f.log : ""}`);
+  pre.textContent = lines.length ? lines.join("\n") : "нет данных (стрим не пишет лог)";
   }
   if (card) {
     card.classList.toggle("fps-bad", !!lagNow && n === n);
@@ -7672,6 +8661,12 @@ function renderObsSsh(s) {
   const badAt = Number(s.bad_at) || 10;
   const level = String(s.level || "ok");
   const lines = [];
+  if (!(total === total) && !(local === local)) {
+    pre.textContent = "считаем локальные ssh.exe…";
+    pill.textContent = "…";
+    pill.className = "pill";
+    return;
+  }
   lines.push(`всего ≈ ${total === total ? total : "?"}  (warn≥${warnAt}, bad≥${badAt})`);
   lines.push(`локально ssh→lab: ${local === local ? local : "?"}`);
   lines.push(`активные у этого UI: ${ui === ui ? ui : "?"}`);
@@ -7916,8 +8911,16 @@ function renderHeroes() {
     heroCard("george","George","var(--george)"),
   );
   for (const hero of ["jack","lily","george"]) {
-    document.getElementById(`tb1-${hero}`).onchange = loadCharts;
-    document.getElementById(`tb2-${hero}`).onchange = loadCharts;
+    const tb1 = document.getElementById(`tb1-${hero}`);
+    const tb2 = document.getElementById(`tb2-${hero}`);
+    if (tb1) tb1.onchange = () => { saveCfg(); if (_tbDrawOn[hero]) loadCharts(); };
+    if (tb2) tb2.onchange = () => { saveCfg(); if (_tbDrawOn[hero]) loadCharts(); };
+    for (const id of [`run1-${hero}`, `run2-${hero}`]) {
+      const inp = document.getElementById(id);
+      if (!inp) continue;
+      inp.oninput = scheduleHeroWeightStatus;
+      inp.onchange = () => { saveCfg(); refreshHeroWeightStatus(hero); };
+    }
   }
   fillJointCard();
   document.getElementById("btnJointTrain").onclick = () => trainJoint();
@@ -7959,7 +8962,30 @@ function renderHeroes() {
   document.getElementById("tab-joint-train").onclick = () => switchJointTab("panel-joint-train");
   document.getElementById("tab-joint-stream").onclick = () => switchJointTab("panel-joint-stream");
   document.getElementById("chart-joint").onclick = () => openJointDetail();
-  loadJointChart();
+  // график joint только после «Нарисовать TB»
+  if (_tbDrawOn.joint) loadJointChart();
+  else {
+    const host = document.getElementById("chart-joint");
+    const leg = document.getElementById("legend-joint");
+    if (host) {
+      drawChartInto(host, leg, {}, 140);
+      if (!host.querySelector("svg")) host.textContent = "график выкл — жми «Нарисовать TB»";
+    }
+  }
+  for (const hero of ["jack", "lily", "george"]) {
+    const host = document.getElementById(`chart-${hero}`);
+    if (host && !_tbDrawOn[hero] && !host.querySelector("svg")) {
+      const hint = host.querySelector(".click-hint");
+      host.textContent = "";
+      if (hint) host.appendChild(hint);
+      host.appendChild(document.createTextNode("график выкл — жми «Нарисовать TB»"));
+    }
+    const L = readHeroLocked(hero);
+    if (L) applyHeroTrainUI(hero, true, L.stage || "s1");
+  }
+  if (readJointLocked()) applyJointTrainLock(true);
+  refreshAllHeroWeightStatus();
+  refreshJointWeightStatus();
 }
 
 function bindModeTabs() {
@@ -8654,8 +9680,8 @@ async function boot() {
       const tb2 = await api("/api/tb/runs");
       TB_RUNS = tb2.runs || [];
       renderHeroes();
-      await loadCharts();
-      flash("hdrMeta", `TB runs ${TB_RUNS.length}`);
+      if (anyTbDrawOn()) await loadCharts();
+      flash("hdrMeta", `TB runs ${TB_RUNS.length}` + (anyTbDrawOn() ? "" : " · график выкл — жми «Нарисовать TB»"));
     } catch (e) { flash("hdrMeta", "TB refresh err: "+e); }
   };
   document.getElementById("btnKill").onclick = () => killTrainOnly();
@@ -8684,24 +9710,21 @@ async function boot() {
   });
   fillValTasks();
   flash("hdrMeta", "UI ready");
-  pollServer();
   pollJobs();
   schedulePresWorldPoll(false);
-  setInterval(pollServer, 5000);
+  scheduleServerPoll();
   setInterval(pollJobs, 8000);
 
   try {
     const tb = await api("/api/tb/runs");
     TB_RUNS = tb.runs || [];
-    flash("hdrMeta", `TB ${CFG.tb_url||""} · runs ${TB_RUNS.length} · ssh ${(tb.ssh_host||"?")}`);
+    flash("hdrMeta", `TB ${CFG.tb_url||""} · runs ${TB_RUNS.length} · ssh ${(tb.ssh_host||"?")} · график выкл`);
     renderHeroes();
-    await loadCharts();
+    // по умолчанию НЕ рисуем и НЕ дергаем tensorboard
   } catch (e) {
     flash("hdrMeta", "TB пока недоступен — кнопки запуска работают");
   }
   restoreUiView();
-
-  setInterval(loadCharts, 30000);
 }
 boot().catch(e => { document.getElementById("hdrMeta").textContent = "UI error: "+e; });
 </script>
@@ -8787,18 +9810,15 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/server_stats":
             cfg = load_cfg()
-            # Только кэш. Lock с таймаутом — никогда не клинить HTTP.
-            stats = None
-            if _stats_lock.acquire(timeout=0.4):
-                try:
-                    cached = _stats_cache.get("data")
-                    stats = dict(cached) if isinstance(cached, dict) else None
-                finally:
-                    _stats_lock.release()
-            if stats is None:
-                stats = _stats_pending_payload(
-                    _ssh_host_cache or (cfg.get("ssh_host") or "lab_comp")
-                )
+            # Кэш + kick фонового SSH (раньше только читали кэш → после одного fail UI «умирал»).
+            prefer = _ssh_host_cache or (cfg.get("ssh_host") or "lab_comp")
+            try:
+                stats = dict(fetch_server_stats(prefer) or {})
+            except Exception as e:
+                stats = _stats_pending_payload(prefer)
+                stats["pending"] = False
+                stats["ok"] = False
+                stats["text"] = f"[ssh] {e}"
             try:
                 act = dict(stats.get("activity") or {})
                 if LLM_BOT is not None and LLM_BOT.is_live():
@@ -9223,6 +10243,10 @@ class Handler(BaseHTTPRequestHandler):
                     jid = action_kill_mode_training(cfg)
                 elif action == "kill_mode_streaming":
                     jid = action_kill_mode_streaming(cfg)
+                elif action == "ensure_tensorboard":
+                    jid = action_ensure_tensorboard(cfg)
+                elif action == "kill_tensorboard":
+                    jid = action_kill_tensorboard(cfg)
                 elif action == "start_streaming_survival":
                     jid = action_start_streaming_survival(cfg)
                 elif action == "stop_streaming_survival":
@@ -9299,9 +10323,9 @@ def main() -> None:
         save_cfg(DEFAULT_CFG)
     # подчистить зомби ssh.exe от прошлого UI до приёма запросов
     try:
-        n = cleanup_orphan_batch_ssh(max_age=0.0)
+        n = purge_all_lab_batch_ssh()
         if n:
-            print(f"[train_lab_ui] pruned {n} orphan BatchMode ssh → lab", flush=True)
+            print(f"[train_lab_ui] purged {n} BatchMode ssh → lab", flush=True)
     except Exception as e:
         print(f"[train_lab_ui] ssh prune: {e}", flush=True)
     _ensure_ssh_reaper()

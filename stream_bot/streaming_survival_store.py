@@ -41,6 +41,7 @@ class StreamingSurvivalStore:
                         total_wood_collected INTEGER DEFAULT 0,
                         total_food_collected INTEGER DEFAULT 0,
                         total_sheep_killed INTEGER DEFAULT 0,
+                        total_zombies_killed INTEGER DEFAULT 0,
                         total_campfires_built INTEGER DEFAULT 0
                     )
                     """
@@ -65,11 +66,20 @@ class StreamingSurvivalStore:
             conn.execute(
                 "ALTER TABLE streaming_survival_users ADD COLUMN session_joined_at REAL DEFAULT 0"
             )
+        if "total_zombies_killed" not in cols:
+            conn.execute(
+                "ALTER TABLE streaming_survival_users ADD COLUMN total_zombies_killed INTEGER DEFAULT 0"
+            )
+        if "skin" not in cols:
+            conn.execute(
+                "ALTER TABLE streaming_survival_users ADD COLUMN skin TEXT DEFAULT 'human'"
+            )
 
     _STAT_FIELDS = {
         "water": "total_water_collected",
         "food": "total_food_collected",
         "sheep": "total_sheep_killed",
+        "zombie": "total_zombies_killed",
         "campfire": "total_campfires_built",
         "wood": "total_wood_collected",
         "round": "total_rounds_participated",
@@ -166,7 +176,7 @@ class StreamingSurvivalStore:
                 conn.close()
 
     def leave(self, username: str) -> bool:
-        """True если был активен и вышел."""
+        """True если был активен и вышел. Строка в БД НЕ удаляется — только is_active=0."""
         u = username.lower().strip()
         now = time.time()
         with self._lock:
@@ -195,6 +205,67 @@ class StreamingSurvivalStore:
                 )
                 conn.commit()
                 return True
+            finally:
+                conn.close()
+
+    # 48 часов без активности (#join / #do / last_seen) → скрыть из мира, БД оставить.
+    INACTIVE_HIDE_SECONDS = 48 * 3600
+
+    def deactivate_inactive(
+        self, max_idle_seconds: Optional[float] = None
+    ) -> List[str]:
+        """Снять is_active у тех, кто давно без активности. Статистика в БД сохраняется.
+
+        Возвращает список username, которых только что убрали из игры.
+        """
+        idle = float(
+            self.INACTIVE_HIDE_SECONDS
+            if max_idle_seconds is None
+            else max_idle_seconds
+        )
+        if idle <= 0:
+            return []
+        cutoff = time.time() - idle
+        with self._lock:
+            conn = self._connect()
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT username, session_joined_at, total_survival_seconds,
+                           last_seen_at, last_action_changed_at
+                    FROM streaming_survival_users
+                    WHERE is_active=1
+                    """
+                ).fetchall()
+                removed: List[str] = []
+                now = time.time()
+                for row in rows:
+                    last_seen = float(row["last_seen_at"] or 0)
+                    last_act = float(row["last_action_changed_at"] or 0)
+                    session = float(row["session_joined_at"] or 0)
+                    last_activity = max(last_seen, last_act, session)
+                    if last_activity <= 0 or last_activity >= cutoff:
+                        continue
+                    u = str(row["username"] or "").strip()
+                    if not u:
+                        continue
+                    session_start = session if session > 0 else last_activity
+                    lived = max(0.0, now - session_start)
+                    total = float(row["total_survival_seconds"] or 0) + lived
+                    conn.execute(
+                        """
+                        UPDATE streaming_survival_users
+                        SET is_active=0, last_action='idle',
+                            last_action_name='Ждёт у базы',
+                            total_survival_seconds=?, session_joined_at=0
+                        WHERE username=? AND is_active=1
+                        """,
+                        (total, u),
+                    )
+                    removed.append(u)
+                if removed:
+                    conn.commit()
+                return removed
             finally:
                 conn.close()
 
@@ -247,7 +318,8 @@ class StreamingSurvivalStore:
             try:
                 rows = conn.execute(
                     f"""
-                    SELECT username, last_action AS action, last_action_name AS action_name
+                    SELECT username, last_action AS action, last_action_name AS action_name,
+                           COALESCE(skin, 'human') AS skin
                     FROM streaming_survival_users
                     WHERE {self._CHAT_ROSTER_WHERE}
                     ORDER BY joined_at ASC
@@ -284,9 +356,10 @@ class StreamingSurvivalStore:
         sql = f"""
             SELECT username, twitch_user_id, joined_at, last_seen_at,
                    session_joined_at, last_action AS action, last_action_name AS action_name,
-                   is_active, join_source,
+                   last_action_changed_at, is_active, join_source,
                    total_water_collected, total_wood_collected, total_food_collected,
-                   total_sheep_killed, total_campfires_built, total_rounds_participated,
+                   total_sheep_killed, total_zombies_killed, total_campfires_built,
+                   total_rounds_participated,
                    total_survival_seconds
             FROM streaming_survival_users
             WHERE {' AND '.join(where)}
@@ -354,6 +427,7 @@ class StreamingSurvivalStore:
             "total_wood_collected",
             "total_food_collected",
             "total_sheep_killed",
+            "total_zombies_killed",
             "total_campfires_built",
             "total_rounds_participated",
         }
@@ -405,6 +479,35 @@ class StreamingSurvivalStore:
             return f"{h} ч {m} мин"
         return f"{h} ч"
 
+    def get_skin(self, username: str) -> str:
+        row = self.get_user(username)
+        if not row:
+            return "human"
+        skin = (row.get("skin") or "human").strip().lower()
+        return skin if skin in ("human", "wolf") else "human"
+
+    def set_skin(self, username: str, skin: str) -> None:
+        u = username.lower().strip()
+        skin = (skin or "human").strip().lower()
+        if skin not in ("human", "wolf"):
+            skin = "human"
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute(
+                    "UPDATE streaming_survival_users SET skin=?, last_seen_at=? WHERE username=?",
+                    (skin, time.time(), u),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+    def sheep_killed(self, username: str) -> int:
+        row = self.get_user(username)
+        if not row:
+            return 0
+        return int(row.get("total_sheep_killed") or 0)
+
     def format_stats_reply(self, username: str) -> str:
         row = self.get_user(username)
         if not row:
@@ -413,11 +516,12 @@ class StreamingSurvivalStore:
         alive = self.format_duration(self.survival_seconds(row))
         water = int(row.get("total_water_collected") or 0)
         wood = int(row.get("total_wood_collected") or 0)
-        food = int(row.get("total_food_collected") or 0)
+        # Еда = мясо с овцы: в чате одна метрика «овцы» (Unity пишет только sheep).
         sheep = int(row.get("total_sheep_killed") or 0)
+        zombies = int(row.get("total_zombies_killed") or 0)
         fires = int(row.get("total_campfires_built") or 0)
         in_game = " (в игре)" if int(row.get("is_active") or 0) == 1 else ""
         return (
-            f"@{name}{in_game}: в игре {alive} · вода {water} · дерево {wood} · еда {food} · "
-            f"овцы {sheep} · костры {fires}"
+            f"@{name}{in_game}: в игре {alive} · вода {water} · дерево {wood} · "
+            f"овцы {sheep} · зомби {zombies} · костры {fires}"
         )

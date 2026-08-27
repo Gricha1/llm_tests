@@ -42,6 +42,7 @@ public static class StreamingSurvivalResourceGuard
             case "collect_food":
             case "kill_sheep":
             case "go_to_sheep": return Mathf.Max(FoodInteractionRadius, SheepInteractionRadius);
+            case "kill_zombie": return 3.5f;
             case "go_home":
             case "go_to_base":
             case "go_to_campfire":
@@ -59,6 +60,7 @@ public static class StreamingSurvivalResourceGuard
             case "collect_wood":
             case "collect_food":
             case "kill_sheep":
+            case "kill_zombie":
             case "collect_stone":
                 return true;
             default:
@@ -78,6 +80,7 @@ public static class StreamingSurvivalResourceGuard
             case "collect_food":
             case "kill_sheep":
             case "go_to_sheep": return "sheep";
+            case "kill_zombie": return "zombie";
             case "go_home":
             case "go_to_base": return "home_interaction_point";
             case "go_to_campfire":
@@ -146,6 +149,36 @@ public static class StreamingSurvivalResourceGuard
         {
             r.Ok = false;
             r.Reason = "missing_target_id";
+            return r;
+        }
+
+        // Зомби не в WorldRegistry — только objectAnchor живого ZombieChase.
+        if (action == "kill_zombie")
+        {
+            if (!objectAnchor.HasValue)
+            {
+                r.Ok = false;
+                r.Reason = "no_zombie_anchor";
+                return r;
+            }
+            Vector3 zp = objectAnchor.Value;
+            float zx = characterPos.x - zp.x;
+            float zz = characterPos.z - zp.z;
+            r.Distance = Mathf.Sqrt(zx * zx + zz * zz);
+            if (r.Distance > r.Radius + 0.35f)
+            {
+                r.Ok = false;
+                r.Reason = $"too_far_from_zombie distance={r.Distance:F1}";
+                return r;
+            }
+            if (!reachedResource || !workStartedNearTarget)
+            {
+                r.Ok = false;
+                r.Reason = "not_reached_zombie";
+                return r;
+            }
+            r.Ok = true;
+            r.Reason = "ok";
             return r;
         }
 

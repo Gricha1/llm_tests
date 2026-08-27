@@ -1,4 +1,6 @@
+using System.Collections;
 using System.Collections.Generic;
+using System.IO;
 using UnityEngine;
 using Unity.MLAgents;
 using Unity.MLAgents.Policies;
@@ -167,10 +169,149 @@ public sealed class StreamingSurvivalController : MonoBehaviour
         TryPrepareWorld(force: true);
         if (!_followersOnlyMode)
             SetupCamAOnly();
+        else
+            StartCoroutine(BootstrapRosterWhenEmpty());
+        StartCoroutine(StripOptionIconsFromAllFollowersSoon());
+    }
+
+    IEnumerator StripOptionIconsFromAllFollowersSoon()
+    {
+        // Несколько попыток: join-клоны появляются после UDP sync.
+        for (int i = 0; i < 12; i++)
+        {
+            yield return new WaitForSecondsRealtime(2f);
+            StripOptionIconsFromAllFollowers();
+        }
+    }
+
+    void StripOptionIconsFromAllFollowers()
+    {
+        foreach (var kv in _players)
+        {
+            var p = kv.Value;
+            if (p == null) continue;
+            StripTrainingOptionIcons(p.gameObject);
+        }
+    }
+
+    IEnumerator BootstrapRosterWhenEmpty()
+    {
+        // После рестарта Unity UDP sync может опоздать — подтягиваем roster с диска.
+        for (int attempt = 0; attempt < 18; attempt++)
+        {
+            if (_players.Count > 0)
+                yield break;
+            if (attempt == 0 || attempt % 3 == 0)
+                TryBootstrapRosterFromDisk();
+            yield return new WaitForSecondsRealtime(5f);
+        }
+        if (_players.Count == 0)
+            Debug.LogWarning("[StreamingSurvival] roster bootstrap: still 0 followers — need bot resync");
+    }
+
+    void TryBootstrapRosterFromDisk()
+    {
+        try
+        {
+            string projectRoot = Directory.GetParent(Application.dataPath)?.FullName;
+            if (string.IsNullOrEmpty(projectRoot))
+                return;
+            string path = Path.Combine(projectRoot, "results", "stream_roster.json");
+            if (!File.Exists(path))
+                return;
+            string json = File.ReadAllText(path);
+            var users = ParseUsersFromRosterJson(json);
+            if (users == null || users.Count == 0)
+                return;
+            Debug.Log($"[StreamingSurvival] roster bootstrap from disk: {users.Count} user(s)");
+            SyncUsers(users);
+        }
+        catch (System.Exception e)
+        {
+            Debug.LogWarning($"[StreamingSurvival] roster bootstrap failed: {e.Message}");
+        }
+    }
+
+    static List<StreamingSurvivalUserDto> ParseUsersFromRosterJson(string json)
+    {
+        var list = new List<StreamingSurvivalUserDto>();
+        if (string.IsNullOrEmpty(json))
+            return list;
+
+        int search = 0;
+        while (true)
+        {
+            int uIdx = json.IndexOf("\"username\"", search, System.StringComparison.Ordinal);
+            if (uIdx < 0)
+                break;
+            int objStart = json.LastIndexOf('{', uIdx);
+            int objEnd = FindJsonObjectEnd(json, objStart);
+            if (objStart < 0 || objEnd < 0)
+            {
+                search = uIdx + 10;
+                continue;
+            }
+            string chunk = json.Substring(objStart, objEnd - objStart + 1);
+            string username = ExtractJsonString(chunk, "username");
+            if (!string.IsNullOrEmpty(username))
+            {
+                list.Add(new StreamingSurvivalUserDto
+                {
+                    username = username,
+                    action = ExtractJsonString(chunk, "action"),
+                    action_name = ExtractJsonString(chunk, "action_name"),
+                    skin = ExtractJsonString(chunk, "skin"),
+                });
+            }
+            search = objEnd + 1;
+        }
+        return list;
+    }
+
+    static int FindJsonObjectEnd(string s, int openIdx)
+    {
+        if (openIdx < 0 || openIdx >= s.Length || s[openIdx] != '{')
+            return -1;
+        int depth = 0;
+        for (int i = openIdx; i < s.Length; i++)
+        {
+            if (s[i] == '{') depth++;
+            else if (s[i] == '}')
+            {
+                depth--;
+                if (depth == 0)
+                    return i;
+            }
+        }
+        return -1;
+    }
+
+    static string ExtractJsonString(string json, string key)
+    {
+        if (string.IsNullOrEmpty(json) || string.IsNullOrEmpty(key))
+            return "";
+        string needle = "\"" + key + "\":\"";
+        int idx = json.IndexOf(needle, System.StringComparison.Ordinal);
+        if (idx < 0)
+            return "";
+        idx += needle.Length;
+        int end = json.IndexOf('"', idx);
+        if (end < 0)
+            return "";
+        return json.Substring(idx, end - idx);
     }
 
     void Update()
     {
+        // OBS stream: если DeathFreeze / кто-то оставил timeScale=0 — поднимаем сразу.
+        if (TrainingEnvSpace.IsLivePresentationForObs || TrainingEnvSpace.IsStreamOnlyMode)
+        {
+            if (Time.timeScale < 0.01f)
+                Time.timeScale = 1f;
+            if (DeathFreeze.IsFrozen)
+                DeathFreeze.EnsureEnvSimulationRunning();
+        }
+
         if (!_worldReady || (!_followersOnlyMode && Time.unscaledTime < _cleanupUntil))
             TryPrepareWorld(force: false);
 
@@ -179,8 +320,9 @@ public sealed class StreamingSurvivalController : MonoBehaviour
         foreach (var kv in _players)
         {
             var p = kv.Value;
-            if (p != null)
-                p.TickGameplay();
+            if (p == null) continue;
+            p.TickWolfDiagnosticsAndLabel();
+            p.TickGameplay();
         }
 
         if (_followersOnlyMode)
@@ -652,28 +794,50 @@ public sealed class StreamingSurvivalController : MonoBehaviour
 
     void TeleportAllToFollowerSpawn()
     {
+        RespawnAllFollowersAtSpawn("round_start");
+    }
+
+    /// <summary>Конец раунда SS: все фолловеры на спавн, HP и последнее #do.</summary>
+    public void RespawnAllFollowersAtSpawn(string reason = "round_start")
+    {
         ResolveFollowerSpawn(force: true);
         int i = 0;
         foreach (var kv in _players)
         {
             var p = kv.Value;
             if (p == null) continue;
-            // Do NOT yank agents mid #do (water/wood/home). That created 15–20m
-            // "max jump" teleports every stageSeconds and failed continuity checks.
-            string act = (p.Action ?? "").ToLowerInvariant();
-            if (!string.IsNullOrEmpty(act)
-                && act != "idle"
-                && act != "idle_stand"
-                && act != "idle_wander")
-            {
-                Debug.Log(
-                    $"[StreamingSurvival] round_start skip teleport user={p.Username} action={act}");
-                i++;
-                continue;
-            }
             Vector3 pos = NextFollowerSpawnPos(i++);
-            p.TeleportTo(pos, "round_start");
+            p.PrepareForRoundRestart();
+            p.TeleportTo(pos, reason);
+            p.RestoreLastDoAfterRoundSpawn();
+            Debug.Log(
+                $"[StreamingSurvival] {reason} teleport user={p.Username} action={p.Action} " +
+                $"to=({pos.x:F1},{pos.z:F1})");
         }
+    }
+
+    /// <summary>Конец ML-эпизода: только убитые зомби — на спавн; живые не трогаем.</summary>
+    public void RespawnDeadFollowersAtEpisodeEnd()
+    {
+        ResolveFollowerSpawn(force: false);
+        int i = 0;
+        int n = 0;
+        foreach (var kv in _players)
+        {
+            var p = kv.Value;
+            if (p == null || !p.IsDeadToZombies)
+                continue;
+            Vector3 pos = NextFollowerSpawnPos(i++);
+            p.PrepareForRoundRestart();
+            p.TeleportTo(pos, "episode_reset");
+            p.RestoreLastDoAfterRoundSpawn();
+            n++;
+            Debug.Log(
+                $"[StreamingSurvival] episode_reset dead user={p.Username} action={p.Action} " +
+                $"to=({pos.x:F1},{pos.z:F1})");
+        }
+        if (n > 0)
+            Debug.Log($"[StreamingSurvival] episode_reset revived {n} dead follower(s)");
     }
 
     public void ClearAllPlayers()
@@ -696,11 +860,6 @@ public sealed class StreamingSurvivalController : MonoBehaviour
         ShowBanner(banner, 3f);
         ExtinguishWorldFires();
         TeleportAllToFollowerSpawn();
-        foreach (var kv in _players)
-        {
-            if (kv.Value != null)
-                kv.Value.ResumeLastAction();
-        }
         RefreshTable();
     }
 
@@ -777,6 +936,7 @@ public sealed class StreamingSurvivalController : MonoBehaviour
         int slot = _players.Count;
         bool firstPlayer = _players.Count == 0;
         Vector3 spawn = NextFollowerSpawnPos(slot);
+        spawn = StreamingSurvivalCampBounds.ClampToSheepMeadow(spawn);
         go.transform.position = spawn;
 
         // Parent under an active hierarchy. Inactive PresentationRoot kills Update().
@@ -787,6 +947,10 @@ public sealed class StreamingSurvivalController : MonoBehaviour
             go.transform.SetParent(transform, true);
         if (!go.activeSelf)
             go.SetActive(true);
+
+        // После инстанса из inactive Jack-template меши иногда остаются выключенными.
+        ForceEnableBodyRenderers(go);
+        StripTrainingOptionIcons(go);
 
         var cc = go.GetComponent<CharacterController>();
         if (cc == null)
@@ -868,9 +1032,52 @@ public sealed class StreamingSurvivalController : MonoBehaviour
         return capsule;
     }
 
+    static void ForceEnableBodyRenderers(GameObject go)
+    {
+        if (go == null) return;
+        var renderers = go.GetComponentsInChildren<Renderer>(true);
+        for (int i = 0; i < renderers.Length; i++)
+        {
+            var r = renderers[i];
+            if (r == null) continue;
+            // Option-иконки обучения (дрова/вода/…) — только у ML-агентов, не у фолловеров.
+            if (IsTrainingOptionIconObject(r.gameObject))
+            {
+                r.enabled = false;
+                continue;
+            }
+            // TextMesh / label — отдельный объект, его не трогаем если уже ок.
+            r.enabled = true;
+        }
+    }
+
+    static bool IsTrainingOptionIconObject(GameObject go)
+    {
+        if (go == null) return false;
+        string n = go.name ?? "";
+        return n.IndexOf("OptionIcon", System.StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
+    /// <summary>Стереть Jack/Lily/George option-стикеры с join-клона (иначе видны под упавшим телом).</summary>
+    static void StripTrainingOptionIcons(GameObject go)
+    {
+        if (go == null) return;
+        var all = go.GetComponentsInChildren<Transform>(true);
+        // С конца: DestroyImmediate во время обхода детей.
+        for (int i = all.Length - 1; i >= 0; i--)
+        {
+            var t = all[i];
+            if (t == null || t == go.transform) continue;
+            if (!IsTrainingOptionIconObject(t.gameObject)) continue;
+            Object.DestroyImmediate(t.gameObject);
+        }
+    }
+
     static void StripTrainingComponents(GameObject go)
     {
         if (go == null) return;
+
+        StripTrainingOptionIcons(go);
 
         // Join clone: модель Jack + Animator, но без ML-Agents (obs 15 vs 21 → crash стрима).
         foreach (var d in go.GetComponentsInChildren<DecisionRequester>(true))
@@ -1033,6 +1240,22 @@ public sealed class StreamingSurvivalController : MonoBehaviour
         return null;
     }
 
+    public void ForEachPlayer(System.Action<StreamingSurvivalPlayer> fn)
+    {
+        if (fn == null) return;
+        foreach (var kv in _players)
+        {
+            if (kv.Value != null)
+                fn(kv.Value);
+        }
+    }
+
+    public void ResetAllWolfEpisodeDiagnostics()
+    {
+        foreach (var kv in _players)
+            kv.Value?.ResetEpisodeWolfDiagnostics();
+    }
+
     public void ApplyAction(string username, string action, string actionName, int amount = 1, string actionQueue = null)
     {
         var p = EnsurePlayer(username);
@@ -1042,37 +1265,37 @@ public sealed class StreamingSurvivalController : MonoBehaviour
 
     public void SyncUsers(List<StreamingSurvivalUserDto> users)
     {
-        // Состав + для НОВЫХ тел после рестарта Unity восстановить action из roster.
-        // Уже живым игрокам action не трогаем (иначе сбросится очередь добычи).
-        var keep = new HashSet<string>();
-        if (users != null)
+        // Пустой sync после рестарта Unity не должен вычищать всех с сцены.
+        if (users == null || users.Count == 0)
         {
-            for (int i = 0; i < users.Count; i++)
-            {
-                var u = users[i];
-                if (u == null || string.IsNullOrEmpty(u.username))
-                    continue;
-                string key = u.username.Trim().ToLowerInvariant();
-                keep.Add(key);
-                bool existed = _players.ContainsKey(key) && _players[key] != null;
-                EnsurePlayer(u.username);
-                if (!existed)
-                {
-                    string act = string.IsNullOrEmpty(u.action) ? "idle" : u.action;
-                    string actName = string.IsNullOrEmpty(u.action_name) ? "Ждёт у базы" : u.action_name;
-                    ApplyAction(u.username, act, actName, 1, null);
-                }
-            }
+            Debug.LogWarning("[StreamingSurvival] SyncUsers: empty — keep scene as-is");
+            return;
         }
 
-        var toRemove = new List<string>();
-        foreach (var kv in _players)
+        // Только добавление/обновление. Удаление — только через user_left (RemovePlayer).
+        for (int i = 0; i < users.Count; i++)
         {
-            if (!keep.Contains(kv.Key))
-                toRemove.Add(kv.Key);
+            var u = users[i];
+            if (u == null || string.IsNullOrEmpty(u.username))
+                continue;
+            string key = u.username.Trim().ToLowerInvariant();
+            bool existed = _players.ContainsKey(key) && _players[key] != null;
+            var p = EnsurePlayer(u.username);
+            if (p != null && !string.IsNullOrEmpty(u.skin))
+            {
+                string skin = u.skin.Trim().ToLowerInvariant();
+                if (skin == "wolf")
+                    p.ApplyWolfSkin();
+                else if (skin == "human" || skin == "jack" || skin == "default")
+                    p.ApplyHumanSkin();
+            }
+            if (!existed)
+            {
+                string act = string.IsNullOrEmpty(u.action) ? "idle" : u.action;
+                string actName = string.IsNullOrEmpty(u.action_name) ? "Ждёт у базы" : u.action_name;
+                ApplyAction(u.username, act, actName, 1, null);
+            }
         }
-        for (int i = 0; i < toRemove.Count; i++)
-            RemovePlayer(toRemove[i]);
 
         RefreshTable();
     }
@@ -1086,6 +1309,20 @@ public sealed class StreamingSurvivalController : MonoBehaviour
             list.Add((kv.Value.Username, kv.Value.ActionName));
         }
         return list;
+    }
+
+    /// <summary>Овца уже занята другим SS-игроком на еду/охоту — не гоняться вдвоём.</summary>
+    public bool IsSheepClaimedByOther(Transform sheep, StreamingSurvivalPlayer self)
+    {
+        if (sheep == null) return false;
+        foreach (var kv in _players)
+        {
+            var p = kv.Value;
+            if (p == null || p == self) continue;
+            if (p.ClaimedSheep == sheep)
+                return true;
+        }
+        return false;
     }
 
     void RefreshTable()
@@ -1154,4 +1391,5 @@ public sealed class StreamingSurvivalUserDto
     public string username;
     public string action;
     public string action_name;
+    public string skin;
 }

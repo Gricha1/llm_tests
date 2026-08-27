@@ -123,7 +123,7 @@ def main() -> int:
     ap.add_argument("--once", action="store_true", help="one check then exit")
     ap.add_argument("--interval", type=float, default=20.0, help="seconds between checks")
     ap.add_argument("--bad-streak", type=int, default=3, help="consecutive bad SNAPs before repair")
-    ap.add_argument("--min-ratio", type=float, default=0.25, help="alive/target below this → broken")
+    ap.add_argument("--min-ratio", type=float, default=0.55, help="alive/target below this → broken")
     ap.add_argument("--repair-cooldown", type=float, default=60.0)
     ap.add_argument("--escalate-after", type=int, default=2, help="failed repairs → stream restart")
     ap.add_argument("--no-restart", action="store_true", help="never touch .stream_restart_request")

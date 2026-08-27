@@ -150,6 +150,9 @@ public class StreamCommandReceiver : MonoBehaviour
                 case "streaming_survival_users_sync":
                     ApplySsSync(json);
                     break;
+                case "streaming_survival_skin":
+                    ApplySsSkin(json);
+                    break;
                 case "streaming_survival_test":
                     ApplySsTest(json);
                     break;
@@ -217,7 +220,7 @@ public class StreamCommandReceiver : MonoBehaviour
             string queue = ExtractString(json, "action_queue");
             int amount = ExtractInt(json, "amount", 1);
             if (amount < 1) amount = 1;
-            c.ApplyAction(user, action, name, amount, queue);
+            c.ApplyAction(user, action, name, amount, string.IsNullOrEmpty(queue) ? null : queue);
             NoteEvent($"{user}: {name}", "info");
             return;
         }
@@ -225,6 +228,40 @@ public class StreamCommandReceiver : MonoBehaviour
             ExtractString(json, "username"),
             ExtractString(json, "action"),
             ExtractString(json, "action_name"));
+    }
+
+    void ApplySsSkin(string json)
+    {
+        if (!TryGetFollowerController(out var c))
+        {
+            NoteEvent("SS skin ignored (no controller)", "warn");
+            return;
+        }
+        string user = ExtractString(json, "username");
+        string skin = (ExtractString(json, "skin") ?? "").Trim().ToLowerInvariant();
+        var p = c.EnsurePlayer(user);
+        if (p == null)
+        {
+            NoteEvent($"skin fail: no player {user}", "warn");
+            return;
+        }
+        if (skin == "wolf")
+        {
+            if (p.ApplyWolfSkin())
+                NoteEvent($"{user} → волк", "info");
+            else
+                NoteEvent($"{user}: wolf skin missing", "warn");
+            return;
+        }
+        if (skin == "human" || skin == "jack" || skin == "default")
+        {
+            if (p.ApplyHumanSkin())
+                NoteEvent($"{user} → человек", "info");
+            else
+                NoteEvent($"{user}: human skin fail", "warn");
+            return;
+        }
+        NoteEvent($"unknown skin={skin}", "warn");
     }
 
     static bool TryGetFollowerController(out StreamingSurvivalController ctrl)
@@ -506,10 +543,26 @@ public class StreamCommandReceiver : MonoBehaviour
                 username = ExtractString(chunk, "username"),
                 action = ExtractString(chunk, "action"),
                 action_name = ExtractString(chunk, "action_name"),
+                skin = ExtractString(chunk, "skin"),
             });
             search = objEnd + 1;
         }
         c.SyncUsers(list);
+        // roster/resync после рестарта стрима: поднять убитых зомби (иначе «зрители пропали»).
+        if (json.IndexOf("\"revive_dead\":true", System.StringComparison.OrdinalIgnoreCase) >= 0
+            || json.IndexOf("\"revive_dead\": true", System.StringComparison.OrdinalIgnoreCase) >= 0)
+        {
+            // Сразу после рестарта зомби иначе снова выкашивают всех за секунды.
+            var spawners = UnityEngine.Object.FindObjectsByType<ZombieSpawner>(
+                FindObjectsInactive.Include, FindObjectsSortMode.None);
+            for (int i = 0; i < spawners.Length; i++)
+            {
+                if (spawners[i] != null)
+                    spawners[i].ClearZombies(scanOrphanRoots: false);
+            }
+            c.RespawnDeadFollowersAtEpisodeEnd();
+            NoteEvent($"users_sync revive_dead n={list.Count}", "ok");
+        }
     }
 
     static int FindBraceEnd(string s, int openIdx)

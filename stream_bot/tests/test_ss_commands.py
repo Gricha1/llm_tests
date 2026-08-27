@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+import time
 import unittest
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -29,8 +30,13 @@ from stream_bot.validator import (
 
 
 class ParseTests(unittest.TestCase):
-    def test_join(self):
-        self.assertEqual(parse_message("#join").kind, ParsedKind.JOIN)
+    def test_i_wolf_parse(self):
+        self.assertEqual(
+            parse_message("#i_wolf", has_joined=True).kind, ParsedKind.I_WOLF
+        )
+        self.assertEqual(
+            parse_message("#i_wolf", has_joined=False).kind, ParsedKind.NEED_JOIN
+        )
 
     def test_exit_aliases(self):
         for cmd in ("#exit", "#leave", "#quit", "#delete"):
@@ -46,6 +52,15 @@ class ParseTests(unittest.TestCase):
 
     def test_stats(self):
         self.assertEqual(parse_message("#stats").kind, ParsedKind.STATS)
+
+    def test_skins_and_human(self):
+        self.assertEqual(parse_message("#skins").kind, ParsedKind.SKINS)
+        self.assertEqual(
+            parse_message("#i_human", has_joined=True).kind, ParsedKind.I_HUMAN
+        )
+        self.assertEqual(
+            parse_message("#i_human", has_joined=False).kind, ParsedKind.NEED_JOIN
+        )
 
     def test_available_actions_list(self):
         text = available_actions_text()
@@ -93,14 +108,50 @@ class StoreSessionTests(unittest.TestCase):
         self.ss.record_stat("stats_user", "water", 3)
         self.ss.record_stat("stats_user", "sheep", 2)
         self.ss.record_stat("stats_user", "campfire", 1)
+        self.ss.record_stat("stats_user", "food", 9)  # не должно попасть в текст
         reply = self.ss.format_stats_reply("stats_user")
         self.assertIn("вода 3", reply)
         self.assertIn("овцы 2", reply)
+        self.assertNotIn("/30000", reply)
+        self.assertNotIn("волк", reply.lower())
         self.assertIn("костры 1", reply)
+        self.assertNotIn("еда", reply)
         self.assertIn("в игре", reply.lower())
         self.assertTrue(self.ss.leave("stats_user"))
         row = self.ss.get_user("stats_user")
         self.assertGreater(float(row.get("total_survival_seconds") or 0), 0)
+        # #exit не удаляет строку из БД
+        self.assertIsNotNone(row)
+        self.assertFalse(bool(int(row.get("is_active") or 0)))
+
+    def test_deactivate_inactive_48h_keeps_db_row(self):
+        self.ss.join("stale_user")
+        self.ss.record_stat("stale_user", "water", 5)
+        # Сдвигаем активность на 49 часов назад.
+        old = time.time() - (49 * 3600)
+        with self.ss._lock:
+            conn = self.ss._connect()
+            try:
+                conn.execute(
+                    """
+                    UPDATE streaming_survival_users
+                    SET last_seen_at=?, last_action_changed_at=?, session_joined_at=?
+                    WHERE username=?
+                    """,
+                    (old, old, old, "stale_user"),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        removed = self.ss.deactivate_inactive(48 * 3600)
+        self.assertIn("stale_user", removed)
+        self.assertFalse(self.ss.has_joined("stale_user"))
+        row = self.ss.get_user("stale_user")
+        self.assertIsNotNone(row)
+        self.assertEqual(int(row.get("total_water_collected") or 0), 5)
+        # Свежий #join снова выводит в игру
+        self.assertTrue(self.ss.join("stale_user"))
+        self.assertTrue(self.ss.has_joined("stale_user"))
 
 
 class HeuristicDoTests(unittest.TestCase):

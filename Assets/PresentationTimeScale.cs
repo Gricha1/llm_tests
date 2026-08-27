@@ -45,13 +45,16 @@ public sealed class PresentationTimeScale : MonoBehaviour
 
     void LateUpdate()
     {
-        if (!TrainingEnvSpace.IsPresentationWorkerProcess)
+        // Stream OBS (-forestStreamOnly) тоже нужен живой clock — не только SingleEnv worker0.
+        if (!TrainingEnvSpace.IsPresentationWorkerProcess
+            && !TrainingEnvSpace.IsLivePresentationForObs
+            && !TrainingEnvSpace.IsStreamOnlyMode)
             return;
 
         EnsureParsed();
-        if (DeathFreeze.IsFrozen)
-            return;
-
-        Time.timeScale = _targetScale;
+        float scale = _targetScale > 0.01f ? _targetScale : 1f;
+        // Даже при DeathFreeze на стриме не оставляем timeScale=0.
+        if (Time.timeScale < 0.01f || !DeathFreeze.IsFrozen)
+            Time.timeScale = scale;
     }
 }
