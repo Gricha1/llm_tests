@@ -474,6 +474,176 @@ Feature themes in that tree (Partially tested / needs Play Mode + lab marker ver
 | Mixing train kills with stream fixes | **Convention** — avoid |
 | HARD / live Twitch without explicit ask | **Forbidden** for casual debug |
 | Pure `-forestStreamingSurvival` vs prod StreamOnly | Easy to confuse — prod = StreamOnly + heroes |
+| Growth bottlenecks (acquisition / early retention / watch depth) | See **Growth / Current Product Bottlenecks — Sep 2026** below |
+
+---
+
+## Growth / Current Product Bottlenecks — Sep 2026
+
+Snapshot basis (read-only):
+- Viewer funnel: `artifacts/analytics/viewer_character_funnel_20260912_121056.csv` (+ events / summary same stamp)
+- Twitch weekly Insights: **manual numbers below** (no Twitch weekly CSV found in repo as of 2026-09-12)
+- Do **not** quote raw SS `UNIQUE VIEWERS=91` as product metric without CLEAN filter
+
+### Clean viewer metrics rule
+
+| Set | Count | Rule |
+|-----|------:|------|
+| **RAW** SS creators | **91** | all `streaming_survival_users` rows |
+| **Excluded** | **34** | test/automation + owner |
+| **CLEAN real viewers** | **57** | product funnel |
+
+**Exclusion (documented):**
+- prefixes / patterns: `debug*`, `test*`, `stress_user_*` / `stress_*`, `e2e*`, `pond_*`, `ui_*`, `coord_*`, `ck_*`, `ep_*`, `u_*` (numeric), plus obvious lab ids in this export (`ck_back`…, `pond_fix*`, `stress_user_0*`, …)
+- **owner/internal:** `mysticggx` excluded from customer funnel (only CLEAN builder unlock was owner)
+- Ambiguous usernames: **none excluded silently** in this pass (0 ambiguous kept flags)
+
+Recompute CLEAN from the funnel CSV before citing newer numbers.
+
+### Current priority
+
+| Priority | Area | Role |
+|----------|------|------|
+| **P1** | Acquisition | Primary growth bottleneck |
+| **P2** | Early retention | Primary growth bottleneck |
+| **P3** | Engagement / watch depth | Confirmed symptom; **root cause unknown** |
+
+P1 + P2 drive growth. P3 is measured decline, not yet a proven gameplay verdict.
+
+---
+
+### 1. Acquisition: insufficient new-user flow
+
+**Problem**  
+ForestSurvival still depends almost entirely on organic Twitch discovery. Independent external acquisition is nearly absent. Recent weeks show weaker Twitch-native inflow and fewer new CLEAN character creators.
+
+**Evidence — Twitch weekly (channel Insights)**
+
+| Week start | Unique viewers | Watch minutes | Chatters | Chat messages | +Followers |
+|------------|---------------:|--------------:|---------:|--------------:|-----------:|
+| Aug 23 | 202 | 8061 | 24 | 714 | +9 |
+| Aug 30 | 158 | 4006 | 16 | 445 | +2 |
+| Sep 06 | 152 | 1362 | 14 | 149 | +0 |
+
+**Evidence — CLEAN new character creators / ISO week** (`first_seen` cohort)
+
+| Cohort week | New CLEAN creators |
+|-------------|-------------------:|
+| 2026-W32 | 18 |
+| 2026-W34 | 20 |
+| 2026-W35 | 11 |
+| 2026-W36 | 6 |
+| 2026-W37 | 2 |
+
+Trend after W34: declining new CLEAN character creations (small absolute counts — treat carefully).
+
+**Current interpretation**  
+Native Twitch acquisition is **limited / recently declining**. That is **not** proof that “the Twitch algorithm stopped recommending” the channel. Separately: there is almost no scalable **external** acquisition channel yet.
+
+**Main controllable growth lever:** external short-form video (YouTube Shorts / TikTok) → measure new CLEAN character creators / week.  
+Twitch-native levers (title / category / tags / schedule) are cheap to tune but **not** the primary scale path.
+
+**Unknowns**  
+Share of uniques from browse/recommendations vs returning vs host raids; how many Twitch uniques ever `#join`.
+
+**Metrics to watch**  
+Twitch weekly uniques / +followers; CLEAN new creators / week; `#join` rate among chatters.
+
+**Next experiment**  
+Ship a Shorts/TikTok clip pipeline; tag UTM/period and compare CLEAN creators/week. Light Twitch packaging pass without treating it as the scale channel.
+
+---
+
+### 2. Early retention: most character creators do not return
+
+**Problem**
+
+```
+viewer enters → creates Human → WHY SHOULD THEY RETURN?
+→ only a minority returns
+→ those who return often start progressing further
+```
+
+**Evidence — CLEAN real creators (n=57)**
+
+| Metric | Value |
+|--------|------:|
+| Returned after 1d | **8 / 57 = 14.0%** |
+| One-day (no 1d return) | **49 / 57 = 86.0%** |
+| Returned after 3d | **8 / 57 = 14.0%** |
+| Returned after 7d | **7 / 57 = 12.3%** |
+| Reached wolf | **6 / 57 = 10.5%** |
+| Reached soldier | **3 / 57 = 5.3%** |
+| Reached builder | **0 / 57 = 0%** (owner-only in RAW) |
+
+Among CLEAN `returned_after_1d=1` (n=8): wolf 6, soldier 3.  
+Among CLEAN non-returners (n=49): wolf 0, soldier 0.  
+→ progression after Human is concentrated in the small returner set (association, not proven causality).
+
+Retention method: `events` (`ss_join|ss_action|ss_stats|ss_skin`) vs `first_seen_at` (same export as funnel summary).
+
+**Current interpretation**  
+First→second visit is the product bottleneck after acquisition. Manual “~20% / ~80%” estimate is **close but superseded** by this CLEAN recompute (**14% / 86%**).
+
+**48h inactivity soft-hide vs schedule (hypothesis)**  
+Actual rule: `INACTIVE_HIDE_SECONDS = 48h` (soft `is_active=0`, row kept). Regular hosted streams: **Tue 17:00** and **Fri 17:00** (~72h apart). A character can leave the active world **before** the next hosted stream.  
+Status: **HYPOTHESIS / retention risk**, not a proven cause of the 14% 1d return.
+
+**Unknowns**  
+How many non-returners never saw a clear next unlock; hosted vs 24/7 first session mix; effect of 48h hide on Tue↔Fri returners.
+
+**Metrics to watch**  
+CLEAN `returned_after_1d/3d/7d`; wolf/soldier conversion among returners; time from first `#join` to second activity day.
+
+**Next experiment**  
+Make first-session “why return / next unlock” explicit; A/B or staged test of hide window vs Tue/Fri loop (e.g. ≥72h) without claiming fix until measured.
+
+---
+
+### 3. Engagement / watch depth is declining
+
+**Problem**  
+Weekly unique volume between Aug 30 and Sep 06 is similar, but **minutes watched per unique** and chat volume fell sharply.
+
+**Evidence**
+
+| Week | Min / unique | Chatters | Chat msgs |
+|------|-------------:|---------:|----------:|
+| Aug 23 | 8061/202 ≈ **39.9** | 24 | 714 |
+| Aug 30 | 4006/158 ≈ **25.4** | 16 | 445 |
+| Sep 06 | 1362/152 ≈ **9.0** | 14 | 149 |
+
+**Current interpretation**  
+Confirmed engagement **symptom**. Root cause = **UNKNOWN**. Do **not** state gameplay as proven cause.
+
+**Hypotheses (unproven)**  
+- less relevant incoming traffic  
+- long passive stretches in autonomous 24/7 mode  
+- unclear objective for a new viewer in the first seconds  
+- technical / performance issues  
+- mix of autonomous 24/7 vs hosted Tue/Fri sessions inside the same Twitch week
+
+**Analytics limitation**  
+Twitch weekly Insights **blend** autonomous 24/7 and hosted live-dev streams. Cannot yet attribute watch-depth drop to one mode.
+
+**Unknowns**  
+Per-mode averages; whether drop is new vs returning viewers; correlation with lab FPS/Present incidents.
+
+**Metrics to watch**  
+Min/unique weekly; chatters / msgs; ideally split autonomous vs hosted (manual or future logging).
+
+**Next experiment**  
+Clarify autonomous loop in-HUD (AI goal / apocalypse progress / next beat); start separating hosted vs 24/7 analytics before changing core gameplay for “engagement”.
+
+---
+
+### Next experiments (short)
+
+| Area | Direction |
+|------|-----------|
+| Acquisition | Shorts/TikTok pipeline; CLEAN creators/week |
+| Retention | First→second visit loop; test/reconsider 48h active-world hide vs Tue/Fri; explicit progression/next unlock |
+| Engagement | Instantly readable autonomous loop; HUD: AI goal / apocalypse / next event; split autonomous vs hosted metrics |
 
 ---
 
