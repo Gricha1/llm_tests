@@ -977,6 +977,19 @@ except Exception as _llm_imp_err:  # pragma: no cover
     _LLM_BOT_IMPORT_ERROR = str(_llm_imp_err)
     _ensure_ssh_reaper()
 
+try:
+    from shorts import ui_api as SHORTS_API
+except Exception:
+    try:
+        from train_scripts.lab_comp.shorts import ui_api as SHORTS_API  # type: ignore
+    except Exception as _shorts_imp_err:  # pragma: no cover
+        SHORTS_API = None  # type: ignore
+        _SHORTS_IMPORT_ERROR = str(_shorts_imp_err)
+    else:
+        _SHORTS_IMPORT_ERROR = ""
+else:
+    _SHORTS_IMPORT_ERROR = ""
+
 
 class SsLabPreview:
     """Live screenshot of lab_comp DISPLAY=:1 (Streaming Survival Unity window)."""
@@ -1971,6 +1984,8 @@ def stream_fps():
         pass
     return _decorate(out)
 
+
+
 ssh_remote = 0
 try:
     import subprocess as _sp
@@ -2145,6 +2160,575 @@ print(json.dumps({
 }))
 PY
 """
+
+
+def stream_performance():
+    '''Aggregate hitch/wait/LLM/weight diagnostics for Stream UI Performance panel.'''
+    root = os.path.expanduser("~/lab_work_space/forest_survival/results")
+    run = "jlg_finetune_2"
+    try:
+        cfg = load_cfg()
+        run = str(cfg.get("stream_run_id") or cfg.get("run_id") or run)
+    except Exception:
+        pass
+    run_dir = os.path.join(root, run)
+    out = {
+        "marker": None,
+        "status": "UNKNOWN",
+        "fps": {},
+        "live": {},
+        "summary": {},
+        "counters": {},
+        "llm": {},
+        "recent_hitches": [],
+        "python": {},
+    }
+    # local FPS snapshot (stream_fps() exists only inside remote activity PY)
+    try:
+        _fps_js = os.path.join(root, "stream_fps.json")
+        if os.path.isfile(_fps_js):
+            with open(_fps_js, encoding="utf-8") as _f:
+                _fd = json.load(_f)
+            if isinstance(_fd, dict):
+                out["fps"] = _fd
+    except Exception:
+        pass
+    # live json (includes perf_* from Unity)
+    for cand in (
+        os.path.join(run_dir, "stream_world_live.json"),
+        os.path.join(root, "stream_world_live.json"),
+    ):
+        if os.path.isfile(cand):
+            try:
+                with open(cand, encoding="utf-8") as f:
+                    live = json.load(f)
+                if isinstance(live, dict):
+                    out["live"] = {k: v for k, v in live.items() if str(k).startswith("perf_") or k in ("ts", "ok", "episode_index")}
+                    out["marker"] = live.get("perf_marker") or out["marker"]
+            except Exception:
+                pass
+            break
+    for cand in (
+        os.path.join(run_dir, "presentation_hitch_summary.json"),
+        os.path.join(root, "presentation_hitch_summary.json"),
+    ):
+        if os.path.isfile(cand):
+            try:
+                with open(cand, encoding="utf-8") as f:
+                    s = json.load(f)
+                if isinstance(s, dict):
+                    out["summary"] = s
+                    out["marker"] = s.get("marker") or out["marker"]
+            except Exception:
+                pass
+            break
+    for cand in (
+        os.path.join(run_dir, "AVAILABLE_PROFILER_COUNTERS.json"),
+        os.path.join(root, "AVAILABLE_PROFILER_COUNTERS.json"),
+    ):
+        if os.path.isfile(cand):
+            try:
+                with open(cand, encoding="utf-8") as f:
+                    out["counters"] = json.load(f)
+            except Exception:
+                pass
+            break
+    for cand in (
+        os.path.join(root, "llm_perf_live.json"),
+        os.path.join(run_dir, "llm_perf_live.json"),
+    ):
+        if os.path.isfile(cand):
+            try:
+                with open(cand, encoding="utf-8") as f:
+                    out["llm"] = json.load(f)
+            except Exception:
+                pass
+            break
+    # recent V6 hitches (bounded tail)
+    hj = os.path.join(run_dir, "presentation_hitches.jsonl")
+    if os.path.isfile(hj):
+        try:
+            with open(hj, "rb") as f:
+                f.seek(0, 2)
+                n = f.tell()
+                f.seek(max(0, n - 400000))
+                tail = f.read().decode("utf-8", "replace")
+            rows = []
+            for ln in tail.splitlines():
+                ln = ln.strip()
+                if not ln or ("HITCH_PROFILER_V7" not in ln and "HITCH_PROFILER_V6" not in ln and "HITCH_PROFILER_V5" not in ln):
+                    continue
+                try:
+                    d = json.loads(ln)
+                except Exception:
+                    continue
+                rows.append({
+                    "ts": d.get("ts"),
+                    "episode_id": d.get("episode_id"),
+                    "frame": d.get("frame"),
+                    "frame_ms": d.get("frame_ms"),
+                    "unaccounted_ms": d.get("unaccounted_ms"),
+                    "unity_main_thread_ms": d.get("unity_main_thread_ms"),
+                    "wait_for_target_fps_ms": d.get("wait_for_target_fps_ms"),
+                    "gfx_wait_for_present_ms": d.get("gfx_wait_for_present_ms"),
+                    "semaphore_wait_ms": d.get("semaphore_wait_ms"),
+                    "present_ms": d.get("present_ms"),
+                    "player_loop_ms": d.get("player_loop_ms"),
+                    "agent_on_action_received_ms": d.get("agent_on_action_received_ms"),
+                    "known_instrumented_ms": d.get("known_instrumented_ms"),
+                    "app_focused": d.get("app_focused"),
+                    "gc_gen2_delta": d.get("gc_gen2_delta"),
+                    "cpu_total_frame_ms": d.get("cpu_total_frame_ms"),
+                    "cpu_main_thread_frame_ms": d.get("cpu_main_thread_frame_ms"),
+                    "cpu_render_thread_frame_ms": d.get("cpu_render_thread_frame_ms"),
+                    "gpu_frame_ms": d.get("gpu_frame_ms"),
+                    "draw_calls_count": d.get("draw_calls_count"),
+                    "batches_count": d.get("batches_count"),
+                    "triangles_count": d.get("triangles_count"),
+                    "setpass_calls_count": d.get("setpass_calls_count"),
+                    "present_wait_dominant": d.get("present_wait_dominant"),
+                    "wait_root_status": d.get("wait_root_status"),
+                    "communicator_gap_ms": d.get("communicator_gap_ms"),
+                    "recorder_frame_offset": d.get("recorder_frame_offset"),
+                    "gpu_counter_supported_but_zero": d.get("gpu_counter_supported_but_zero"),
+                })
+            out["recent_hitches"] = rows[-20:]
+        except Exception:
+            pass
+    # python policy/env from last PY_EP_SUMMARY in log
+    logp = os.path.join(root, f"stream_onnx_{run}.log")
+    if os.path.isfile(logp):
+        try:
+            with open(logp, "rb") as f:
+                f.seek(0, 2)
+                f.seek(max(0, f.tell() - 120000))
+                t = f.read().decode("utf-8", "replace")
+            for ln in reversed(t.splitlines()):
+                if "PY_EP_SUMMARY" in ln:
+                    out["python"]["summary_line"] = ln.strip()
+                    break
+            for ln in reversed(t.splitlines()):
+                if "HITCH step=" in ln and "policy=" in ln:
+                    out["python"]["last_hitch_line"] = ln.strip()
+                    break
+        except Exception:
+            pass
+
+    out["gpu_os"] = {}
+    out["weights"] = {}
+    out["obs"] = {}
+    out["graphics_env"] = {}
+    for cand in (
+        os.path.join(run_dir, "gpu_os_probe_latest.json"),
+        os.path.join(root, "gpu_os_probe_latest.json"),
+    ):
+        if os.path.isfile(cand):
+            try:
+                with open(cand, encoding="utf-8") as f:
+                    out["gpu_os"] = json.load(f)
+            except Exception:
+                pass
+            break
+    for cand in (
+        os.path.join(run_dir, "python_weight_perf_live.json"),
+        os.path.join(root, "python_weight_perf_live.json"),
+    ):
+        if os.path.isfile(cand):
+            try:
+                with open(cand, encoding="utf-8") as f:
+                    out["weights"] = json.load(f)
+            except Exception:
+                pass
+            break
+    for cand in (
+        os.path.join(run_dir, "obs_perf_live.json"),
+        os.path.join(root, "obs_perf_live.json"),
+    ):
+        if os.path.isfile(cand):
+            try:
+                with open(cand, encoding="utf-8") as f:
+                    out["obs"] = json.load(f)
+            except Exception:
+                pass
+            break
+    for cand in (
+        os.path.join(run_dir, "graphics_env.json"),
+        os.path.join(root, "graphics_env.json"),
+    ):
+        if os.path.isfile(cand):
+            try:
+                with open(cand, encoding="utf-8") as f:
+                    out["graphics_env"] = json.load(f)
+            except Exception:
+                pass
+            break
+    live0 = out.get("live") or {}
+    wr = live0.get("perf_wait_root_status")
+    if not wr and out["recent_hitches"]:
+        wr = out["recent_hitches"][-1].get("wait_root_status")
+    out["wait_root_status"] = wr or "UNKNOWN"
+
+    fps = out.get("fps") or {}
+    last_hitch = None
+    if out["recent_hitches"]:
+        last_hitch = out["recent_hitches"][-1].get("frame_ms")
+    live_last = (out.get("live") or {}).get("perf_last_hitch_ms")
+    severe = (isinstance(last_hitch, (int, float)) and last_hitch >= 900) or (
+        isinstance(live_last, (int, float)) and live_last >= 900
+    )
+    degraded = False
+    n = fps.get("fps")
+    if isinstance(n, (int, float)) and float(n) < 15:
+        severe = True
+    elif isinstance(n, (int, float)) and float(n) < 20:
+        degraded = True
+    p95 = (out.get("summary") or {}).get("p95_frame_ms")
+    if isinstance(p95, (int, float)) and float(p95) >= 50:
+        degraded = True
+    out["status"] = "SEVERE" if severe else ("DEGRADED" if degraded else "GOOD")
+    return out
+
+
+# ── DISPLAY / NVIDIA health (STREAM tab) ─────────────────────────────
+_DISPLAY_HEALTH_LOCK = threading.Lock()
+_DISPLAY_HEALTH_CACHE: dict[str, Any] = {"ts": 0.0, "data": None}
+_DISPLAY_HEALTH_LAST: dict[str, Any] | None = None
+_DISPLAY_HEALTH_LAST_CHANGE: str | None = None
+_DISPLAY_HEALTH_POLL_SEC = 4.0
+_DISPLAY_EVENTS_PATH = ROOT / "artifacts" / "display_health" / "display_state_events.jsonl"
+_DISPLAY_SNAP_PATH = ROOT / "artifacts" / "display_health" / "display_state_current.json"
+
+
+def _dh_run(cmd: list[str], timeout: float = 8.0) -> str:
+    try:
+        r = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env={
+                **os.environ,
+                "DISPLAY": os.environ.get("DISPLAY") or ":1",
+                "XAUTHORITY": os.environ.get("XAUTHORITY")
+                or f"/run/user/{os.getuid()}/gdm/Xauthority",
+            },
+        )
+        return (r.stdout or "") + (r.stderr or "")
+    except Exception as e:
+        return f"ERR:{e}"
+
+
+def _dh_pgrep(pat: str) -> bool:
+    try:
+        return subprocess.call(
+            ["pgrep", "-f", pat], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        ) == 0
+    except Exception:
+        return False
+
+
+def _dh_workloads() -> dict[str, bool]:
+    obs_on = False
+    try:
+        obs_on = subprocess.call(
+            ["pgrep", "-x", "obs"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        ) == 0
+    except Exception:
+        obs_on = False
+    # Twitch stream: OBS with --startstreaming in cmdline
+    twitch_on = False
+    if obs_on:
+        try:
+            out = subprocess.check_output(["ps", "-eo", "args"], text=True, timeout=3)
+            twitch_on = any(
+                ("obs" in ln.lower()) and ("--startstreaming" in ln) for ln in out.splitlines()
+            )
+        except Exception:
+            twitch_on = False
+    return {
+        "unity": _dh_pgrep("stream_forest_survival_2_12_07_2026"),
+        "onnx": _dh_pgrep("stream_onnx_infer"),
+        "bot": _dh_pgrep("stream_bot.main"),
+        "training": _dh_pgrep("mlagents-learn"),
+        "obs": obs_on,
+        "twitch_stream": twitch_on,
+        "anydesk": _dh_pgrep("anydesk"),
+    }
+
+
+def _collect_display_health_uncached() -> dict[str, Any]:
+    import re
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc).isoformat()
+    disp = os.environ.get("DISPLAY") or ":1"
+    xauth = os.environ.get("XAUTHORITY") or f"/run/user/{os.getuid()}/gdm/Xauthority"
+
+    xorg_pid = None
+    xorg_vt = None
+    xorg_alive = False
+    try:
+        out = subprocess.check_output(["pgrep", "-a", "Xorg"], text=True, timeout=3)
+        for ln in out.splitlines():
+            if "vt2" in ln or f"auth {xauth}" in ln or "/run/user/1000/" in ln:
+                parts = ln.split(None, 1)
+                xorg_pid = int(parts[0])
+                m = re.search(r"vt(\d+)", ln)
+                xorg_vt = int(m.group(1)) if m else None
+                xorg_alive = True
+                break
+        if not xorg_alive and out.strip():
+            # fallback first Xorg
+            parts = out.splitlines()[0].split(None, 1)
+            xorg_pid = int(parts[0])
+            m = re.search(r"vt(\d+)", out.splitlines()[0])
+            xorg_vt = int(m.group(1)) if m else None
+            xorg_alive = True
+    except Exception:
+        pass
+
+    session_active = None
+    try:
+        sessions = subprocess.check_output(
+            ["loginctl", "list-sessions", "--no-legend"], text=True, timeout=3
+        )
+        for ln in sessions.splitlines():
+            sid = (ln.split() or [""])[0]
+            if not sid:
+                continue
+            props = subprocess.check_output(
+                [
+                    "loginctl",
+                    "show-session",
+                    sid,
+                    "-p",
+                    "Name",
+                    "-p",
+                    "Active",
+                    "-p",
+                    "VTNr",
+                    "-p",
+                    "Type",
+                ],
+                text=True,
+                timeout=3,
+            )
+            d = {}
+            for p in props.splitlines():
+                if "=" in p:
+                    k, v = p.split("=", 1)
+                    d[k] = v
+            if d.get("Name") == "reedgern" and d.get("Type") == "x11":
+                session_active = d.get("Active") == "yes"
+                if not xorg_vt and d.get("VTNr") not in ("", "0", None):
+                    try:
+                        xorg_vt = int(d["VTNr"])
+                    except Exception:
+                        pass
+                break
+    except Exception:
+        pass
+
+    xrandr_txt = _dh_run(["xrandr", "--current"], 5)
+    output_name = None
+    connected = False
+    resolution = None
+    refresh = None
+    primary = False
+    for ln in xrandr_txt.splitlines():
+        if " connected" in ln:
+            connected = True
+            output_name = ln.split()[0]
+            primary = "primary" in ln
+            m = re.search(r"(\d+)x(\d+)\+(\d+)\+(\d+)", ln)
+            if m:
+                resolution = f"{m.group(1)}x{m.group(2)}"
+            break
+    for ln in xrandr_txt.splitlines():
+        if "*" in ln and re.search(r"\d+\.\d+", ln):
+            m = re.search(r"(\d+\.\d+)\*", ln) or re.search(r"(\d+\.\d+)", ln)
+            if m:
+                refresh = m.group(1)
+            break
+
+    da = None
+    nsmi = _dh_run(["nvidia-smi", "-q"], 12)
+    for ln in nsmi.splitlines():
+        if "Display Active" in ln and ":" in ln:
+            da = ln.split(":", 1)[1].strip()
+            break
+
+    enabled = None
+    connected_bit = None
+    metamode = None
+    en_txt = _dh_run(["nvidia-settings", "-q", "EnabledDisplays"], 8)
+    for ln in en_txt.splitlines():
+        if "EnabledDisplays" in ln and "0x" in ln and "Attribute" in ln:
+            m = re.search(r"(0x[0-9a-fA-F]+)", ln)
+            if m:
+                enabled = m.group(1)
+    cd_txt = _dh_run(["nvidia-settings", "-q", "ConnectedDisplays"], 8)
+    for ln in cd_txt.splitlines():
+        if "ConnectedDisplays" in ln and "0x" in ln and "Attribute" in ln:
+            m = re.search(r"(0x[0-9a-fA-F]+)", ln)
+            if m:
+                connected_bit = m.group(1)
+    mm_txt = _dh_run(["nvidia-settings", "-q", "CurrentMetaMode"], 8)
+    m = re.search(r"::\s*(.+)", mm_txt)
+    if m:
+        metamode = m.group(1).strip()
+
+    enabled_zero = (enabled is None) or (enabled.lower() in ("0x0", "0x00000000", "0"))
+    da_disabled = (da or "").lower() == "disabled"
+    xrandr_active = bool(connected and resolution)
+
+    if da_disabled or enabled_zero:
+        if xrandr_active:
+            health = "MISMATCH"
+        else:
+            health = "BAD"
+    elif xorg_alive and session_active is not False and xrandr_active and not da_disabled and not enabled_zero:
+        health = "GOOD"
+    else:
+        health = "BAD"
+
+    workloads = _dh_workloads()
+    return {
+        "ok": True,
+        "checked_at": now,
+        "last_change_at": _DISPLAY_HEALTH_LAST_CHANGE,
+        "health": health,
+        "display": disp,
+        "xauthority": xauth,
+        "xorg": {
+            "alive": xorg_alive,
+            "pid": xorg_pid,
+            "vt": xorg_vt,
+            "session_active": session_active,
+        },
+        "xrandr": {
+            "output": output_name,
+            "connected": connected,
+            "resolution": resolution,
+            "refresh": refresh,
+            "primary": primary,
+        },
+        "nvidia": {
+            "display_active": da,
+            "connected_displays": connected_bit,
+            "enabled_displays": enabled,
+            "current_metamode": metamode,
+        },
+        "workloads": {
+            "unity": "ON" if workloads["unity"] else "OFF",
+            "onnx": "ON" if workloads["onnx"] else "OFF",
+            "bot": "ON" if workloads["bot"] else "OFF",
+            "training": "ON" if workloads["training"] else "OFF",
+            "obs": "ON" if workloads["obs"] else "OFF",
+            "twitch_stream": "ON" if workloads["twitch_stream"] else "OFF",
+            "anydesk": "ON" if workloads["anydesk"] else "OFF",
+        },
+    }
+
+
+def _display_health_maybe_log_event(data: dict[str, Any]) -> None:
+    global _DISPLAY_HEALTH_LAST, _DISPLAY_HEALTH_LAST_CHANGE
+    cur_key = (
+        data.get("health"),
+        (data.get("nvidia") or {}).get("display_active"),
+        (data.get("nvidia") or {}).get("enabled_displays"),
+        (data.get("xrandr") or {}).get("resolution"),
+    )
+    prev = _DISPLAY_HEALTH_LAST
+    prev_key = None
+    if prev:
+        prev_key = (
+            prev.get("health"),
+            (prev.get("nvidia") or {}).get("display_active"),
+            (prev.get("nvidia") or {}).get("enabled_displays"),
+            (prev.get("xrandr") or {}).get("resolution"),
+        )
+    if prev_key == cur_key:
+        data["last_change_at"] = _DISPLAY_HEALTH_LAST_CHANGE
+        return
+    _DISPLAY_HEALTH_LAST_CHANGE = data.get("checked_at")
+    data["last_change_at"] = _DISPLAY_HEALTH_LAST_CHANGE
+    try:
+        _DISPLAY_EVENTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        ev = {
+            "ts": data.get("checked_at"),
+            "old_display_active": (prev or {}).get("nvidia", {}).get("display_active") if prev else None,
+            "new_display_active": (data.get("nvidia") or {}).get("display_active"),
+            "old_enabled_displays": (prev or {}).get("nvidia", {}).get("enabled_displays") if prev else None,
+            "new_enabled_displays": (data.get("nvidia") or {}).get("enabled_displays"),
+            "old_health": (prev or {}).get("health") if prev else None,
+            "new_health": data.get("health"),
+            "xrandr": data.get("xrandr"),
+            "workloads": data.get("workloads"),
+        }
+        with _DISPLAY_EVENTS_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(ev, ensure_ascii=False) + "\n")
+        _DISPLAY_SNAP_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+    _DISPLAY_HEALTH_LAST = dict(data)
+
+
+def display_health(force: bool = False) -> dict[str, Any]:
+    """Cached NVIDIA/Xorg display health for STREAM tab (poll ~4s)."""
+    now = time.time()
+    with _DISPLAY_HEALTH_LOCK:
+        cached = _DISPLAY_HEALTH_CACHE.get("data")
+        ts = float(_DISPLAY_HEALTH_CACHE.get("ts") or 0)
+        if (not force) and cached is not None and (now - ts) < _DISPLAY_HEALTH_POLL_SEC:
+            return cached
+        try:
+            data = _collect_display_health_uncached()
+        except Exception as e:
+            data = {"ok": False, "error": str(e), "health": "BAD", "checked_at": None}
+        _display_health_maybe_log_event(data)
+        _DISPLAY_HEALTH_CACHE["ts"] = now
+        _DISPLAY_HEALTH_CACHE["data"] = data
+        return data
+
+
+def display_health_repair() -> dict[str, Any]:
+    """Manual-only: reassert exact CurrentMetaMode. Never call automatically."""
+    before = display_health(force=True)
+    mm = (before.get("nvidia") or {}).get("current_metamode")
+    if not mm:
+        return {"ok": False, "error": "no CurrentMetaMode", "before": before}
+    assign = _dh_run(["nvidia-settings", "--assign", f"CurrentMetaMode={mm}"], 15)
+    time.sleep(2)
+    after = display_health(force=True)
+    try:
+        _DISPLAY_EVENTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with _DISPLAY_EVENTS_PATH.open("a", encoding="utf-8") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "ts": after.get("checked_at"),
+                        "event": "manual_repair_metamode",
+                        "metamode": mm,
+                        "assign_log": (assign or "")[:500],
+                        "before": {
+                            "display_active": (before.get("nvidia") or {}).get("display_active"),
+                            "enabled_displays": (before.get("nvidia") or {}).get("enabled_displays"),
+                            "health": before.get("health"),
+                        },
+                        "after": {
+                            "display_active": (after.get("nvidia") or {}).get("display_active"),
+                            "enabled_displays": (after.get("nvidia") or {}).get("enabled_displays"),
+                            "health": after.get("health"),
+                        },
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+    except Exception:
+        pass
+    return {"ok": True, "before": before, "after": after, "assign_log": assign, "metamode": mm}
 
 
 def fetch_lab_activity(host: str | None = None) -> dict[str, Any]:
@@ -4255,6 +4839,7 @@ def _ss_reports_page_html(limit: int = 120) -> str:
   tr:hover td {{ background:rgba(106,166,255,.08); }}
   a {{ color:#7eb6ff; }}
   code {{ word-break:break-all; }}
+
 </style>
 </head><body>
 <h1>Live Stress — все репорты</h1>
@@ -5038,6 +5623,16 @@ button.live-on:hover { border-color: #ff8a8a; }
 button.jack { border-color: #3a5f99; }
 button.lily { border-color: #6b4a8a; }
 button.george { border-color: #3d6b52; }
+.perf-ok { color: #3dd68c; }
+.perf-warn { color: #e6b84d; }
+.perf-bad { color: #ff5c5c; }
+.perf-sev { color: #ff2a2a; font-weight: 600; }
+#streamPerfHitchTable td, #streamPerfHitchTable th { padding: 2px 6px; border-bottom: 1px solid #243044; }
+#streamPerfHitchTable tr.perf-sev { background: rgba(255,42,42,.12); }
+#streamPerfHitchTable tr.perf-bad { background: rgba(255,92,92,.08); }
+.pill.perf-ok { background: #1a3d2e; color: #3dd68c; }
+.pill.perf-warn { background: #3d341a; color: #e6b84d; }
+.pill.perf-sev { background: #4a1515; color: #ff5c5c; }
 .chart-wrap {
   background: #0f1116; border: 1px solid var(--border); border-radius: 8px;
   padding: 8px; min-height: 180px; cursor: pointer; position: relative;
@@ -5308,6 +5903,7 @@ button.george { border-color: #3d6b52; }
     <button type="button" class="mode-tab active" id="tab-mode-training" data-mode="training">Forest Lab Train</button>
     <button type="button" class="mode-tab" id="tab-mode-streaming" data-mode="streaming">Survival followers</button>
     <button type="button" class="mode-tab" id="tab-mode-obs" data-mode="obs">OBS Stream</button>
+    <button type="button" class="mode-tab" id="tab-mode-shorts" data-mode="shorts">Shorts со стримов</button>
   </nav>
   <div class="status-bar"><span id="hdrMeta"></span></div>
 </header>
@@ -5522,6 +6118,37 @@ button.george { border-color: #3d6b52; }
             </details>
             <p class="hint" style="margin:6px 0 0">Окно ~500 шагов · <code>stream_onnx_*.log</code> / <code>stream_fps.json</code>. Ниже ~15 — стрим лагает.</p>
           </div>
+
+          <div class="host-card" id="streamPerfCard" style="padding:10px;margin:0 0 10px">
+            <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+              <strong>PERFORMANCE / HITCH</strong>
+              <span class="pill" id="streamPerfStatus">—</span>
+              <span class="hint" id="streamPerfMarker"></span>
+            </div>
+            <div id="streamPerfBody" class="hint" style="margin-top:8px;font-family:ui-monospace,monospace;white-space:pre-wrap;line-height:1.35">ждём /api/stream_performance…</div>
+            <div style="overflow:auto;max-height:220px;margin-top:8px">
+              <table id="streamPerfHitchTable" style="width:100%;border-collapse:collapse;font-size:12px;font-variant-numeric:tabular-nums">
+                <thead><tr style="text-align:left;opacity:.7">
+                  <th>ts</th><th>ep</th><th>frame_ms</th><th>main</th><th>waitFps</th><th>present</th><th>unacc</th><th>focus</th>
+                </tr></thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="host-card" id="displayHealthCard" style="padding:10px;margin:0 0 10px">
+            <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+              <strong>DISPLAY / NVIDIA</strong>
+              <span class="pill" id="displayHealthPill">—</span>
+              <span class="hint" id="displayHealthChanged"></span>
+            </div>
+            <div id="displayHealthWorkloads" class="hint" style="margin-top:6px;font-family:ui-monospace,monospace;white-space:pre-wrap"></div>
+            <div id="displayHealthBody" class="hint" style="margin-top:8px;font-family:ui-monospace,monospace;white-space:pre-wrap;line-height:1.4">ждём /api/display_health…</div>
+            <div class="btns" style="margin-top:8px">
+              <button type="button" id="btnDisplayHealthRepair" title="Manual only: reassert exact CurrentMetaMode. Не auto.">Repair NVIDIA display</button>
+            </div>
+          </div>
+
           <div class="pres-kpis" id="presWorldKpis">
             <div class="pres-kpi"><span class="k">Эпизод</span><span class="v" id="presKpiEpisode">—</span></div>
             <div class="pres-kpi"><span class="k">Овцы</span><span class="v" id="presKpiSheep">—</span></div>
@@ -5656,7 +6283,7 @@ button.george { border-color: #3d6b52; }
           <button type="button" id="btnLlmRosterMode" title="Переключить: только в игре / вся история">В игре</button>
           <button type="button" id="btnLlmRosterResync" title="Отправить список в Unity после рестарта стрима">↻ Resync → Unity</button>
         </div>
-        <p class="hint" style="margin:6px 0 8px">База <code>stream_bot.sqlite3</code>: кто писал #join, когда, вода/дерево/овцы/костры. #exit и 48ч без активности → не «в игре», но в истории/статистике остаётся. Вернуться — снова #join. После рестарта стрима жми Resync (или он сам после restart_stream).</p>
+        <p class="hint" style="margin:6px 0 8px">База <code>stream_bot.sqlite3</code>: кто писал #join / #do / #stats, когда, вода/дерево/овцы/зомби/костры/баррикады. #exit и 48ч без активности → не «в игре», но в истории/статистике остаётся. Вернуться — снова #join. После рестарта стрима жми Resync (или он сам после restart_stream).</p>
         <div id="llmRosterEmpty" class="hint" style="padding:6px 0">Пока никого — зрители пишут #join в чат</div>
         <div style="overflow:auto;max-height:320px">
           <table id="llmRosterTable" style="width:100%;border-collapse:collapse;font-size:12px;display:none">
@@ -5671,7 +6298,9 @@ button.george { border-color: #3d6b52; }
                 <th style="padding:4px 6px">💧</th>
                 <th style="padding:4px 6px">🪵</th>
                 <th style="padding:4px 6px">🐑</th>
+                <th style="padding:4px 6px">🧟</th>
                 <th style="padding:4px 6px">🔥</th>
+                <th style="padding:4px 6px">🧱</th>
             </tr>
           </thead>
           <tbody id="llmRosterBody"></tbody>
@@ -5699,6 +6328,46 @@ button.george { border-color: #3d6b52; }
       <pre class="llm-setup-log" id="llmBotLog">(пусто)</pre>
     </section>
   </div><!-- /panel-mode-obs -->
+
+  <div id="panel-mode-shorts" class="mode-panel" style="display:none">
+    <section class="card" id="card-shorts">
+      <h2>Shorts со стримов <span class="pill" id="shortsPill">—</span></h2>
+      <p class="hint">Video capture через ffmpeg (DISPLAY), независимо от OBS Twitch broadcast. Компонент: <code>train_scripts/lab_comp/shorts/</code> + вкладка в <code>train_lab_ui.py</code>.</p>
+
+      <h3 style="font-size:13px;margin:10px 0 6px">STREAM MODE</h3>
+      <div class="btns" style="flex-wrap:wrap">
+        <button type="button" id="btnStreamModeAutonomous">Autonomous</button>
+        <button type="button" id="btnStreamModeHosted">Hosted</button>
+        <button type="button" id="btnStreamModeTest">Test</button>
+        <span class="hint" id="streamModeLabel">default: Autonomous</span>
+      </div>
+
+      <h3 style="font-size:13px;margin:14px 0 6px">Сбор / запись</h3>
+      <div class="llm-status" id="shortsStatusGrid">
+        <div>Сбор видео: <b id="shortsCollection">—</b></div>
+        <div>Recorder status: <b id="shortsRecStatus">—</b></div>
+        <div>Current episode: <b id="shortsEpisode">—</b></div>
+        <div>Current recording duration: <b id="shortsDuration">—</b></div>
+      </div>
+      <div class="hint" style="margin:6px 0">Detected interesting events: <span id="shortsEvents">—</span></div>
+      <div class="btns" style="flex-wrap:wrap;margin-top:8px">
+        <button type="button" class="primary" id="btnShortsManual">Записать эпизод</button>
+        <button type="button" id="btnShortsToggle">Сбор видео ON/OFF</button>
+        <button type="button" id="btnShortsSync">Sync lab→local</button>
+        <button type="button" id="btnShortsRefresh">Refresh</button>
+      </div>
+      <pre class="server-pre" id="shortsLog" style="max-height:90px;margin-top:8px">—</pre>
+
+      <h3 style="font-size:13px;margin:14px 0 6px">Диск</h3>
+      <div class="grid2">
+        <pre class="server-pre" id="shortsDiskLocal">LOCAL: …</pre>
+        <pre class="server-pre" id="shortsDiskLab">LAB_COMP: …</pre>
+      </div>
+
+      <h3 style="font-size:13px;margin:14px 0 6px">Видео</h3>
+      <div id="shortsVideoList" class="hint">нет видео</div>
+    </section>
+  </div><!-- /panel-mode-shorts -->
 </main>
 <div class="modal-bg" id="detailModal">
   <div class="modal">
@@ -5726,6 +6395,9 @@ async function api(path, opts) {
     || (path || "").indexOf("/api/llm_bot/local_chat") === 0
     || (path || "").indexOf("/api/ss_preview/") === 0
     || (path || "").indexOf("/api/presentation_world") === 0
+    || (path || "").indexOf("/api/stream_performance") === 0
+    || (path || "").indexOf("/api/display_health") === 0
+    || (path || "").indexOf("/api/shorts/") === 0
     || (path || "").indexOf("/api/tb/") === 0;
   // joint weights = SSH на lab, может быть 15–40с — не рвать на 12с
   const jointW = (path || "").indexOf("/api/joint/run_weights") === 0;
@@ -6650,12 +7322,18 @@ function switchModeTab(mode) {
   const train = mode === "training";
   const streaming = mode === "streaming";
   const obs = mode === "obs";
+  const shorts = mode === "shorts";
   document.getElementById("tab-mode-training").classList.toggle("active", train);
   document.getElementById("tab-mode-streaming").classList.toggle("active", streaming);
   document.getElementById("tab-mode-obs").classList.toggle("active", obs);
+  const tabShorts = document.getElementById("tab-mode-shorts");
+  if (tabShorts) tabShorts.classList.toggle("active", shorts);
   document.getElementById("panel-mode-training").style.display = train ? "" : "none";
   document.getElementById("panel-mode-streaming").style.display = streaming ? "" : "none";
   document.getElementById("panel-mode-obs").style.display = obs ? "" : "none";
+  const panelShorts = document.getElementById("panel-mode-shorts");
+  if (panelShorts) panelShorts.style.display = shorts ? "" : "none";
+  if (shorts) refreshShorts();
   saveUiView();
 }
 
@@ -6685,9 +7363,11 @@ function saveUiView() {
       && document.getElementById("tab-mode-streaming").classList.contains("active"));
     const obs = !!(document.getElementById("tab-mode-obs")
       && document.getElementById("tab-mode-obs").classList.contains("active"));
+    const shorts = !!(document.getElementById("tab-mode-shorts")
+      && document.getElementById("tab-mode-shorts").classList.contains("active"));
     const jointBtn = document.querySelector("#card-joint-wrap .subtab.active");
     const view = {
-      mode: obs ? "obs" : (streaming ? "streaming" : "training"),
+      mode: shorts ? "shorts" : (obs ? "obs" : (streaming ? "streaming" : "training")),
       joint: (jointBtn && jointBtn.dataset.panel) || "panel-joint-train",
       scrollY: Math.max(0, window.scrollY || window.pageYOffset || 0),
       anchor: _nearestVisibleCardId() || "",
@@ -6704,17 +7384,22 @@ function restoreUiView() {
     view = null;
   }
   if (!view || typeof view !== "object") return;
-  if (view.mode === "streaming" || view.mode === "training" || view.mode === "obs") {
+  if (view.mode === "streaming" || view.mode === "training" || view.mode === "obs" || view.mode === "shorts") {
     // Avoid recursive save noise while restoring.
     const train = view.mode === "training";
     const streaming = view.mode === "streaming";
     const obs = view.mode === "obs";
+    const shorts = view.mode === "shorts";
     document.getElementById("tab-mode-training").classList.toggle("active", train);
     document.getElementById("tab-mode-streaming").classList.toggle("active", streaming);
     document.getElementById("tab-mode-obs").classList.toggle("active", obs);
+    const tabShorts = document.getElementById("tab-mode-shorts");
+    if (tabShorts) tabShorts.classList.toggle("active", shorts);
     document.getElementById("panel-mode-training").style.display = train ? "" : "none";
     document.getElementById("panel-mode-streaming").style.display = streaming ? "" : "none";
     document.getElementById("panel-mode-obs").style.display = obs ? "" : "none";
+    const panelShorts = document.getElementById("panel-mode-shorts");
+    if (panelShorts) panelShorts.style.display = shorts ? "" : "none";
   }
   if (view.joint) {
     for (const btn of document.querySelectorAll("#card-joint-wrap .subtab")) {
@@ -7222,7 +7907,9 @@ function renderLlmRoster(roster, count, players) {
       <td style="padding:4px 6px">${num(u.total_water_collected)}</td>
       <td style="padding:4px 6px">${num(u.total_wood_collected)}</td>
       <td style="padding:4px 6px">${num(u.total_sheep_killed)}</td>
+      <td style="padding:4px 6px">${num(u.total_zombies_killed)}</td>
       <td style="padding:4px 6px">${num(u.total_campfires_built)}</td>
+      <td style="padding:4px 6px">${num(u.total_barricades_built)}</td>
     </tr>`;
   }).join("");
 }
@@ -7726,6 +8413,8 @@ async function pollServer() {
     renderServerHost(s);
     applyLabActivity(s.activity || {});
     renderStreamFps((s.activity || {}).stream_fps || {});
+    pollStreamPerformance();
+    pollDisplayHealth();
     renderObsSsh(s.ssh_sessions || {});
     const streamOn = !!(s.activity && s.activity.stream);
     if (streamOn) schedulePresWorldPoll(true);
@@ -8426,6 +9115,221 @@ function drawPresWorldMap(canvasId, data, cam) {
   }
 }
 
+
+function _perfCls(v, yellow, red, severe) {
+  if (v == null || v !== v) return "";
+  if (severe != null && v >= severe) return "perf-sev";
+  if (v >= red) return "perf-bad";
+  if (yellow != null && v >= yellow) return "perf-warn";
+  return "perf-ok";
+}
+function _perfFmt(v, digits) {
+  if (v == null || v !== v) return "N/A";
+  return Number(v).toFixed(digits == null ? 1 : digits);
+}
+function renderStreamPerformance(p) {
+  const card = document.getElementById("streamPerfCard");
+  const st = document.getElementById("streamPerfStatus");
+  const mk = document.getElementById("streamPerfMarker");
+  const body = document.getElementById("streamPerfBody");
+  const tb = document.querySelector("#streamPerfHitchTable tbody");
+  if (!card || !body) return;
+  const d = p && typeof p === "object" ? p : {};
+  const status = d.status || "UNKNOWN";
+  if (st) {
+    st.textContent = status;
+    st.className = "pill " + (status === "SEVERE" ? "perf-sev" : (status === "DEGRADED" ? "perf-warn" : (status === "GOOD" ? "perf-ok" : "")));
+  }
+  if (mk) mk.textContent = d.marker || "";
+  const live = d.live || {};
+  const sum = d.summary || {};
+  const fps = d.fps || {};
+  const llm = d.llm || {};
+  const ctr = d.counters || {};
+  const lines = [];
+  lines.push("FPS " + _perfFmt(fps.fps, 1) + " · step " + _perfFmt(fps.step_ms, 0) + "ms · policy/env from last hitch:");
+  const lastPy = (d.python || {}).last_hitch_line || "";
+  if (lastPy) lines.push(lastPy.replace(/^\[stream_onnx\]\s*/, ""));
+  if ((d.python || {}).summary_line) lines.push(String(d.python.summary_line).replace(/^\[stream_onnx\]\s*/, ""));
+  lines.push("Unity ep=" + (live.perf_episode_id ?? sum.episode_id ?? "?")
+    + " hitches50=" + (live.perf_hitches_50 ?? sum.hitches_50ms ?? "?")
+    + " hitches900=" + (live.perf_hitches_900 ?? sum.hitches_900ms ?? "?")
+    + " worst=" + _perfFmt(live.perf_worst_frame_ms ?? sum.worst_frame_ms, 0) + "ms");
+  lines.push("focus=" + live.perf_app_focused + " paused=" + live.perf_app_paused
+    + " targetFps=" + live.perf_target_fps + " vsync=" + live.perf_vsync
+    + " timeScale=" + live.perf_time_scale);
+  lines.push("main=" + _perfFmt(live.perf_main_thread_ms)
+    + " waitFps=" + _perfFmt(live.perf_wait_target_fps_ms)
+    + " gfxPresent=" + _perfFmt(live.perf_gfx_wait_present_ms)
+    + " sem=" + _perfFmt(live.perf_semaphore_wait_ms)
+    + " present=" + _perfFmt(live.perf_present_ms)
+    + " playerLoop=" + _perfFmt(live.perf_player_loop_ms));
+
+  lines.push("--- GRAPHICS / PRESENT ---");
+  lines.push("Gfx.WaitForPresent=" + _perfFmt(live.perf_gfx_wait_present_ms ?? live.perf_last_gfx_wait_present_ms)
+    + " waitRoot=" + (live.perf_wait_root_status || d.wait_root_status || "—")
+    + " dominant=" + live.perf_present_wait_dominant);
+  lines.push("CPU total=" + _perfFmt(live.perf_cpu_total_frame_ms)
+    + " mainExact=" + _perfFmt(live.perf_cpu_main_thread_frame_ms)
+    + " renderExact=" + _perfFmt(live.perf_cpu_render_thread_frame_ms)
+    + " GPU=" + (live.perf_gpu_counter_supported_but_zero ? "counter no data" : _perfFmt(live.perf_gpu_frame_ms)));
+  lines.push("draw=" + (live.perf_draw_calls ?? live.perf_last_draw_calls ?? "N/A")
+    + " batches=" + (live.perf_batches ?? live.perf_last_batches ?? "N/A")
+    + " tris=" + (live.perf_triangles ?? live.perf_last_triangles ?? "N/A")
+    + " setpass=" + (live.perf_setpass ?? "N/A")
+    + " shadows=" + (live.perf_shadow_casters ?? "N/A"));
+  lines.push("recorder_offset=" + (live.perf_recorder_frame_offset ?? "1"));
+  const gpu = d.gpu_os || {};
+  lines.push("GPU OS util=" + (gpu.gpu_util == null ? "N/A" : gpu.gpu_util) + "% VRAM=" + (gpu.mem_used ?? "N/A")
+    + " P=" + (gpu.pstate ?? "N/A"));
+  const obs = d.obs || {};
+  lines.push("OBS renderLag=" + _perfFmt(obs.rendering_lag_ms) + " encodeLag=" + _perfFmt(obs.encoding_lag_ms));
+  lines.push("--- ML-AGENTS / LLM / WEIGHTS ---");
+  lines.push("communicator_gap=" + _perfFmt(live.perf_communicator_gap_ms) + "ms (collect→action upper bound; may overlap present)");
+  const llm2 = d.llm || {};
+  lines.push("LLM wall=" + _perfFmt(llm2.last_wall_ms) + " parse=" + _perfFmt(llm2.last_parse_ms)
+    + " block_unity=" + _perfFmt(llm2.main_thread_block_ms) + " q=" + (llm2.queue_depth ?? 0)
+    + " status=" + (llm2.last_status || "—") + " alive=" + (llm2.bot_alive ?? "N/A"));
+  const w = d.weights || {};
+  lines.push("weights poll=" + _perfFmt(w.python_weight_poll_ms) + " reload=" + _perfFmt(w.python_weight_reload_ms)
+    + " session=" + _perfFmt(w.onnx_session_create_ms) + " reload_step=" + (w.reload_this_step ?? "N/A"));
+
+  lines.push("last hitch=" + _perfFmt(live.perf_last_hitch_ms) + " unaccounted=" + _perfFmt(live.perf_last_unaccounted_ms));
+  if (sum.severe_900_seconds_delta_median != null)
+    lines.push("periodicity >=900: sec_median=" + sum.severe_900_seconds_delta_median
+      + " frame_delta_median=" + sum.severe_900_frame_delta_median);
+  lines.push("LLM wall=" + _perfFmt(llm.last_wall_ms) + "ms block_unity=" + _perfFmt(llm.main_thread_block_ms)
+    + " req=" + (llm.requests ?? 0) + " status=" + (llm.last_status || "—"));
+  const avail = Object.keys(ctr).filter(k => k !== "marker" && ctr[k] === true);
+  const unavail = Object.keys(ctr).filter(k => k !== "marker" && ctr[k] === false);
+  if (avail.length || unavail.length)
+    lines.push("counters OK: " + (avail.join(",") || "—") + " | N/A: " + (unavail.join(",") || "—"));
+  body.innerHTML = lines.map(ln => {
+    let cls = "";
+    if (/unaccounted=\s*[5-9]\d\d|unaccounted=\s*[1-9]\d{3,}/.test(ln) || /waitFps=\s*[5-9]\d\d/.test(ln) || /SEVERE|НИЗКИЙ|hitch=\s*[5-9]\d\d/.test(ln))
+      cls = "perf-bad";
+    return '<div class="' + cls + '">' + ln.replace(/</g, "&lt;") + "</div>";
+  }).join("");
+  if (tb) {
+    tb.innerHTML = "";
+    (d.recent_hitches || []).slice().reverse().forEach(h => {
+      const tr = document.createElement("tr");
+      const fms = Number(h.frame_ms);
+      if (fms >= 900) tr.className = "perf-sev";
+      else if (fms >= 50) tr.className = "perf-bad";
+      const cells = [
+        String(h.ts || "").slice(11, 19),
+        h.episode_id,
+        _perfFmt(h.frame_ms, 0),
+        _perfFmt(h.unity_main_thread_ms, 0),
+        _perfFmt(h.wait_for_target_fps_ms, 0),
+        _perfFmt(h.present_ms, 0),
+        _perfFmt(h.unaccounted_ms, 0),
+        h.app_focused === false ? "NO" : "yes",
+      ];
+      cells.forEach(c => {
+        const td = document.createElement("td");
+        td.textContent = c == null ? "—" : String(c);
+        tr.appendChild(td);
+      });
+      tb.appendChild(tr);
+    });
+  }
+  card.classList.toggle("fps-bad", status === "SEVERE");
+  card.classList.toggle("fps-warn", status === "DEGRADED");
+}
+
+async function pollStreamPerformance() {
+  try {
+    const d = await api("/api/stream_performance");
+    renderStreamPerformance(d);
+  } catch (e) { /* ignore */ }
+}
+
+function renderDisplayHealth(d) {
+  const pill = document.getElementById("displayHealthPill");
+  const body = document.getElementById("displayHealthBody");
+  const wl = document.getElementById("displayHealthWorkloads");
+  const ch = document.getElementById("displayHealthChanged");
+  const card = document.getElementById("displayHealthCard");
+  if (!pill || !body) return;
+  const health = String((d && d.health) || "BAD");
+  pill.textContent = health;
+  pill.className = "pill " + (health === "GOOD" ? "on" : "");
+  if (card) {
+    card.classList.toggle("fps-bad", health === "BAD" || health === "MISMATCH");
+    card.classList.toggle("fps-warn", health === "MISMATCH");
+  }
+  const x = (d && d.xorg) || {};
+  const xr = (d && d.xrandr) || {};
+  const n = (d && d.nvidia) || {};
+  const w = (d && d.workloads) || {};
+  if (wl) {
+    wl.textContent =
+      "Unity: " + (w.unity || "—")
+      + "  |  ONNX: " + (w.onnx || "—")
+      + "  |  Bot: " + (w.bot || "—")
+      + "  |  Training: " + (w.training || "—")
+      + "  |  OBS: " + (w.obs || "—")
+      + "  |  STREAM: " + (w.twitch_stream || "—")
+      + "  |  AnyDesk: " + (w.anydesk || "—");
+  }
+  if (ch) {
+    ch.textContent = d && d.last_change_at
+      ? ("last change " + String(d.last_change_at).replace("T", " ").slice(0, 19))
+      : "";
+  }
+  const lines = [
+    "HEALTH: " + health,
+    "Last check: " + (d && d.checked_at ? String(d.checked_at).replace("T", " ").slice(0, 19) : "—"),
+    "",
+    "XORG",
+    "  DISPLAY: " + ((d && d.display) || "—"),
+    "  Xorg PID: " + (x.pid != null ? x.pid : "—") + "   VT: " + (x.vt != null ? x.vt : "—"),
+    "  graphical session Active: " + (x.session_active === true ? "yes" : (x.session_active === false ? "no" : "—")),
+    "  Xorg alive: " + (x.alive ? "yes" : "no"),
+    "",
+    "XRANDR",
+    "  output: " + (xr.output || "—") + "   connected: " + (xr.connected ? "yes" : "no"),
+    "  resolution: " + (xr.resolution || "—") + "   refresh: " + (xr.refresh || "—"),
+    "  primary: " + (xr.primary ? "yes" : "no"),
+    "",
+    "NVIDIA",
+    "  Display Active: " + (n.display_active || "—"),
+    "  ConnectedDisplays: " + (n.connected_displays || "—"),
+    "  EnabledDisplays: " + (n.enabled_displays || "—"),
+    "  CurrentMetaMode: " + (n.current_metamode || "—"),
+  ];
+  if (d && d.error) lines.push("", "error: " + d.error);
+  body.textContent = lines.join("\n");
+}
+
+async function pollDisplayHealth() {
+  try {
+    const d = await api("/api/display_health");
+    renderDisplayHealth(d);
+  } catch (e) { /* ignore */ }
+}
+
+async function repairDisplayHealth() {
+  const btn = document.getElementById("btnDisplayHealthRepair");
+  if (btn) btn.disabled = true;
+  try {
+    const d = await api("/api/display_health/repair", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: "{}",
+    });
+    if (d && d.after) renderDisplayHealth(d.after);
+    else await pollDisplayHealth();
+    flash("hdrMeta", d && d.ok ? "NVIDIA MetaMode reassert done" : ("repair fail: " + ((d && d.error) || "?")));
+  } catch (e) {
+    flash("hdrMeta", "repair error: " + (e.message || e));
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
 function renderStreamFps(fps) {
   // Единственное место FPS: «Мир стрима» (meters + KPI + pill).
   const pre = document.getElementById("streamFps");
@@ -8926,6 +9830,8 @@ function renderHeroes() {
   document.getElementById("btnJointTrain").onclick = () => trainJoint();
   document.getElementById("btnJointStream").onclick = () => startJointStream();
   document.getElementById("btnKillStream").onclick = () => killStreamOnly();
+  const btnDisplayRepair = document.getElementById("btnDisplayHealthRepair");
+  if (btnDisplayRepair) btnDisplayRepair.onclick = () => repairDisplayHealth();
   const btnRepairSpawn = document.getElementById("btnRepairSpawn");
   if (btnRepairSpawn) btnRepairSpawn.onclick = () => repairStreamSpawn();
   const btnObsStart = document.getElementById("btnObsStartStream");
@@ -8992,9 +9898,148 @@ function bindModeTabs() {
   const t = document.getElementById("tab-mode-training");
   const s = document.getElementById("tab-mode-streaming");
   const o = document.getElementById("tab-mode-obs");
+  const sh = document.getElementById("tab-mode-shorts");
   if (t) t.onclick = () => switchModeTab("training");
   if (s) s.onclick = () => switchModeTab("streaming");
   if (o) o.onclick = () => switchModeTab("obs");
+  if (sh) sh.onclick = () => switchModeTab("shorts");
+}
+
+function fmtBytes(n) {
+  n = Number(n)||0;
+  if (n < 1024) return n + " B";
+  if (n < 1024*1024) return (n/1024).toFixed(1) + " KB";
+  if (n < 1024*1024*1024) return (n/(1024*1024)).toFixed(1) + " MB";
+  return (n/(1024*1024*1024)).toFixed(2) + " GB";
+}
+
+async function refreshShorts() {
+  const logEl = document.getElementById("shortsLog");
+  try {
+    const st = await api("/api/shorts/status");
+    const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+    set("shortsCollection", st.collection_on ? "ON" : "OFF");
+    set("shortsRecStatus", st.status || "IDLE");
+    set("shortsEpisode", st.current_episode || "—");
+    set("shortsDuration", (st.recording_duration_sec != null ? st.recording_duration_sec + "s" : "—"));
+    const ev = (st.detected_interesting_events || []).join(", ") || "—";
+    set("shortsEvents", ev);
+    const pill = document.getElementById("shortsPill");
+    if (pill) pill.textContent = (st.collection_on ? "collect ON" : "collect OFF") + " · " + (st.status || "IDLE");
+    const mode = st.stream_mode || "autonomous";
+    set("streamModeLabel", "current: " + mode);
+    ["Autonomous","Hosted","Test"].forEach((name) => {
+      const b = document.getElementById("btnStreamMode" + name);
+      if (b) b.classList.toggle("primary", mode === name.toLowerCase());
+    });
+    const btnT = document.getElementById("btnShortsToggle");
+    if (btnT) btnT.textContent = st.collection_on ? "Сбор видео: ON" : "Сбор видео: OFF";
+    if (logEl && st.error) logEl.textContent = st.error;
+
+    try {
+      const disk = await api("/api/shorts/disk");
+      const loc = disk.local || {};
+      const lab = disk.lab || {};
+      const localEl = document.getElementById("shortsDiskLocal");
+      const labEl = document.getElementById("shortsDiskLab");
+      if (localEl) localEl.textContent =
+        "LOCAL\\nTotal: " + fmtBytes(loc.total) +
+        "\\nUsed: " + fmtBytes(loc.used) +
+        "\\nFree: " + fmtBytes(loc.free) +
+        "\\nShorts folder: " + fmtBytes(loc.shorts_folder_size) +
+        (loc.error ? ("\\nERR: " + loc.error) : "");
+      if (labEl) labEl.textContent =
+        "LAB_COMP\\nTotal: " + fmtBytes(lab.total) +
+        "\\nUsed: " + fmtBytes(lab.used) +
+        "\\nFree: " + fmtBytes(lab.free) +
+        "\\nShorts folder: " + fmtBytes(lab.shorts_folder_size) +
+        (lab.error ? ("\\nERR: " + lab.error) : "");
+    } catch (diskErr) {
+      const localEl = document.getElementById("shortsDiskLocal");
+      const labEl = document.getElementById("shortsDiskLab");
+      if (localEl) localEl.textContent = "LOCAL\\nERR: " + (diskErr.message || diskErr);
+      if (labEl) labEl.textContent = "LAB_COMP\\nERR: disk refresh failed";
+    }
+
+    const lst = await api("/api/shorts/list");
+    const box = document.getElementById("shortsVideoList");
+    if (!box) return;
+    const videos = lst.videos || [];
+    if (!videos.length) { box.innerHTML = "<div class='hint'>нет видео</div>"; return; }
+    box.innerHTML = videos.map(v => {
+      const reasons = (v.save_reasons || []).join(", ") || "—";
+      const id = String(v.video_id || "").replace(/"/g, "");
+      return "<div style='border:1px solid var(--line);border-radius:8px;padding:8px;margin:6px 0'>"
+        + "<div><b>" + (v.video_id||"?") + "</b> · " + (v.created_at||"") + "</div>"
+        + "<div class='hint'>duration " + (v.duration_sec||"?") + "s · size " + fmtBytes(v.size_bytes)
+        + " · " + (v.source_mode||"") + "</div>"
+        + "<div class='hint'>reasons: " + reasons + "</div>"
+        + "<div class='btns' style='margin-top:6px'>"
+        + "<button type='button' data-play='" + id + "'>▶ Воспроизвести</button>"
+        + "<button type='button' class='danger' data-del='" + id + "'>🗑 Удалить</button>"
+        + "</div></div>";
+    }).join("");
+    box.querySelectorAll("[data-play]").forEach(btn => {
+      btn.onclick = async () => {
+        try {
+          const r = await api("/api/shorts/play", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({video_id: btn.dataset.play})});
+          if (!r.ok) alert(r.error || "play failed");
+          else if (logEl) logEl.textContent = "opened: " + (r.path||"");
+        } catch (e) { alert(e.message||e); }
+      };
+    });
+    box.querySelectorAll("[data-del]").forEach(btn => {
+      btn.onclick = async () => {
+        if (!confirm("Удалить видео " + btn.dataset.del + " (local + lab)?")) return;
+        try {
+          const r = await api("/api/shorts/delete", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({video_id: btn.dataset.del})});
+          if (!r.ok) alert("Partial/fail:\\nlocal: " + (r.local_error||"ok") + "\\nlab: " + (r.remote_error||"ok"));
+          refreshShorts();
+        } catch (e) { alert(e.message||e); }
+      };
+    });
+  } catch (e) {
+    if (logEl) logEl.textContent = String(e.message || e);
+  }
+}
+
+document.getElementById("btnShortsManual")?.addEventListener("click", async () => {
+  try {
+    const r = await api("/api/shorts/manual", {method:"POST", headers:{"Content-Type":"application/json"}, body:"{}"});
+    alert((r.message || "armed") + (r.status && r.status.status ? ("\\nstatus="+r.status.status) : ""));
+    refreshShorts();
+  } catch (e) { alert(e.message||e); }
+});
+document.getElementById("btnShortsToggle")?.addEventListener("click", async () => {
+  try {
+    const st = await api("/api/shorts/status");
+    await api("/api/shorts/collection", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({on: !st.collection_on})});
+    refreshShorts();
+  } catch (e) { alert(e.message||e); }
+});
+document.getElementById("btnShortsSync")?.addEventListener("click", async () => {
+  try {
+    const r = await api("/api/shorts/sync", {method:"POST", headers:{"Content-Type":"application/json"}, body:"{}"});
+    alert("synced: " + (r.synced||[]).join(", ") + (r.errors && r.errors.length ? ("\\nerrors:\\n"+r.errors.join("\\n")) : ""));
+    refreshShorts();
+  } catch (e) { alert(e.message||e); }
+});
+document.getElementById("btnShortsRefresh")?.addEventListener("click", () => refreshShorts());
+async function setStreamMode(mode) {
+  try {
+    await api("/api/shorts/stream_mode", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({mode})});
+    refreshShorts();
+  } catch (e) { alert(e.message||e); }
+}
+document.getElementById("btnStreamModeAutonomous")?.addEventListener("click", () => setStreamMode("autonomous"));
+document.getElementById("btnStreamModeHosted")?.addEventListener("click", () => setStreamMode("hosted"));
+document.getElementById("btnStreamModeTest")?.addEventListener("click", () => setStreamMode("test"));
+setInterval(() => {
+  const panel = document.getElementById("panel-mode-shorts");
+  if (panel && panel.style.display !== "none") refreshShorts();
+}, 15000);
+
+function bindStreamingSurvivalButtons() {
   const bStart = document.getElementById("btnSsStart");
   const bStop = document.getElementById("btnSsStop");
   if (bStart) bStart.onclick = () => startStreamingSurvival();
@@ -9692,6 +10737,7 @@ async function boot() {
   const btnKillModeSs = document.getElementById("btnKillModeStreaming");
   if (btnKillModeSs) btnKillModeSs.onclick = () => killModeStreaming();
   bindModeTabs();
+  bindStreamingSurvivalButtons();
   bindUiViewPersistence();
   restoreUiView();
   wireLlmBotUi();
@@ -9808,6 +10854,38 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, LLM_BOT.status())
             return
 
+        if path == "/api/shorts/status":
+            if SHORTS_API is None:
+                self._json(500, {"ok": False, "error": _SHORTS_IMPORT_ERROR or "shorts import failed"})
+                return
+            try:
+                self._json(200, SHORTS_API.daemon_status(ssh_run))
+            except Exception as e:
+                self._json(500, {"ok": False, "error": str(e)})
+            return
+
+        if path == "/api/shorts/list":
+            if SHORTS_API is None:
+                self._json(500, {"ok": False, "error": _SHORTS_IMPORT_ERROR or "shorts import failed"})
+                return
+            self._json(200, SHORTS_API.list_videos())
+            return
+
+        if path == "/api/shorts/disk":
+            if SHORTS_API is None:
+                self._json(500, {"ok": False, "error": _SHORTS_IMPORT_ERROR or "shorts import failed"})
+                return
+            try:
+                local = SHORTS_API.disk_stats(SHORTS_API.LOCAL_SHORTS)
+            except Exception as e:
+                local = {"ok": False, "error": str(e)}
+            try:
+                lab = SHORTS_API.lab_disk_stats(ssh_run)
+            except Exception as e:
+                lab = {"ok": False, "error": str(e)}
+            self._json(200, {"ok": True, "local": local, "lab": lab})
+            return
+
         if path == "/api/server_stats":
             cfg = load_cfg()
             # Кэш + kick фонового SSH (раньше только читали кэш → после одного fail UI «умирал»).
@@ -9859,6 +10937,20 @@ class Handler(BaseHTTPRequestHandler):
                     "error": str(e),
                 }
             self._json(200, stats)
+            return
+
+        if path == "/api/stream_performance":
+            try:
+                self._json(200, stream_performance())
+            except Exception as e:
+                self._json(500, {"error": str(e)})
+            return
+
+        if path == "/api/display_health":
+            try:
+                self._json(200, display_health())
+            except Exception as e:
+                self._json(500, {"ok": False, "error": str(e), "health": "BAD"})
             return
 
         if path == "/api/presentation_world":
@@ -10147,6 +11239,13 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {"config": cfg})
             return
 
+        if path == "/api/display_health/repair":
+            try:
+                self._json(200, display_health_repair())
+            except Exception as e:
+                self._json(500, {"ok": False, "error": str(e)})
+            return
+
         if path.startswith("/api/ss_preview/"):
             try:
                 if path == "/api/ss_preview/start":
@@ -10201,6 +11300,54 @@ class Handler(BaseHTTPRequestHandler):
                 return
             except Exception as e:
                 self._json(500, {"ok": False, "error": str(e), "status": LLM_BOT.status()})
+                return
+
+        if path.startswith("/api/shorts/"):
+            if SHORTS_API is None:
+                self._json(500, {"ok": False, "error": _SHORTS_IMPORT_ERROR or "shorts import failed"})
+                return
+            try:
+                if path == "/api/shorts/collection":
+                    self._json(200, SHORTS_API.set_collection(bool(body.get("on")), ssh_run))
+                    return
+                if path == "/api/shorts/manual":
+                    self._json(200, SHORTS_API.request_manual(ssh_run))
+                    return
+                if path == "/api/shorts/sync":
+                    self._json(
+                        200,
+                        SHORTS_API.sync_pending_videos(
+                            ssh_run,
+                            scp_bin,
+                            lambda: resolve_ssh_host(load_cfg().get("ssh_host") or "lab_comp"),
+                        ),
+                    )
+                    return
+                if path == "/api/shorts/delete":
+                    self._json(200, SHORTS_API.delete_video(str(body.get("video_id") or ""), ssh_run))
+                    return
+                if path == "/api/shorts/play":
+                    info = SHORTS_API.play_path(str(body.get("video_id") or ""))
+                    if info.get("ok") and info.get("path"):
+                        p = info["path"]
+                        try:
+                            if sys.platform.startswith("win"):
+                                os.startfile(p)  # type: ignore[attr-defined]
+                            elif sys.platform == "darwin":
+                                subprocess.Popen(["open", p])
+                            else:
+                                subprocess.Popen(["xdg-open", p])
+                        except Exception as e:
+                            info = {"ok": False, "error": str(e), "path": p}
+                    self._json(200, info)
+                    return
+                if path == "/api/shorts/stream_mode":
+                    self._json(200, SHORTS_API.set_stream_mode(str(body.get("mode") or ""), ssh_run))
+                    return
+                self._json(404, {"error": f"unknown shorts path {path}"})
+                return
+            except Exception as e:
+                self._json(500, {"ok": False, "error": str(e)})
                 return
 
         if path.startswith("/api/ss_diagnostics/"):

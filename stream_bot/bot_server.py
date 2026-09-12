@@ -66,6 +66,16 @@ def create_app(bot) -> FastAPI:
         """История входов + статистика (вода/еда/дерево/…)."""
         return bot.list_players(active_only=bool(active_only))
 
+    @app.get("/leaderboard/time")
+    def leaderboard_time(limit: int = 5) -> Dict[str, Any]:
+        """Legacy URL — топ по убийствам зомби (как /leaderboard/zombies)."""
+        return bot.leaderboard_zombies(limit=limit)
+
+    @app.get("/leaderboard/zombies")
+    def leaderboard_zombies(limit: int = 5) -> Dict[str, Any]:
+        """Топ по убийствам зомби (включая вышедших)."""
+        return bot.leaderboard_zombies(limit=limit)
+
     @app.post("/roster/resync")
     def roster_resync() -> Dict[str, Any]:
         """Повторно заспавнить всех из roster в Unity."""

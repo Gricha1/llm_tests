@@ -47,7 +47,8 @@ action ONLY:
 - collect_stone — камень
 - collect_food — еда
 - kill_sheep — овечки
-- kill_zombie — бить зомби (только волк)
+- kill_zombie — бить зомби (волк или солдат)
+- go_to_water / go_home / go_to_campfire — подойти (можно в любом скине, без добычи)
 - build_campfire — поставить костёр у базы
 - walk_circle — ходить кругом
 - walk_forward — идти вперёд

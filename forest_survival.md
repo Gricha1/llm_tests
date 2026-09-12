@@ -7,8 +7,8 @@ Companion handoff (also living): `docs/LAB_ARCHITECTURE.md` (may be untracked un
 
 Document snapshot context:
 - Branch: `forest_survival` (tracks `main/forest_survival`)
-- HEAD (committed): `883433c` — 2026-08-28 — *Add shirtless zombie apocalypse mix, wolf/death combat, and roster revive on resync.*
-- Large Builder / Apocalypse / L-menu / barrier work exists mainly in the **working tree** (modified + untracked), not fully in HEAD. See §17.
+- Doc refresh: **2026-09-12** — growth features shipped (7d hide, progression goals, Shorts, stream_mode). See **Growth features shipped — 2026-09-12** below.
+- Prior committed HEAD before this push: `9ea649c` — docs growth bottlenecks; gameplay Builder/Apocalypse/L-menu still largely working-tree. See §17–§18.
 
 ---
 
@@ -425,6 +425,9 @@ Separate issue: Unity can still stall (`Gfx.WaitForPresent`) even while NVIDIA r
 
 | Commit | Date | Title / impact |
 |--------|------|----------------|
+| *(this push)* | 2026-09-12 | Growth: 7d hide, progression goals, Shorts pipeline, stream_mode analytics + `forest_survival.md` |
+| `9ea649c` | 2026-09-12 | docs: add current growth bottlenecks |
+| `f522b36` | 2026-09 | docs: add ForestSurvival project context |
 | `883433c` | 2026-08-28 | Shirtless zombie apocalypse mix, wolf/death combat, roster revive on resync |
 | `8b8e043` | 2026-08-20 | Tree spawn wipe fix; spawn/OBS repair tooling; Train Lab UI |
 | `30b52ad` … `0d2b451` | 2026-08-14 | Live Stress ×3, wood stuck retarget, run-list UI |
@@ -442,23 +445,18 @@ Older roots: Twitch overlays, city scene, validation/training fixes (`d9ccfe4`, 
 
 **Do not treat as “in git production” until committed + deployed.**
 
-Large modified areas include (non-exhaustive):
-- `StreamingSurvivalController/Player/Hud`, `StreamCommandReceiver`, `AgentDeathOverlay`, `JackScript`, `ZombieChase/Attack/Health/Spawner`, `TrainingEnvSpace`, `CamAbSwitcher`, `DayNightCycle`, `JointEpisodeReset`, `PresentationWorldReset`, `stream_bot/*`, `stream_onnx_infer.py`, `train_lab_ui.py`, `ForestScene.unity`, …
+**Committed in the 2026-09-12 growth push (bot/docs/Shorts):** 7d soft-hide, reactivation, `progression_goals.py`, Shorts package + Train Lab UI tab, `stream_context` / event `stream_mode`, `.env` gitignore, `docs/LAB_ARCHITECTURE.md`, updated `forest_survival.md`.
 
-Notable **untracked** feature files:
-- `BarrierFrontManager.cs`, `StreamingSurvivalBarrier.cs`, `StreamingSurvivalTestMenu.cs`
-- `ZombieApocalypseDifficulty.cs`, `WorkerBossZombie.cs`, `WorkerBossHud.cs`, `WorkerBossMusic.cs`
-- `PresentationTestSpeed.cs`, `PresentationTestGodMode.cs`, `PresentationCombatTargetRegistry.cs`
-- `UnityWebRequestDomainSafe.cs`
-- Builder/barrier/soldier Resources prefabs; medieval + barrier asset packs
-- `docs/LAB_ARCHITECTURE.md`
+Large **still uncommitted** Unity / scene areas include (non-exhaustive):
+- `StreamingSurvivalController/Player/Hud`, `StreamCommandReceiver`, `AgentDeathOverlay`, `JackScript`, `ZombieChase/Attack/Health/Spawner`, `TrainingEnvSpace`, `CamAbSwitcher`, `DayNightCycle`, `JointEpisodeReset`, `PresentationWorldReset`, `ForestScene.unity`, …
+- Builder/Apocalypse/L-menu feature files (`BarrierFrontManager`, `ZombieApocalypseDifficulty`, `StreamingSurvivalTestMenu`, …)
+- `stream_onnx_infer.py` / train script diffs outside Shorts UI
 
-Feature themes in that tree (Partially tested / needs Play Mode + lab marker verify):
+Feature themes still mainly working-tree (Partially tested / needs Play Mode + lab marker verify):
 - L-menu test characters + 1×/5× + camera lock
 - Builder + `build_walls` + Front_1..4 multi-builder slots
 - Apocalypse bosses + phase sync + bar×6 + bar-end restart
-- Follower wipe reset; straight zombie chase editor sync; webrequest domain-safe; Editor Play as stream
-
+- Follower wipe reset; core-loop HUD DLL; Editor Play as stream
 ---
 
 ## 19. Known Issues / Open Work
@@ -475,6 +473,9 @@ Feature themes in that tree (Partially tested / needs Play Mode + lab marker ver
 | HARD / live Twitch without explicit ask | **Forbidden** for casual debug |
 | Pure `-forestStreamingSurvival` vs prod StreamOnly | Easy to confuse — prod = StreamOnly + heroes |
 | Growth bottlenecks (acquisition / early retention / watch depth) | See **Growth / Current Product Bottlenecks — Sep 2026** below |
+| Twitch `#stats` truncates at first newline | **Fixed** — goals are single-line; keep PRIVMSG replies one line |
+| Soft-hide cleared `last_action` → idle after reactivation | **Fixed** — preserve action + `restore_actions_from_events` |
+| Shorts capture on `DISPLAY=:1` | **Wrong** — use `:0` + gdm Xauthority (`shorts/capture.env`) |
 
 ---
 
@@ -509,6 +510,87 @@ Recompute CLEAN from the funnel CSV before citing newer numbers.
 | **P3** | Engagement / watch depth | Confirmed symptom; **root cause unknown** |
 
 P1 + P2 drive growth. P3 is measured decline, not yet a proven gameplay verdict.
+
+---
+
+## Growth Analysis Snapshot — 2026-09-12
+
+**Analysis date: 2026-09-12**
+
+Historical baseline from the viewer-funnel export that day. **Do not rewrite** these numbers after later product experiments (e.g. 48h→7d hide). Compare before/after against this snapshot.
+
+### P1 Acquisition
+
+- Twitch-native inflow declining (weekly uniques / CLEAN new creators after W34).
+- Almost no external acquisition channel yet.
+- Primary controllable lever: Shorts/TikTok clip pipeline → CLEAN creators/week.
+
+### P2 Early Retention
+
+- CLEAN real creators **n=57**: returned after 1d **14.0%**; one-day **86.0%**.
+- Progression (wolf/soldier) concentrated among the small returner set.
+- Soft-hide rule **at analysis time: 48h** (correct historical state). Later changed to 7 days as an experiment — snapshot stays 48h.
+
+### P3 Engagement / Watch Depth
+
+- Min/unique and chat volume fell Aug 23 → Sep 06 while unique volume stayed similar.
+- Root cause **UNKNOWN**; Twitch Insights blend autonomous + hosted.
+
+---
+
+### Growth features shipped — 2026-09-12
+
+Verification zip: `artifacts/reports/forest_survival_growth_features_20260912_FINAL.zip`.  
+Lab bot Python: `~/anaconda3/envs/mlagents/bin/python` (**3.10.12**) — not system `/usr/bin/python3` (3.6).
+
+#### 7-day inactivity + reactivation
+
+| Item | Detail |
+|------|--------|
+| Marker | `INACTIVE_HIDE_7D_V1` |
+| Window | `INACTIVE_HIDE_SECONDS = 604800` (was 48h at snapshot) |
+| Soft-hide | Does **not** clear `last_action` (fix: wiped actions → idle followers) |
+| Reactivation | Restores soft-hidden users; `restore_actions_from_events()` recovers last `ss_action` if historically idle |
+| Script | `stream_bot/reactivate_inactivity.py` |
+| Deploy | Lab bot restart + roster resync |
+
+#### Progression goals (`#join` / `#stats`)
+
+| Item | Detail |
+|------|--------|
+| Module | `stream_bot/progression_goals.py` (wired via `format_next_class_hint`) |
+| Label | Always **«Ближайшая цель»** (not «Будущая») + progress bar + `have / need` |
+| Human | Nearest of Wolf vs Builder |
+| Wolf → | Soldier |
+| Soldier → | Robot 150k zombies (no fake `#i_robot`) |
+| Builder → | Upgrade 10k barricades (no fake `#i_builder_upgrade`) |
+| Twitch format | **Single line** (` · ` separators) — PRIVMSG truncates at first `\n` (fix after mysticggx `#stats` only showed title) |
+| Example | `🎯 Ближайшая цель: Builder Upgrade · 🟩… 56% · баррикады 5609 / 10000` |
+
+#### Shorts capture pipeline
+
+| Item | Detail |
+|------|--------|
+| Package | `train_scripts/lab_comp/shorts/` (`interest.py`, `recorder.py`, `daemon.py`, `ui_api.py`, …) |
+| Capture | **ffmpeg x11grab**, independent of OBS StartRecord |
+| Canonical display | `DISPLAY=:0` + `XAUTHORITY=/run/user/1000/gdm/Xauthority` (`capture.env`) — **not** `:1` (MIT-MAGIC-COOKIE failures) |
+| Daemon | `run_shorts_daemon.bash` |
+| UI | Train Lab UI tab **«Shorts со стримов»** (`tab-mode-shorts`); APIs `/api/shorts/*` |
+| Local videos | `.train_lab_ui/shorts/saved/` (gitignored) |
+| Real E2E | PASS — x11grab → scp → sha256 → Play → delete local+lab (`real_e2e_direct.py`) |
+
+#### Analytics / stream mode
+
+| Item | Detail |
+|------|--------|
+| Context | `stream_bot/stream_context.py` |
+| Events | `event_log.py` injects `stream_mode` / `episode_id` into `raw_json` at write time (immutable after) |
+| UI | Shorts tab Stream Mode buttons (default Autonomous) |
+| Secrets | `.env` / `stream_bot/.env` gitignored; do not commit |
+
+#### Still separate (HUD / Unity working tree)
+
+- Core-loop HUD (`CORE_LOOP_HUD_V1`) and related Unity DLL changes remain mainly **working tree / hotpatch** — not claimed fully committed with this growth bot/Shorts push unless Assets are included in the same commit.
 
 ---
 
@@ -586,8 +668,7 @@ Retention method: `events` (`ss_join|ss_action|ss_stats|ss_skin`) vs `first_seen
 First→second visit is the product bottleneck after acquisition. Manual “~20% / ~80%” estimate is **close but superseded** by this CLEAN recompute (**14% / 86%**).
 
 **48h inactivity soft-hide vs schedule (hypothesis)**  
-Actual rule: `INACTIVE_HIDE_SECONDS = 48h` (soft `is_active=0`, row kept). Regular hosted streams: **Tue 17:00** and **Fri 17:00** (~72h apart). A character can leave the active world **before** the next hosted stream.  
-Status: **HYPOTHESIS / retention risk**, not a proven cause of the 14% 1d return.
+**UPDATE (test):** hide window is now **7 days** (`INACTIVE_HIDE_7D_V1`) so Tue/Fri (~72h) returners are not soft-hidden mid-week. Measure CLEAN `returned_after_3d/7d` before/after.
 
 **Unknowns**  
 How many non-returners never saw a clear next unlock; hosted vs 24/7 first session mix; effect of 48h hide on Tue↔Fri returners.
@@ -645,6 +726,20 @@ Clarify autonomous loop in-HUD (AI goal / apocalypse progress / next beat); star
 | Retention | First→second visit loop; test/reconsider 48h active-world hide vs Tue/Fri; explicit progression/next unlock |
 | Engagement | Instantly readable autonomous loop; HUD: AI goal / apocalypse / next event; split autonomous vs hosted metrics |
 
+### Product backlog — active (Sep 2026)
+
+Status after 2026-09-12 growth ship (bot / Shorts / analytics on lab):
+
+| # | Item | Status |
+|---|------|--------|
+| 1 | Core-loop clarity: AI → защита → apocalypse → boss → next | **In progress** — HUD labels (`CORE_LOOP_HUD_V1`); Unity still working-tree |
+| 2 | Character hide 48h → **7 days** (test) | **Deployed** — `INACTIVE_HIDE_7D_V1`; reactivation + action restore |
+| 3 | Explicit nearest goal + bar on `#join` / `#stats` | **Deployed** — one-line Twitch format (`progression_goals.py`) |
+| 4 | HUD: AI goal + progress + apocalypse + next boss + `#i_human` | **Implemented** (layout v6 + help panel) — needs DLL hotpatch verify |
+| 5 | OBS event capture | **Scaffold** — `PresentationObsEventCapture` JSONL + `watch_obs_events.bash` |
+| 6 | Shorts capture + UI sync | **Deployed / E2E PASS** — ffmpeg `:0`; cadence «3/week publish» still manual process |
+| 7 | Analytics: autonomous/hosted at event time | **Deployed** — `stream_mode` / `episode_id` in `raw_json`; Shorts UI mode buttons |
+
 ---
 
 ## 20. Project Conventions
@@ -697,6 +792,11 @@ Assets/ZombieApocalypseDifficulty.cs          # often untracked until commit
 Assets/JackScript.cs / LilyScript.cs / GeorgeScript.cs
 Assets/Editor/CompileStreamingSurvivalDll.cs
 stream_bot/
+stream_bot/progression_goals.py
+stream_bot/stream_context.py
+stream_bot/reactivate_inactivity.py
+train_scripts/lab_comp/shorts/          # ffmpeg capture; capture.env = DISPLAY=:0
+train_scripts/lab_comp/train_lab_ui.py  # Shorts tab + stream mode
 train_scripts/lab_comp/restart_stream_for_run.bash
 train_scripts/lab_comp/stream_onnx_infer.py
 train_scripts/lab_comp/restart_obs.bash

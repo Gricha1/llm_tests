@@ -53,6 +53,12 @@ class ParseTests(unittest.TestCase):
     def test_stats(self):
         self.assertEqual(parse_message("#stats").kind, ParsedKind.STATS)
 
+    def test_unknown_hash_command(self):
+        p = parse_message("#jon")
+        self.assertEqual(p.kind, ParsedKind.UNKNOWN_CMD)
+        self.assertEqual(p.text, "jon")
+        self.assertEqual(parse_message("привет").kind, ParsedKind.IGNORE)
+
     def test_skins_and_human(self):
         self.assertEqual(parse_message("#skins").kind, ParsedKind.SKINS)
         self.assertEqual(
@@ -108,6 +114,7 @@ class StoreSessionTests(unittest.TestCase):
         self.ss.record_stat("stats_user", "water", 3)
         self.ss.record_stat("stats_user", "sheep", 2)
         self.ss.record_stat("stats_user", "campfire", 1)
+        self.ss.record_stat("stats_user", "barricade", 4)
         self.ss.record_stat("stats_user", "food", 9)  # не должно попасть в текст
         reply = self.ss.format_stats_reply("stats_user")
         self.assertIn("вода 3", reply)
@@ -115,6 +122,7 @@ class StoreSessionTests(unittest.TestCase):
         self.assertNotIn("/30000", reply)
         self.assertNotIn("волк", reply.lower())
         self.assertIn("костры 1", reply)
+        self.assertIn("баррикады 4", reply)
         self.assertNotIn("еда", reply)
         self.assertIn("в игре", reply.lower())
         self.assertTrue(self.ss.leave("stats_user"))
@@ -124,11 +132,71 @@ class StoreSessionTests(unittest.TestCase):
         self.assertIsNotNone(row)
         self.assertFalse(bool(int(row.get("is_active") or 0)))
 
-    def test_deactivate_inactive_48h_keeps_db_row(self):
+    def test_top_survival_leaderboard(self):
+        self.ss.join("leader_a")
+        self.ss.join("leader_b")
+        with self.ss._lock:
+            conn = self.ss._connect()
+            try:
+                conn.execute(
+                    """
+                    UPDATE streaming_survival_users
+                    SET total_survival_seconds=7200
+                    WHERE username=?
+                    """,
+                    ("leader_a",),
+                )
+                conn.execute(
+                    """
+                    UPDATE streaming_survival_users
+                    SET total_survival_seconds=1800, is_active=0, session_joined_at=0
+                    WHERE username=?
+                    """,
+                    ("leader_b",),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        top = self.ss.list_top_by_survival_time(limit=5)
+        self.assertGreaterEqual(len(top), 2)
+        self.assertEqual(top[0]["username"], "leader_a")
+        self.assertEqual(top[1]["username"], "leader_b")
+        self.assertFalse(top[1]["is_active"])
+        self.assertIn("ч", top[0]["survival_label"])
+
+    def test_top_zombie_leaderboard(self):
+        self.ss.join("zkill_a")
+        self.ss.join("zkill_b")
+        self.ss.record_stat("zkill_a", "zombie", 12)
+        self.ss.record_stat("zkill_b", "zombie", 3)
+        with self.ss._lock:
+            conn = self.ss._connect()
+            try:
+                conn.execute(
+                    """
+                    UPDATE streaming_survival_users
+                    SET is_active=0, session_joined_at=0
+                    WHERE username=?
+                    """,
+                    ("zkill_b",),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        top = self.ss.list_top_by_zombies(limit=5)
+        self.assertGreaterEqual(len(top), 2)
+        self.assertEqual(top[0]["username"], "zkill_a")
+        self.assertEqual(top[0]["zombies_killed"], 12)
+        self.assertEqual(top[1]["username"], "zkill_b")
+        self.assertFalse(top[1]["is_active"])
+        self.assertIn("зомби", top[0]["survival_label"])
+        self.assertEqual(top[0]["score_label"], top[0]["survival_label"])
+
+    def test_deactivate_inactive_7d_keeps_db_row(self):
         self.ss.join("stale_user")
         self.ss.record_stat("stale_user", "water", 5)
-        # Сдвигаем активность на 49 часов назад.
-        old = time.time() - (49 * 3600)
+        # Сдвигаем активность на 8 дней назад (порог hide = 7d).
+        old = time.time() - (8 * 24 * 3600)
         with self.ss._lock:
             conn = self.ss._connect()
             try:
@@ -143,7 +211,7 @@ class StoreSessionTests(unittest.TestCase):
                 conn.commit()
             finally:
                 conn.close()
-        removed = self.ss.deactivate_inactive(48 * 3600)
+        removed = self.ss.deactivate_inactive(7 * 24 * 3600)
         self.assertIn("stale_user", removed)
         self.assertFalse(self.ss.has_joined("stale_user"))
         row = self.ss.get_user("stale_user")
@@ -152,6 +220,34 @@ class StoreSessionTests(unittest.TestCase):
         # Свежий #join снова выводит в игру
         self.assertTrue(self.ss.join("stale_user"))
         self.assertTrue(self.ss.has_joined("stale_user"))
+
+    def test_stats_counts_as_activity(self):
+        self.ss.join("stats_idle")
+        old = time.time() - (8 * 24 * 3600)
+        with self.ss._lock:
+            conn = self.ss._connect()
+            try:
+                conn.execute(
+                    """
+                    UPDATE streaming_survival_users
+                    SET last_seen_at=?, last_action_changed_at=?, session_joined_at=?
+                    WHERE username=?
+                    """,
+                    (old, old, old, "stats_idle"),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        self.assertTrue(self.ss.touch_activity("stats_idle"))
+        removed = self.ss.deactivate_inactive(7 * 24 * 3600)
+        self.assertNotIn("stats_idle", removed)
+        self.assertTrue(self.ss.has_joined("stats_idle"))
+
+    def test_stats_does_not_rejoin_after_exit(self):
+        self.ss.join("gone")
+        self.ss.leave("gone")
+        self.assertTrue(self.ss.touch_activity("gone"))
+        self.assertFalse(self.ss.has_joined("gone"))
 
 
 class HeuristicDoTests(unittest.TestCase):

@@ -50,12 +50,25 @@ class EventLog:
         message: str = "",
         raw: Optional[Dict[str, Any]] = None,
     ) -> None:
+        # Persist stream_mode / episode_id at event time (not reconstructed later).
+        payload: Dict[str, Any] = dict(raw) if isinstance(raw, dict) else {}
+        if raw is not None and not isinstance(raw, dict):
+            payload = {"raw": raw}
+        try:
+            from stream_bot.stream_context import analytics_context
+
+            ctx = analytics_context()
+            if "stream_mode" not in payload:
+                payload["stream_mode"] = ctx.get("stream_mode")
+            if "episode_id" not in payload and ctx.get("episode_id"):
+                payload["episode_id"] = ctx.get("episode_id")
+        except Exception:
+            payload.setdefault("stream_mode", "autonomous")
         raw_json = ""
-        if raw is not None:
-            try:
-                raw_json = json.dumps(raw, ensure_ascii=False)
-            except (TypeError, ValueError):
-                raw_json = str(raw)
+        try:
+            raw_json = json.dumps(payload, ensure_ascii=False) if payload else ""
+        except (TypeError, ValueError):
+            raw_json = str(payload)
         with self._lock:
             conn = self._connect()
             try:

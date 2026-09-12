@@ -42,7 +42,8 @@ class StreamingSurvivalStore:
                         total_food_collected INTEGER DEFAULT 0,
                         total_sheep_killed INTEGER DEFAULT 0,
                         total_zombies_killed INTEGER DEFAULT 0,
-                        total_campfires_built INTEGER DEFAULT 0
+                        total_campfires_built INTEGER DEFAULT 0,
+                        total_barricades_built INTEGER DEFAULT 0
                     )
                     """
                 )
@@ -74,6 +75,22 @@ class StreamingSurvivalStore:
             conn.execute(
                 "ALTER TABLE streaming_survival_users ADD COLUMN skin TEXT DEFAULT 'human'"
             )
+        if "total_barricades_built" not in cols:
+            conn.execute(
+                "ALTER TABLE streaming_survival_users ADD COLUMN total_barricades_built INTEGER DEFAULT 0"
+            )
+        if "hide_reason" not in cols:
+            conn.execute(
+                "ALTER TABLE streaming_survival_users ADD COLUMN hide_reason TEXT DEFAULT ''"
+            )
+        if "first_join_stream_mode" not in cols:
+            conn.execute(
+                "ALTER TABLE streaming_survival_users ADD COLUMN first_join_stream_mode TEXT DEFAULT ''"
+            )
+        if "first_action_stream_mode" not in cols:
+            conn.execute(
+                "ALTER TABLE streaming_survival_users ADD COLUMN first_action_stream_mode TEXT DEFAULT ''"
+            )
 
     _STAT_FIELDS = {
         "water": "total_water_collected",
@@ -81,6 +98,7 @@ class StreamingSurvivalStore:
         "sheep": "total_sheep_killed",
         "zombie": "total_zombies_killed",
         "campfire": "total_campfires_built",
+        "barricade": "total_barricades_built",
         "wood": "total_wood_collected",
         "round": "total_rounds_participated",
     }
@@ -152,7 +170,7 @@ class StreamingSurvivalStore:
                         UPDATE streaming_survival_users
                         SET is_active=1, last_seen_at=?,
                             twitch_user_id=COALESCE(?, twitch_user_id),
-                            join_source=?
+                            join_source=?, hide_reason=''
                         WHERE username=?
                         """,
                         (now, twitch_user_id or None, src, u),
@@ -164,7 +182,7 @@ class StreamingSurvivalStore:
                         SET is_active=1, last_seen_at=?, session_joined_at=?,
                             twitch_user_id=COALESCE(?, twitch_user_id),
                             last_action='idle', last_action_name='Ждёт у базы',
-                            last_action_changed_at=0, join_source=?
+                            last_action_changed_at=0, join_source=?, hide_reason=''
                         WHERE username=?
                         """,
                         (now, now, twitch_user_id or None, src, u),
@@ -198,7 +216,8 @@ class StreamingSurvivalStore:
                     UPDATE streaming_survival_users
                     SET is_active=0, last_seen_at=?, last_action='idle',
                         last_action_name='Ждёт у базы',
-                        total_survival_seconds=?, session_joined_at=0
+                        total_survival_seconds=?, session_joined_at=0,
+                        hide_reason='exit'
                     WHERE username=?
                     """,
                     (now, total, u),
@@ -208,8 +227,10 @@ class StreamingSurvivalStore:
             finally:
                 conn.close()
 
-    # 48 часов без активности (#join / #do / last_seen) → скрыть из мира, БД оставить.
-    INACTIVE_HIDE_SECONDS = 48 * 3600
+    # Soft-hide из мира (строка в БД остаётся). TEST: 7 дней (было 48ч).
+    # Tue/Fri hosted loop ≈72ч — 48ч прятал персонажа до следующего стрима.
+    INACTIVE_HIDE_SECONDS = 7 * 24 * 3600
+    INACTIVE_HIDE_MARKER = "INACTIVE_HIDE_7D_V1"
 
     def deactivate_inactive(
         self, max_idle_seconds: Optional[float] = None
@@ -255,9 +276,9 @@ class StreamingSurvivalStore:
                     conn.execute(
                         """
                         UPDATE streaming_survival_users
-                        SET is_active=0, last_action='idle',
-                            last_action_name='Ждёт у базы',
-                            total_survival_seconds=?, session_joined_at=0
+                        SET is_active=0,
+                            total_survival_seconds=?, session_joined_at=0,
+                            hide_reason='inactivity'
                         WHERE username=? AND is_active=1
                         """,
                         (total, u),
@@ -266,6 +287,157 @@ class StreamingSurvivalStore:
                 if removed:
                     conn.commit()
                 return removed
+            finally:
+                conn.close()
+
+    def reactivate_inactivity_within_window(
+        self, window_seconds: Optional[float] = None
+    ) -> Dict[str, Any]:
+        """Re-activate soft-hidden users whose last activity is still inside the hide window.
+
+        Explicit #exit (hide_reason='exit') are never restored.
+        Historical rows without hide_reason are treated as inactivity unless last leave was exit.
+        """
+        window = float(
+            self.INACTIVE_HIDE_SECONDS if window_seconds is None else window_seconds
+        )
+        cutoff = time.time() - window
+        eligible: List[str] = []
+        reactivated: List[str] = []
+        with self._lock:
+            conn = self._connect()
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT username, hide_reason, last_seen_at, last_action_changed_at,
+                           session_joined_at, is_active
+                    FROM streaming_survival_users
+                    WHERE is_active=0
+                    """
+                ).fetchall()
+                for row in rows:
+                    u = str(row["username"] or "").strip()
+                    if not u:
+                        continue
+                    reason = str(row["hide_reason"] or "").strip().lower()
+                    if reason == "exit":
+                        continue
+                    # Only inactivity (explicit or legacy empty).
+                    if reason and reason not in ("inactivity", "inactive", "soft_hide"):
+                        continue
+                    last_activity = max(
+                        float(row["last_seen_at"] or 0),
+                        float(row["last_action_changed_at"] or 0),
+                        float(row["session_joined_at"] or 0),
+                    )
+                    if last_activity < cutoff:
+                        continue
+                    eligible.append(u)
+                    # Keep last_action as-is (do not force idle). Soft-hide must not
+                    # wipe what the follower was doing — they resume after reactivation.
+                    conn.execute(
+                        """
+                        UPDATE streaming_survival_users
+                        SET is_active=1, hide_reason=''
+                        WHERE username=? AND is_active=0
+                          AND COALESCE(hide_reason,'') != 'exit'
+                        """,
+                        (u,),
+                    )
+                    reactivated.append(u)
+                if reactivated:
+                    conn.commit()
+            finally:
+                conn.close()
+        # If historical soft-hide already wiped actions to idle, recover from events.
+        restored = self.restore_actions_from_events(reactivated)
+        out = {
+            "eligible_for_reactivation_count": len(eligible),
+            "actually_reactivated_count": len(reactivated),
+            "usernames": reactivated,
+            "restored_actions": restored,
+            "window_seconds": window,
+            "marker": self.INACTIVE_HIDE_MARKER,
+        }
+        return out
+
+    def restore_actions_from_events(self, usernames: Optional[List[str]] = None) -> Dict[str, str]:
+        """For active idle users, restore last non-idle ss_action from event log."""
+        from stream_bot.validator import ACTION_NAMES_RU
+
+        restored_map: Dict[str, str] = {}
+        with self._lock:
+            conn = self._connect()
+            try:
+                if usernames:
+                    rows = []
+                    for name in usernames:
+                        r = conn.execute(
+                            "SELECT username, last_action FROM streaming_survival_users WHERE username=? AND is_active=1",
+                            (name.lower().strip(),),
+                        ).fetchone()
+                        if r:
+                            rows.append(r)
+                else:
+                    rows = conn.execute(
+                        """
+                        SELECT username, last_action FROM streaming_survival_users
+                        WHERE is_active=1 AND COALESCE(last_action,'idle') IN ('','idle')
+                        """
+                    ).fetchall()
+                for row in rows:
+                    u = str(row["username"] or "").strip()
+                    if not u:
+                        continue
+                    act = str(row["last_action"] or "idle").strip().lower()
+                    if act and act != "idle":
+                        continue
+                    ev = conn.execute(
+                        """
+                        SELECT message FROM events
+                        WHERE username=? AND type='ss_action'
+                          AND message IS NOT NULL AND TRIM(message) != ''
+                          AND LOWER(TRIM(message)) != 'idle'
+                        ORDER BY id DESC LIMIT 1
+                        """,
+                        (u,),
+                    ).fetchone()
+                    if not ev:
+                        continue
+                    action = str(ev["message"] or "").strip().lower()
+                    if not action or action == "idle":
+                        continue
+                    action_name = ACTION_NAMES_RU.get(action) or action
+                    conn.execute(
+                        """
+                        UPDATE streaming_survival_users
+                        SET last_action=?, last_action_name=?
+                        WHERE username=? AND is_active=1
+                        """,
+                        (action, action_name, u),
+                    )
+                    restored_map[u] = action
+                if restored_map:
+                    conn.commit()
+            finally:
+                conn.close()
+        return restored_map
+
+    def touch_activity(self, username: str) -> bool:
+        """Обновить last_seen_at. Не реактивирует вышедших (#exit / 48ч)."""
+        u = username.lower().strip()
+        if not u:
+            return False
+        now = time.time()
+        with self._lock:
+            conn = self._connect()
+            try:
+                cur = conn.execute(
+                    "UPDATE streaming_survival_users SET last_seen_at=? WHERE username=?",
+                    (now, u),
+                )
+                conn.commit()
+                return int(cur.rowcount or 0) > 0
             finally:
                 conn.close()
 
@@ -359,6 +531,7 @@ class StreamingSurvivalStore:
                    last_action_changed_at, is_active, join_source,
                    total_water_collected, total_wood_collected, total_food_collected,
                    total_sheep_killed, total_zombies_killed, total_campfires_built,
+                   total_barricades_built,
                    total_rounds_participated,
                    total_survival_seconds
             FROM streaming_survival_users
@@ -429,6 +602,7 @@ class StreamingSurvivalStore:
             "total_sheep_killed",
             "total_zombies_killed",
             "total_campfires_built",
+            "total_barricades_built",
             "total_rounds_participated",
         }
         if field not in allowed:
@@ -465,6 +639,75 @@ class StreamingSurvivalStore:
             return total
         return total + max(0.0, time.time() - session_start)
 
+    def list_top_by_survival_time(
+        self,
+        *,
+        limit: int = 5,
+        chat_only: bool = True,
+        hide_test: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """Топ-N по суммарному времени в игре (включая неактивных)."""
+        limit = max(1, min(int(limit or 5), 20))
+        players = self.list_players(
+            active_only=False, chat_only=chat_only, hide_test=hide_test
+        )
+        players.sort(
+            key=lambda p: float(p.get("survival_seconds") or 0), reverse=True
+        )
+        out: List[Dict[str, Any]] = []
+        for row in players:
+            secs = float(row.get("survival_seconds") or 0)
+            if secs <= 0:
+                continue
+            out.append(
+                {
+                    "rank": len(out) + 1,
+                    "username": row.get("username") or "",
+                    "survival_seconds": secs,
+                    "survival_label": self.format_duration(secs),
+                    "is_active": bool(row.get("is_active")),
+                }
+            )
+            if len(out) >= limit:
+                break
+        return out
+
+    def list_top_by_zombies(
+        self,
+        *,
+        limit: int = 5,
+        chat_only: bool = True,
+        hide_test: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """Топ-N по убийствам зомби (включая неактивных)."""
+        limit = max(1, min(int(limit or 5), 20))
+        players = self.list_players(
+            active_only=False, chat_only=chat_only, hide_test=hide_test
+        )
+        players.sort(
+            key=lambda p: int(p.get("total_zombies_killed") or 0), reverse=True
+        )
+        out: List[Dict[str, Any]] = []
+        for row in players:
+            kills = int(row.get("total_zombies_killed") or 0)
+            if kills <= 0:
+                continue
+            label = f"{kills} зомби"
+            out.append(
+                {
+                    "rank": len(out) + 1,
+                    "username": row.get("username") or "",
+                    "zombies_killed": kills,
+                    "score_label": label,
+                    # HUD/старый парсер читает survival_label как подпись строки.
+                    "survival_label": label,
+                    "is_active": bool(row.get("is_active")),
+                }
+            )
+            if len(out) >= limit:
+                break
+        return out
+
     @staticmethod
     def format_duration(seconds: float) -> str:
         s = max(0, int(seconds))
@@ -484,12 +727,12 @@ class StreamingSurvivalStore:
         if not row:
             return "human"
         skin = (row.get("skin") or "human").strip().lower()
-        return skin if skin in ("human", "wolf") else "human"
+        return skin if skin in ("human", "wolf", "soldier", "builder") else "human"
 
     def set_skin(self, username: str, skin: str) -> None:
         u = username.lower().strip()
         skin = (skin or "human").strip().lower()
-        if skin not in ("human", "wolf"):
+        if skin not in ("human", "wolf", "soldier", "builder"):
             skin = "human"
         with self._lock:
             conn = self._connect()
@@ -508,6 +751,79 @@ class StreamingSurvivalStore:
             return 0
         return int(row.get("total_sheep_killed") or 0)
 
+    def zombies_killed(self, username: str) -> int:
+        row = self.get_user(username)
+        if not row:
+            return 0
+        return int(row.get("total_zombies_killed") or 0)
+
+    def wood_collected(self, username: str) -> int:
+        row = self.get_user(username)
+        if not row:
+            return 0
+        return int(row.get("total_wood_collected") or 0)
+
+    def water_collected(self, username: str) -> int:
+        row = self.get_user(username)
+        if not row:
+            return 0
+        return int(row.get("total_water_collected") or 0)
+
+    def format_next_class_hint(self, username: str) -> str:
+        """Nearest progression goal (centralized resolver). Shown on #join / #stats only."""
+        from stream_bot.progression_goals import format_goal_message
+
+        row = self.get_user(username)
+        return format_goal_message(row)
+
+    def note_first_join_stream_mode(self, username: str, mode: str) -> None:
+        u = username.lower().strip()
+        m = (mode or "").strip().lower()
+        if not u or not m:
+            return
+        with self._lock:
+            conn = self._connect()
+            try:
+                row = conn.execute(
+                    "SELECT first_join_stream_mode FROM streaming_survival_users WHERE username=?",
+                    (u,),
+                ).fetchone()
+                if row is None:
+                    return
+                if str(row["first_join_stream_mode"] or "").strip():
+                    return
+                conn.execute(
+                    "UPDATE streaming_survival_users SET first_join_stream_mode=? WHERE username=?",
+                    (m, u),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+    def note_first_action_stream_mode(self, username: str, mode: str) -> None:
+        u = username.lower().strip()
+        m = (mode or "").strip().lower()
+        if not u or not m:
+            return
+        with self._lock:
+            conn = self._connect()
+            try:
+                row = conn.execute(
+                    "SELECT first_action_stream_mode FROM streaming_survival_users WHERE username=?",
+                    (u,),
+                ).fetchone()
+                if row is None:
+                    return
+                if str(row["first_action_stream_mode"] or "").strip():
+                    return
+                conn.execute(
+                    "UPDATE streaming_survival_users SET first_action_stream_mode=? WHERE username=?",
+                    (m, u),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
     def format_stats_reply(self, username: str) -> str:
         row = self.get_user(username)
         if not row:
@@ -520,8 +836,11 @@ class StreamingSurvivalStore:
         sheep = int(row.get("total_sheep_killed") or 0)
         zombies = int(row.get("total_zombies_killed") or 0)
         fires = int(row.get("total_campfires_built") or 0)
+        barricades = int(row.get("total_barricades_built") or 0)
         in_game = " (в игре)" if int(row.get("is_active") or 0) == 1 else ""
+        next_class = self.format_next_class_hint(username)
         return (
             f"@{name}{in_game}: в игре {alive} · вода {water} · дерево {wood} · "
-            f"овцы {sheep} · зомби {zombies} · костры {fires}"
+            f"овцы {sheep} · зомби {zombies} · костры {fires} · баррикады {barricades}. "
+            f"{next_class}"
         )

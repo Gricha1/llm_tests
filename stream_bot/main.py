@@ -13,7 +13,15 @@ from typing import Any, Deque, Dict, List, Optional
 
 from stream_bot.command_parser import (
     AVAILABLE_ACTIONS,
+    BUILDER_FORBIDDEN_ACTIONS,
+    BUILDER_FORBIDDEN_DENIED,
+    BUILDER_NEED_JOIN,
+    BUILDER_NEED_RESOURCES,
+    BUILDER_OK,
+    BUILDER_WATER_REQUIREMENT,
+    BUILDER_WOOD_REQUIREMENT,
     CHAT_TIPS,
+    COMBAT_SKIN_GATHER_ACTIONS,
     DO_EMPTY,
     EXIT_NOT_IN,
     EXIT_OK,
@@ -25,7 +33,11 @@ from stream_bot.command_parser import (
     JOIN_OK,
     JOIN_PROMPT,
     SKINS_HELP,
-    UNKNOWN_DO_HINT,
+    SOLDIER_GATHER_DENIED,
+    SOLDIER_NEED_JOIN,
+    SOLDIER_NEED_ZOMBIES,
+    SOLDIER_OK,
+    SOLDIER_ZOMBIE_REQUIREMENT,
     WOLF_GATHER_ACTIONS,
     WOLF_GATHER_DENIED,
     WOLF_NEED_JOIN,
@@ -36,6 +48,8 @@ from stream_bot.command_parser import (
     available_actions_text,
     cooldown_reply,
     parse_message,
+    unknown_command_reply,
+    unknown_do_hint,
 )
 from stream_bot.config import load_config
 from stream_bot.event_log import EventLog
@@ -158,6 +172,29 @@ class StreamBot:
             tmp.replace(path)
         except OSError as exc:
             log.warning("roster json write failed: %s", exc)
+        self._publish_time_leaderboard()
+
+    def _publish_time_leaderboard(self) -> None:
+        rows = self.ss.list_top_by_zombies(limit=5)
+        payload = {
+            "type": "streaming_survival_time_leaderboard",
+            "metric": "zombies",
+            "updated_at": time.time(),
+            "leaderboard": rows,
+            "count": len(rows),
+        }
+        path = self._roster_json.parent / "stream_time_leaderboard.json"
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(path)
+        except OSError as exc:
+            log.warning("time leaderboard json write failed: %s", exc)
+        try:
+            self.unity.send_payload(payload)
+        except Exception:
+            log.exception("time leaderboard udp failed")
 
     def resync_roster(self) -> Dict[str, Any]:
         """Повторно отправить список игроков в Unity (после рестарта стрима)."""
@@ -168,7 +205,7 @@ class StreamBot:
         for u in self.ss.list_active():
             user = u.get("username") or ""
             skin = (u.get("skin") or self.ss.get_skin(user) or "human").strip().lower()
-            if skin not in ("human", "wolf"):
+            if skin not in ("human", "wolf", "soldier", "builder"):
                 skin = "human"
             self.unity.send_payload(
                 {
@@ -180,8 +217,10 @@ class StreamBot:
             action = (u.get("action") or "idle").strip() or "idle"
             if action == "idle":
                 continue
-            # Волк + добыча — не слать (Unity/бот всё равно запретят).
-            if skin == "wolf" and action in WOLF_GATHER_ACTIONS:
+            # Волк/солдат + добыча — не слать (Unity/бот всё равно запретят).
+            if skin in ("wolf", "soldier") and action in COMBAT_SKIN_GATHER_ACTIONS:
+                continue
+            if skin == "builder" and action in BUILDER_FORBIDDEN_ACTIONS:
                 continue
             self.unity.send_payload(
                 {
@@ -207,17 +246,43 @@ class StreamBot:
         }
 
     def prune_inactive_players(self, *, force: bool = False) -> Dict[str, Any]:
-        """Скрыть из мира тех, у кого нет активности 48ч. В БД остаются."""
+        """Скрыть из мира тех, у кого нет активности INACTIVE_HIDE_SECONDS. В БД остаются.
+
+        Also reactivates soft-hidden (non-exit) users still inside the 7d window
+        (e.g. after 48h→7d rule change).
+        """
         now = time.time()
         if not force and (now - self._last_inactive_prune) < self.inactive_prune_interval_seconds:
-            return {"ok": True, "skipped": True, "removed": []}
+            return {"ok": True, "skipped": True, "removed": [], "reactivated": []}
         self._last_inactive_prune = now
+        reactivated_info = self.ss.reactivate_inactivity_within_window(
+            self.inactive_hide_seconds
+        )
+        if reactivated_info.get("usernames"):
+            self._send_users_sync()
+            self._persist_roster()
+            log.info(
+                "inactive reactivate (%sh window): %s",
+                int(self.inactive_hide_seconds / 3600),
+                reactivated_info.get("usernames"),
+            )
+            for name in reactivated_info.get("usernames") or []:
+                self.events.log(
+                    "ss_inactive_reactivate",
+                    username=name,
+                    message="within_7d_window",
+                )
         removed = self.ss.deactivate_inactive(self.inactive_hide_seconds)
         for name in removed:
             self.unity.send_payload(
                 {"type": "streaming_survival_user_left", "username": name}
             )
-            self.events.log("ss_inactive_hide", username=name, message="48h idle")
+            self.events.log(
+                "ss_inactive_hide",
+                username=name,
+                message=f"{int(self.inactive_hide_seconds / 3600)}h idle",
+                raw={"hide_reason": "inactivity"},
+            )
         if removed:
             self._send_users_sync()
             self._persist_roster()
@@ -226,7 +291,13 @@ class StreamBot:
                 int(self.inactive_hide_seconds / 3600),
                 removed,
             )
-        return {"ok": True, "removed": removed, "idle_hours": self.inactive_hide_seconds / 3600.0}
+        return {
+            "ok": True,
+            "removed": removed,
+            "reactivated": reactivated_info.get("usernames") or [],
+            "reactivation": reactivated_info,
+            "idle_hours": self.inactive_hide_seconds / 3600.0,
+        }
 
     def list_players(self, *, active_only: bool = False) -> Dict[str, Any]:
         players = self.ss.list_players(
@@ -239,6 +310,14 @@ class StreamBot:
             "active_count": sum(1 for p in players if p.get("is_active")),
             "db_path": self.cfg.db_path,
         }
+
+    def leaderboard_time(self, *, limit: int = 5) -> Dict[str, Any]:
+        """Legacy endpoint name — топ по убийствам зомби."""
+        return self.leaderboard_zombies(limit=limit)
+
+    def leaderboard_zombies(self, *, limit: int = 5) -> Dict[str, Any]:
+        rows = self.ss.list_top_by_zombies(limit=limit)
+        return {"ok": True, "metric": "zombies", "leaderboard": rows, "count": len(rows)}
 
     def prune_roster(self) -> Dict[str, Any]:
         """Убрать debug/test из roster и с Unity; остаются только Twitch chat."""
@@ -334,7 +413,7 @@ class StreamBot:
         self._tick_thread.start()
         self._push_event("start", message="streaming survival bot")
         # Keep whoever already #join'ed (restart must not kick the live stream),
-        # but drop 48h-idle bodies so they do not clutter the yard.
+        # Drop long-idle bodies so they do not clutter the yard (default 7d hide).
         self.prune_inactive_players(force=True)
         self._send_users_sync()
         self._persist_roster()
@@ -352,6 +431,8 @@ class StreamBot:
             log.exception("unity close")
 
     def _tick_loop(self) -> None:
+        last_lb = 0.0
+        last_llm_hb = 0.0
         while not self._stop.is_set():
             try:
                 self.prune_inactive_players(force=False)
@@ -359,6 +440,22 @@ class StreamBot:
                     self._maybe_welcome()
                     self._maybe_chat_tip()
                     self._maybe_watchtime_tick()
+                now = time.time()
+                if now - last_lb >= 30.0:
+                    self._publish_time_leaderboard()
+                    last_lb = now
+                if now - last_llm_hb >= 5.0:
+                    try:
+                        from stream_bot.llm_client import llm_heartbeat
+                        q = 0
+                        try:
+                            q = int(getattr(self, "pending_llm_count", 0) or 0)
+                        except Exception:
+                            q = 0
+                        llm_heartbeat(queue_depth=q)
+                    except Exception:
+                        pass
+                    last_llm_hb = now
             except Exception:
                 log.exception("tick failed")
                 self.last_error = "tick failed"
@@ -474,6 +571,15 @@ class StreamBot:
 
             if parsed.kind == ParsedKind.IGNORE:
                 return out
+            if parsed.kind == ParsedKind.UNKNOWN_CMD:
+                self._reply(
+                    user,
+                    unknown_command_reply(parsed.text or ""),
+                    source,
+                    out,
+                    to_twitch=(source == "chat"),
+                )
+                return out
             if parsed.kind == ParsedKind.NEED_JOIN:
                 self._reply(user, JOIN_PROMPT, source, out)
                 return out
@@ -502,13 +608,21 @@ class StreamBot:
                 self._handle_stats(user, source, out)
                 return out
             if parsed.kind == ParsedKind.SKINS:
+                self.ss.touch_activity(user)
+                self.unity.send_payload({"type": "streaming_survival_show_skins"})
                 self._reply(user, SKINS_HELP, source, out, to_twitch=(source == "chat"))
                 return out
             if parsed.kind == ParsedKind.I_WOLF:
                 self._handle_i_wolf(user, source, out)
                 return out
+            if parsed.kind == ParsedKind.I_SOLDIER:
+                self._handle_i_soldier(user, source, out)
+                return out
             if parsed.kind == ParsedKind.I_HUMAN:
                 self._handle_i_human(user, source, out)
+                return out
+            if parsed.kind == ParsedKind.I_BUILDER:
+                self._handle_i_builder(user, source, out)
                 return out
             if parsed.kind == ParsedKind.DO:
                 if source == "local_debug" and self.listen_stream:
@@ -579,8 +693,25 @@ class StreamBot:
         self._persist_roster()
         twitch_ack = source == "chat"
         if first:
-            self._reply(user, JOIN_OK, source, out, to_twitch=twitch_ack)
-            self.events.log("ss_join", username=user, message="joined")
+            hint = self.ss.format_next_class_hint(user)
+            self._reply(
+                user,
+                f"{JOIN_OK} {hint}",
+                source,
+                out,
+                to_twitch=twitch_ack,
+            )
+            try:
+                from stream_bot.progression_goals import goal_analytics_payload
+                from stream_bot.stream_context import get_stream_mode
+
+                mode = get_stream_mode()
+                self.ss.note_first_join_stream_mode(user, mode)
+                goal_raw = goal_analytics_payload(self.ss.get_user(user), goal_source="join")
+                goal_raw["first_join_stream_mode"] = mode
+                self.events.log("ss_join", username=user, message="joined", raw=goal_raw)
+            except Exception:
+                self.events.log("ss_join", username=user, message="joined")
         else:
             self._reply(user, JOIN_ALREADY, source, out, to_twitch=twitch_ack)
 
@@ -599,9 +730,16 @@ class StreamBot:
         self.events.log("ss_leave", username=user, message="left")
 
     def _handle_stats(self, user: str, source: str, out: Dict[str, Any]) -> None:
+        self.ss.touch_activity(user)
         reply = self.ss.format_stats_reply(user)
         self._reply(user, reply, source, out, to_twitch=(source == "chat"))
-        self.events.log("ss_stats", username=user, message=reply[:120])
+        try:
+            from stream_bot.progression_goals import goal_analytics_payload
+
+            raw = goal_analytics_payload(self.ss.get_user(user), goal_source="stats")
+            self.events.log("ss_stats", username=user, message=reply[:120], raw=raw)
+        except Exception:
+            self.events.log("ss_stats", username=user, message=reply[:120])
 
     def _handle_i_wolf(self, user: str, source: str, out: Dict[str, Any]) -> None:
         if not self.ss.has_joined(user):
@@ -629,6 +767,32 @@ class StreamBot:
         self._reply(user, WOLF_OK, source, out, to_twitch=(source == "chat"))
         self.events.log("ss_skin", username=user, message="wolf")
 
+    def _handle_i_soldier(self, user: str, source: str, out: Dict[str, Any]) -> None:
+        if not self.ss.has_joined(user):
+            self._reply(user, SOLDIER_NEED_JOIN, source, out)
+            return
+        zombies = self.ss.zombies_killed(user)
+        if zombies < SOLDIER_ZOMBIE_REQUIREMENT:
+            self._reply(
+                user,
+                SOLDIER_NEED_ZOMBIES.format(zombies=zombies),
+                source,
+                out,
+                to_twitch=(source == "chat"),
+            )
+            return
+        payload = {
+            "type": "streaming_survival_skin",
+            "username": user,
+            "skin": "soldier",
+        }
+        self.unity.send_payload(payload)
+        out["unity_commands"].append(payload)
+        out["sent_to_unity"] = True
+        self.ss.set_skin(user, "soldier")
+        self._reply(user, SOLDIER_OK, source, out, to_twitch=(source == "chat"))
+        self.events.log("ss_skin", username=user, message="soldier")
+
     def _handle_i_human(self, user: str, source: str, out: Dict[str, Any]) -> None:
         if not self.ss.has_joined(user):
             self._reply(user, HUMAN_NEED_JOIN, source, out)
@@ -644,6 +808,33 @@ class StreamBot:
         self.ss.set_skin(user, "human")
         self._reply(user, HUMAN_OK, source, out, to_twitch=(source == "chat"))
         self.events.log("ss_skin", username=user, message="human")
+
+    def _handle_i_builder(self, user: str, source: str, out: Dict[str, Any]) -> None:
+        if not self.ss.has_joined(user):
+            self._reply(user, BUILDER_NEED_JOIN, source, out)
+            return
+        wood = self.ss.wood_collected(user)
+        water = self.ss.water_collected(user)
+        if wood < BUILDER_WOOD_REQUIREMENT or water < BUILDER_WATER_REQUIREMENT:
+            self._reply(
+                user,
+                BUILDER_NEED_RESOURCES.format(wood=wood, water=water),
+                source,
+                out,
+                to_twitch=(source == "chat"),
+            )
+            return
+        payload = {
+            "type": "streaming_survival_skin",
+            "username": user,
+            "skin": "builder",
+        }
+        self.unity.send_payload(payload)
+        out["unity_commands"].append(payload)
+        out["sent_to_unity"] = True
+        self.ss.set_skin(user, "builder")
+        self._reply(user, BUILDER_OK, source, out, to_twitch=(source == "chat"))
+        self.events.log("ss_skin", username=user, message="builder")
 
     def _handle_do(self, user: str, text: str, source: str, out: Dict[str, Any]) -> None:
         if not self.ss.has_joined(user):
@@ -672,7 +863,7 @@ class StreamBot:
                 raw = None
         if raw is None or _llm_did_not_understand(raw, tag):
             log.info("unrecognized #do user=%s text=%s", user, text[:80])
-            self._reply(user, UNKNOWN_DO_HINT, source, out, to_twitch=True)
+            self._reply(user, unknown_do_hint(self.ss.get_skin(user)), source, out, to_twitch=True)
             out["system_summary"] = "unrecognized_do_hint"
             return
 
@@ -681,16 +872,23 @@ class StreamBot:
         out["validator_result"] = {"ok": vr.ok, "reason": vr.reason}
         if not vr.ok or not vr.payload:
             log.info("invalid #do user=%s reason=%s", user, vr.reason)
-            self._reply(user, UNKNOWN_DO_HINT, source, out, to_twitch=True)
+            self._reply(user, unknown_do_hint(self.ss.get_skin(user)), source, out, to_twitch=True)
             out["system_summary"] = "invalid_do_hint"
             return
 
         payload = vr.payload
         action = (payload.get("action") or "").strip().lower()
-        if self.ss.get_skin(user) == "wolf" and action in WOLF_GATHER_ACTIONS:
-            self._reply(user, WOLF_GATHER_DENIED, source, out, to_twitch=(source == "chat"))
+        skin = self.ss.get_skin(user)
+        if skin in ("wolf", "soldier") and action in COMBAT_SKIN_GATHER_ACTIONS:
+            deny = WOLF_GATHER_DENIED if skin == "wolf" else SOLDIER_GATHER_DENIED
+            self._reply(user, deny, source, out, to_twitch=(source == "chat"))
             out["ok"] = False
-            out["system_summary"] = "wolf_gather_denied"
+            out["system_summary"] = f"{skin}_gather_denied"
+            return
+        if skin == "builder" and action in BUILDER_FORBIDDEN_ACTIONS:
+            self._reply(user, BUILDER_FORBIDDEN_DENIED, source, out, to_twitch=(source == "chat"))
+            out["ok"] = False
+            out["system_summary"] = "builder_forbid_denied"
             return
 
         self.ss.set_action(user, payload["action"], payload["action_name"])
@@ -699,6 +897,15 @@ class StreamBot:
         out["sent_to_unity"] = True
         out["system_summary"] = f"action={payload['action']} name={payload['action_name']}"
         self._send_users_sync()
+        try:
+            from stream_bot.stream_context import get_stream_mode
+
+            mode = get_stream_mode()
+            self.ss.note_first_action_stream_mode(user, mode)
+            payload = dict(payload)
+            payload.setdefault("stream_mode", mode)
+        except Exception:
+            pass
         self.events.log("ss_action", username=user, message=payload["action"], raw=payload)
         self._push_event("ss_action", message=payload["action"], username=user, source=tag)
         self._reply(user, str(payload.get("chat_reply") or ""), source, out)

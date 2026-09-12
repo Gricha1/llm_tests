@@ -32,6 +32,7 @@ ALLOWED_ACTIONS = frozenset(
         "idle",
         "attack_user",
         "kill_zombie",
+        "build_walls",
     }
 )
 
@@ -53,6 +54,7 @@ KEEP_FARM_ACTIONS = frozenset(
         "kill_sheep",
         "kill_zombie",
         "build_campfire",
+        "build_walls",
     }
 )
 
@@ -80,6 +82,7 @@ ACTION_NAMES_RU = {
     "idle": "Ждёт у базы",
     "attack_user": "Атакует игрока",
     "kill_zombie": "Бьёт зомби",
+    "build_walls": "Ставит стены",
 }
 
 FALLBACK_REPLY = "Не понял точно, персонаж будет ждать у базы."
@@ -106,6 +109,7 @@ _CANONICAL = frozenset(
         "idle",
         "attack_user",
         "kill_zombie",
+        "build_walls",
     }
 )
 
@@ -318,6 +322,21 @@ def _detect_action(t: str) -> Optional[str]:
     )
     build = bool(_BUILD_CAMP.search(t))
 
+    # Walls / barricades — before campfire so «ставь стены» ≠ костёр.
+    # «барикад» (1×р) — частая опечатка vs «баррикад».
+    if re.search(r"стен|wall|бар+икад|барикад|barrier|огражд|забор", t) and (
+        build
+        or re.search(r"ставь|поставь|строй|build|возвед", t)
+        or re.search(r"build_walls", t)
+    ):
+        return "build_walls"
+    if re.search(
+        r"build_walls|ставь\s+стен|поставь\s+стен|строй\s+стен|"
+        r"ставь\s+бар+икад|ставь\s+барикад|поставь\s+бар+икад|поставь\s+барикад",
+        t,
+    ):
+        return "build_walls"
+
     # Campfire: build vs go_to
     if _has_campfire(t):
         if build or re.search(r"ставь|поставь|развед", t):
@@ -382,6 +401,7 @@ def _detect_action(t: str) -> Optional[str]:
         "go_to_tree",
         "go_to_sheep",
         "kill_zombie",
+        "build_walls",
         "go_to_base",
         "go_home",
         "collect_water",
