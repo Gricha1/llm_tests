@@ -7,8 +7,9 @@ Companion handoff (also living): `docs/LAB_ARCHITECTURE.md` (may be untracked un
 
 Document snapshot context:
 - Branch: `forest_survival` (tracks `main/forest_survival`)
-- Doc refresh: **2026-09-12** — growth features shipped (7d hide, progression goals, Shorts, stream_mode). See **Growth features shipped — 2026-09-12** below.
-- Prior committed HEAD before this push: `9ea649c` — docs growth bottlenecks; gameplay Builder/Apocalypse/L-menu still largely working-tree. See §17–§18.
+- Doc refresh: **2026-09-13** — local disk cleanup (~10 GB free → ~197 GB); growth features already on `1d1f26b`.
+- Growth ship (2026-09-12): 7d hide, progression goals, Shorts, stream_mode — see **Growth features shipped — 2026-09-12**.
+- Gameplay Builder/Apocalypse/L-menu still largely working-tree. See §17–§18.
 
 ---
 
@@ -425,7 +426,8 @@ Separate issue: Unity can still stall (`Gfx.WaitForPresent`) even while NVIDIA r
 
 | Commit | Date | Title / impact |
 |--------|------|----------------|
-| *(this push)* | 2026-09-12 | Growth: 7d hide, progression goals, Shorts pipeline, stream_mode analytics + `forest_survival.md` |
+| *(this push)* | 2026-09-13 | docs: local disk cleanup (~197 GB free); preserve stats DBs |
+| `1d1f26b` | 2026-09-12 | Growth: 7d hide, progression goals, Shorts pipeline, stream_mode analytics + md |
 | `9ea649c` | 2026-09-12 | docs: add current growth bottlenecks |
 | `f522b36` | 2026-09 | docs: add ForestSurvival project context |
 | `883433c` | 2026-08-28 | Shirtless zombie apocalypse mix, wolf/death combat, roster revive on resync |
@@ -476,6 +478,32 @@ Feature themes still mainly working-tree (Partially tested / needs Play Mode + l
 | Twitch `#stats` truncates at first newline | **Fixed** — goals are single-line; keep PRIVMSG replies one line |
 | Soft-hide cleared `last_action` → idle after reactivation | **Fixed** — preserve action + `restore_actions_from_events` |
 | Shorts capture on `DISPLAY=:1` | **Wrong** — use `:0` + gdm Xauthority (`shorts/capture.env`) |
+| Local disk nearly full (~10 GB free, 2026-09-13) | **Cleaned** — see **Local disk cleanup — 2026-09-13** below |
+
+---
+
+## Local disk cleanup — 2026-09-13
+
+**Before:** ~10–11 GB free on `C:` (drive ~476 GB).  
+**After:** ~197 GB free.  
+**Preserved:** `stream_bot.sqlite3`, `artifacts/analytics/stream_bot_lab_readonly_20260912.sqlite3` (viewer stats DBs). Final `.onnx` kept under `results/*/`.
+
+| Action | Approx freed | Notes |
+|--------|-------------:|-------|
+| Delete `C:\Grisha\unity_projects\_fs_build_tmp` | ~90 GB | Full duplicate of forest_survival + `results` (Aug build tmp) |
+| Strip `results/*/videos` (frame `.jpg` dumps) | ~38+ GB | e.g. run_2/run_40 ~14 GB each |
+| Delete `results/**/*.pt` checkpoints | (incl. in strip) | **7328** `.pt` removed; **7273** `.onnx` kept |
+| Downloads: ubuntu ISO + 2 large mp4 | ~13.5 GB | install ISO + `part1_.mp4` + Telegram Desktop mp4 |
+| `AppData\Local\Temp` (>2d old) | ~2.2 GB | |
+| Repo root `.tmp_*` / `.chat_*` junk | ~15 MB | |
+
+Log: `artifacts/disk_cleanup_20260913.log`.
+
+**Still large / optional later:** `results/` ~16 GB left (onnx/history), `Library/` ~5 GB (Unity cache — regenerates), `four_friends_ice` ~11 GB (other project).
+
+**Do not delete:** user stats SQLite, lab prod `jlg_finetune_2` onnx on lab_comp (local folder may be empty — stream uses lab).
+
+---
 
 ---
 
