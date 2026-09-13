@@ -74,6 +74,4 @@ Desktop.ini
 Assets/Resources/Music/CelticElfMusic.mp3
 Assets/StreamingAssets/Music/CelticElfMusic.mp3
 
-# Accidental full-tree build duplicate (was ~90GB)
-../_fs_build_tmp/
 
