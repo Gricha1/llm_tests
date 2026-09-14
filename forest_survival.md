@@ -1,15 +1,149 @@
 # ForestSurvival
 
-Internal project context / engineering log for Cursor and maintainers.  
+Internal project context / engineering log for the coding agent (**Kimi Code** since 2026-09-14; previously Cursor) and maintainers.  
 **Not** an end-user README. Update after every substantial change.
 
 Companion handoff (also living): `docs/LAB_ARCHITECTURE.md` (may be untracked until committed).
 
 Document snapshot context:
 - Branch: `forest_survival` (tracks `main/forest_survival`)
-- Doc refresh: **2026-09-13** — local disk cleanup (~10 GB free → ~197 GB); growth features already on `1d1f26b`.
+- Doc refresh: **2026-09-14** — Kimi workflow/handoff + latest production fixes.
 - Growth ship (2026-09-12): 7d hide, progression goals, Shorts, stream_mode — see **Growth features shipped — 2026-09-12**.
 - Gameplay Builder/Apocalypse/L-menu still largely working-tree. See §17–§18.
+
+---
+
+## Development workflow / Coding agent — current (Sep 2026)
+
+**Updated: 2026-09-14.** The primary coding agent of the project is now **Kimi Code in VS Code**.
+Cursor is no longer the primary working agent — treat it as **previous workflow / fallback**.
+Historical Cursor references in this document (and `docs/CURSOR_*.md`) are kept intentionally as project history.
+
+### 1. Current coding agent
+
+Current workflow:
+
+```
+Grigoriy
+  → discusses task / architecture / bug with ChatGPT
+  → ChatGPT helps form a hypothesis and a precise technical spec
+  → Kimi Code inspects the actual repository
+  → makes changes
+  → runs tests / diagnostics
+  → deploys to lab_comp when the task requires it
+  → returns evidence / report
+  → result is checked again with ChatGPT
+```
+
+Role split:
+- **Kimi Code** — engineering execution agent (repo inspection, edits, tests, deploys, evidence reports).
+- **ChatGPT** — task framing, architecture analysis, conclusion review, experiment planning, analysis of Kimi reports.
+
+Kimi must **not** blindly execute an assumed architecture: before making changes it must **inspect the actual repository state**.
+
+### 2. Current model / usage policy
+
+Verified from local config `~/.kimi-code/config.toml` on **2026-09-14**:
+- `default_model = "kimi-code/k3-256k"` — **K3-256K is available** in the current account (256K context, display name "K3-256k").
+- Thinking efforts supported by K3 / K3-256K: `low / high / max`; configured default effort: `high`.
+
+Policy:
+
+| Mode | Effort | Use for |
+|------|--------|---------|
+| **Normal development (default)** | **High** | feature implementation; ordinary bug fixes; repository inspection; multi-file changes; tests; deployment scripts; UI changes |
+| **Hard tasks only** | **Max** | complex architecture; hard-to-reproduce bug; large multi-system changes; heavy diagnostics; several failed High iterations |
+
+Do **not** use Max by default — the goal is to work long and spend subscription quota economically.
+
+### 3. Resource / token requirements
+
+Primary user requirement: the coding agent must allow **long uninterrupted work**. For this project, not burning the available Kimi quota too fast matters more than minimizing each individual call.
+
+Strategy:
+- use **K3-256K** instead of a more quota-expensive mode when it does not hurt the task;
+- **High** = default; **Max** = genuinely hard tasks only;
+- do not feed the agent huge irrelevant files;
+- locate relevant repo areas first; do not re-read the whole repository without reason;
+- reuse already-found project context; use `forest_survival.md` as persistent project context;
+- keep reports for major changes so the next session does not have to reconstruct everything from scratch.
+
+Quota facts (docs-verified 2026-09-14, [membership docs](https://www.kimi.com/code/docs/en/kimi-code/membership.html)):
+- quota **refreshes every 7 days** from the subscription date; unused quota does not roll over;
+- a **rolling 5-hour rate window** also applies (recovers automatically);
+- all logged-in devices and API keys share the same quota;
+- remaining quota / rate-limit status: **`/usage` in the CLI** or the **Kimi Code Console**.
+
+**Exact weekly quota / remaining / reset date: exact quota currently not verified.**
+Do not record invented numbers. When checked, record actual Kimi UI values only, with `verified on <date>`.
+
+### 4. Current subscription context
+
+- User works via a **Kimi Code subscription**; goal: replace Cursor as the primary coding agent and **maximize continuous engineering work + quota efficiency**.
+- Kimi still has **rolling 5-hour rate window + weekly quota limits** (official docs) — the subscription is not a "no 5-hour ceiling" guarantee; **exact current quota remains not verified**.
+- **Current tier: Moderato** — user-confirmed from Kimi UI, **verified on 2026-09-14**.
+- Monthly/weekly quota values: **exact quota currently not verified** — use actual Kimi UI values only (`/usage`, Kimi Code Console, Subscription page).
+- Docs note: a rolling **5-hour rate window** still exists on top of the weekly quota (burst rate-limit, auto-recovers) — "no 5-hour limit at all" is not guaranteed by the tier.
+
+### 5. Agent execution rules for ForestSurvival
+
+For every significant request Kimi must:
+
+1. inspect actual state;
+2. read the relevant section of `forest_survival.md`;
+3. `git status`;
+4. determine production / local / lab_comp context;
+5. not assume an old description is still accurate;
+6. establish root cause before a serious bugfix (for diagnostics);
+7. minimal targeted diff;
+8. tests;
+9. deploy only if the task requires it;
+10. verify deployed state;
+11. never declare PASS without evidence;
+12. give a short final report.
+
+Especially important:
+- local Editor ForestScene and lab_comp production runtime **may differ** — do not sync them automatically;
+- do **not** start a real Twitch stream for a debug test;
+- no force push;
+- never commit `.env` / tokens / DBs / generated videos / credentials;
+- production actions must be explicitly reflected in the report.
+
+### 6. Context efficiency
+
+Since Kimi has limited subscription usage/context, `forest_survival.md` is the compact persistent context.
+
+Before a big task: read relevant sections first, then investigate only the necessary files.
+
+Do **not** routinely: re-read the whole git history; scan all of `Assets/`; read all logs; re-analyze already-documented architecture — unless the current task requires it.
+
+But the living doc is **not** a source of truth above the actual code: if document and repo diverge, check code/runtime and update the document after confirmation.
+
+### 7. Document maintenance
+
+After major architecture or workflow changes, update `forest_survival.md`.
+
+Especially record: production architecture changes; new UI/control systems; analytics changes; deployment procedures; major bugs/root causes; growth experiments; coding-agent workflow changes.
+
+Do not turn this document into a full session log — it must stay a useful **compact context** for the next Kimi session.
+
+---
+
+## Cursor → Kimi handoff — 2026-09-12/13
+
+**Index only** — last important changes at the Cursor → Kimi transition. No duplicated details; follow the links.
+
+| Change | Details in |
+|--------|-----------|
+| Growth/Shorts commit `1d1f26b` (7d hide, progression goals, Shorts, stream_mode analytics) | **Growth features shipped — 2026-09-12**; §18 |
+| 7d inactivity persistence (`INACTIVE_HIDE_7D_V1`; soft-hide keeps `last_action`; reactivation restores actions) | **Growth features shipped — 2026-09-12**; §19 |
+| Twitch `#stats` single-line rule (PRIVMSG truncates at first `\n`) | §19; **Growth features shipped** → Progression goals |
+| UnityEditor refs in player DLL killed `/stats/event` POSTs (`UnityWebRequestDomainSafe` TypeLoadException; rule: Editor hooks → `Assets/Editor/`; markers `WEBREQUEST_DOMAIN_SAFE_V2` / `SSSTATS_HTTP_V2`) | §19 |
+| `#todo` viewer wishlist → SQLite `viewer_todos` (`VIEWER_TODO_V1`) | §19 |
+| `#goal_soldier` / `#goal_builder` join goal UX + `goal_track` (`GOAL_TRACK_V1`) | §19 |
+| Players table blocked-state sanitizing (junk labels → «Ждёт у базы») | §19 |
+| Separate Help Canvas / HUD help line (`VIEWER_TODO_HUD_V2`) | §19; Product backlog #4 |
+| Local disk cleanup ~10 GB → ~197 GB free; viewer stats DBs preserved | **Local disk cleanup — 2026-09-13** |
 
 ---
 
@@ -370,6 +504,7 @@ Keep Training and StreamingSurvival changes scoped.
 - `restart_obs.bash` defaults `DISPLAY=:1`, sets `XAUTHORITY` from gdm/`~/.Xauthority`.
 - Dual stream: OBS → `rtmp://127.0.0.1/live` → Docker `obs_dual_rtmp` pushes Twitch + VK (`setup_obs_dual_stream.bash`).
 - Observed ops issue (2026-09 session): nginx-rtmp stuck `SYN_SENT` on stale Twitch ingest IP → fix by `docker restart obs_dual_rtmp` + OBS restart (DNS re-resolve). Do not paste stream keys into this doc.
+- **NOTE / TODO (2026-09-14): DISPLAY inconsistency** — production sections say `DISPLAY=:1` (Unity window §3, `run_stream_onnx.bash` §5, `restart_obs.bash` above), while Shorts canonical capture says `DISPLAY=:0` (`shorts/capture.env`; §19 marks `:1` as *wrong* for capture). **Verify actual Unity/OBS DISPLAY on lab_comp before relying on :0/:1 documentation** — do not change either value blindly.
 
 ---
 
@@ -479,6 +614,12 @@ Feature themes still mainly working-tree (Partially tested / needs Play Mode + l
 | Soft-hide cleared `last_action` → idle after reactivation | **Fixed** — preserve action + `restore_actions_from_events` |
 | Shorts capture on `DISPLAY=:1` | **Wrong** — use `:0` + gdm Xauthority (`shorts/capture.env`) |
 | Local disk nearly full (~10 GB free, 2026-09-13) | **Cleaned** — see **Local disk cleanup — 2026-09-13** below |
+| `#stats` not growing after DomainSafe hotpatch | **Fixed 2026-09-13** — `UnityWebRequestDomainSafe` had Editor refs in player DLL (`TypeLoadException` → all `/stats/event` POSTs died). Split Editor hooks to `Assets/Editor/`; marker `WEBREQUEST_DOMAIN_SAFE_V2` / `SSSTATS_HTTP_V2` |
+| Viewer wishlist / feedback channel | **Implemented 2026-09-13** — `#todo <текст>` → SQLite `viewer_todos` (`VIEWER_TODO_V1`); HUD help line `VIEWER_TODO_HUD_V2` (raised + «пожелания стримеру») |
+| Join goal UX | **Implemented 2026-09-13** — new players pick `#goal_soldier` / `#goal_builder`; returning with track get goal + suggested `#do` (`GOAL_TRACK_V1`) |
+| Players table junk statuses | **Fixed 2026-09-13** — forbid labels → «Ждёт у базы»; table enlarged |
+| Black screen on stream (protobuf) | **Fixed 2026-09-14** — `protobuf` got upgraded to **7.36.1** in the lab `mlagents` env (Sep 13 ~21:44, source unknown) → `mlagents_envs` import crash (`Descriptors cannot be created directly`) → `stream_onnx_infer` crash-looped, Unity presentation never started, OBS captured black. Fix: `pip install protobuf==3.20.3` (onnx 1.15 / mlagents 1.1 compatible); watchdog auto-restarted stream. **Guard:** never run bare `pip install` in the lab `mlagents` env without checking protobuf afterwards |
+| Viewers lost skins after stream auto-restart | **Fixed 2026-09-14** — after the protobuf crash-loop the supervisor auto-restart (`run_stream_onnx.bash`) brought Unity back **without** `POST :8765/roster/resync` (only `restart_stream_for_run.bash` had it). Unity roster bootstrap (disk `stream_roster.json` / HTTP `/roster`) had **no `skin` field** (`list_players` didn't SELECT it) → everyone spawned human, combat/build `#do` rejected → «Ждёт у базы». DB was intact (verified vs `ss_skin` events). Fix: (1) manual resync restored mysticggx=builder, polinagorbova=wolf, otka3y/i_guess_u_know_me/flannel_=soldier (Unity log `*_skin_applied`); (2) `list_players` now SELECTs `COALESCE(skin,'human') AS skin` → roster json/`/roster` carry skin; (3) `run_stream_onnx.bash` auto-restart now POSTs `/roster/resync` (~25s after start, 12 retries). Bot restarted (daemon). Note: dack2800 has stale `last_action=kill_zombie` with human skin (never had an `ss_skin` event) — «Ждёт у базы» is correct for him |
 
 ---
 
